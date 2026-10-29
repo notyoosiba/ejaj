@@ -1,0 +1,3 @@
+# Crate-wide Clippy policy: one complexity budget for every module. The
+# corresponding lint levels live in Cargo.toml's [lints.clippy] table.
+cognitive-complexity-threshold = 15

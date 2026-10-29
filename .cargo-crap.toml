@@ -1,0 +1,4 @@
+# Crate-wide CRAP policy: every function must stay at or below 30.0 when
+# scored against LCOV coverage from the test suite.
+threshold = 30.0
+fail-above = true

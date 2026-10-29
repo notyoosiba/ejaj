@@ -1,0 +1,187 @@
+{
+  "url": "http://192.168.56.1:1234/v1/chat/completions",
+  "model": "qwen/qwen3-30b-a3b",
+  "recorded_at": "1793036285",
+  "exchanges": [
+    {
+      "request": {
+        "messages": [
+          {
+            "content": "You are an autonomous software engineer.\nYou have two command tools: `execute_script` and `bash`.\n\nUse `execute_script` for all file listing, searching, reading, diffing, and editing. Use `bash` only for `cargo`, `git`, and the ticket's verification gate.\n\n`execute_script` runs a JavaScript program in an ephemeral sandbox with these bindings:\n\n```typescript\ndeclare namespace tools {\n  /** Read a UTF-8 file (or 1-based inclusive line range), relative to the project root. */\n  function read(path: string, startLine?: number, endLine?: number): string;\n\n  /** Overwrite or create a UTF-8 file, relative to the project root. */\n  function write(path: string, content: string): void;\n\n  /** Replace one exact occurrence. Throws on zero or on more than one. */\n  function replace(path: string, old_text: string, new_text: string): void;\n\n  /** List tracked and untracked-not-ignored files (git ls-files). */\n  function list(glob?: string): string[];\n\n  /** Search tracked and untracked-not-ignored files (git grep). */\n  function grep(\n    pattern: string,\n    glob?: string,\n  ): { path: string; line: number; text: string }[];\n\n  /** Return the repository-root unified diff (staged, unstaged, and non-ignored untracked files, excluding .ejaj/). */\n  function diff(): string;\n}\n```\n\nScript rules:\n- Write plain JavaScript; do not use type annotations.\n- Batch related reads, searches, and multi-file edits into a single `execute_script` call rather than making one call per file or operation.\n- Return a string (returned as plain text), a JSON-serializable value, or log with `console.log`.\n- Paths are relative to the project root.\n- The script runs without network access.\n\nOutput limits and spill logs:\n- Every tool result is capped at 16 KiB (16,384 bytes). Bash output at or below 16 KiB (16,384 bytes) is returned unchanged, and an empty result stays empty. `execute_script` output above that limit is truncated on a UTF-8 character boundary; the marker reports the exact omitted bytes, so filter results in JavaScript when a returned value may be large. `execute_script` output is never spilled.\n- Bash output above 16 KiB is saved complete before a bounded digest is returned. The complete raw output -- stdout followed by stderr, including bytes that are not valid UTF-8 -- is written to the `tools-output/` directory inside the active timestamped session directory, `.ejaj/<timestamp>/tools-output/`. The primary file name is `step-<one-based-step>-call-<one-based-Bash-call-index>.log`; on a collision, names add `-1`, `-2`, and so on before `.log`. The path the digest returns is authoritative and relative to the project root, so read that exact path. The log begins with a `Command:` section holding the originating command exactly as it was run, followed by an `Output:` section holding the complete raw stdout followed by raw stderr; the 16 KiB threshold applies only to that captured output. Inspect the complete log with `tools.read` through `execute_script`, using a line range when it is large. If the complete output could not be saved, the digest reports the failure and names no path.\n\nRules:\n1. `apply_patch`, diff tools, and specialized editors DO NOT exist.\n2. Never inspect or list files inside `target/` or `.git/`.\n3. To list or find files, ALWAYS use `tools.list(glob?)` in `execute_script`.\n4. To search text across the codebase, ALWAYS use `tools.grep(pattern, glob?)` in `execute_script`.\n5. To read, diff, or edit files, ALWAYS use `tools.read()`, `tools.diff()`, `tools.write()`, or `tools.replace()` in `execute_script`. Prefer `tools.diff()` over `git diff` or `git status` in `bash` when inspecting your changes. Do not use `cat`, `sed`, `awk`, or shell heredocs in `bash` to read or write files.\n6. Apply a coherent set of edits across all affected files before running `cargo check` or tests, rather than compiling after every single file edit. Fix any errors or warnings before completing.\n7. Chain related `cargo` commands with `&&` in a single `bash` call instead of running them in separate turns. Tool output is automatically capped at 16 KiB by the harness: never pipe `cargo` commands (`check`, `test`, `clippy`, `fmt`) through `head`, `tail`, `grep`, or `sed`, which hides diagnostics and forces re-runs. If formatting is needed, run `cargo fmt` directly rather than `cargo fmt --check` followed by manual edits.\n8. Run the ticket's verification gate command and confirm it exits 0. As soon as the ticket's scope and test expectations are implemented and the verification gate exits 0 (warning-free), call `task_complete` immediately on the next turn -- do not run extra unrequested audit passes (`git log`, repo-wide greps, reading `AGENTS.md`, etc.).\n9. Never end your turn without calling `task_complete`. You are unattended: there is no user to ask, and a turn that ends without this call fails the ticket.\n\nThe project root is the current working directory (the `ejaj` package root). Work only inside it: never read, list or search outside this directory (`/`, `~`, `/etc`, sibling projects), and never inspect `target/` or `.git/`. The working directory is already set to the project root, so always use paths relative to it. No human is available in this session: never ask a question, and end your turn only by calling the control tool your phase offers, with the payload it asks for.\n",
+            "role": "system"
+          },
+          {
+            "content": "The ticket reproduced below is this session's entire task. The conversation starts fresh: nothing from any earlier ticket or pass is replayed. Everything the ticket lists as a prerequisite is assumed to exist already, and anything the ticket marks out of scope must not be touched. You are unattended, so there is no user to ask: a turn that ends without `task_complete` fails the ticket. Implement the ticket, then run its verification gate command and make sure it exits 0 before you call `task_complete`.\n\n# Ticket\n\nCall the bash tool once with exactly `echo ejaj-integration-ok`, and put no other tool call in that message. The command's result will be returned to you; call `task_complete` only once you have seen it. Do not create, edit or delete any file, and do not run any other command.",
+            "role": "user"
+          }
+        ],
+        "model": "qwen/qwen3-30b-a3b",
+        "temperature": 0.0,
+        "tools": [
+          {
+            "function": {
+              "description": "Runs a bash command.",
+              "name": "bash",
+              "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "description": "Arguments of the `bash` tool.",
+                "properties": {
+                  "command": {
+                    "description": "The bash command to run.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "command"
+                ],
+                "title": "BashArgs",
+                "type": "object"
+              }
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "Runs a plain JavaScript program in the project sandbox against the `tools` namespace (`read`, `write`, `replace`, `list`, `grep`, `diff`) and returns the result (plain text for a string, JSON for other defined values, or the captured `console.log` output when the script returns `undefined`). Batch related file reads, searches, and edits into a single script call rather than making separate calls.",
+              "name": "execute_script",
+              "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "description": "Arguments of the `execute_script` tool.",
+                "properties": {
+                  "code": {
+                    "description": "The JavaScript program to run in the project sandbox.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code"
+                ],
+                "title": "ExecuteScriptArgs",
+                "type": "object"
+              }
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "Ends the ticket: call it only once the ticket's verification gate has exited 0. You are unattended, so there is no user to ask: a turn that ends without this call fails the ticket.",
+              "name": "task_complete",
+              "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "description": "Arguments of the `task_complete` tool. Empty on purpose: completion is a\nstatement, not a payload.\n\nThe `properties` extension is load-bearing: `schemars` omits the key for a\nstruct with no fields, and a provider that validates the tool list strictly\n(LM Studio) rejects a parameter schema without an object `properties` with\n`parameters.properties: Required`. An explicit empty object keeps\n`task_complete` as admissible as the tools that do take arguments.",
+                "properties": {},
+                "title": "TaskCompleteArgs",
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "status": 200,
+      "body": "{\n  \"id\": \"chatcmpl-94kamqj8e5g0e0d657u1ovb\",\n  \"object\": \"chat.completion\",\n  \"created\": 1793036192,\n  \"model\": \"qwen/qwen3-30b-a3b\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"\",\n        \"reasoning_content\": \"Okay, let me try to figure out how to approach this ticket. The user wants me to call the bash tool with the command \\\"echo ejaj-integration-ok\\\". But wait, the ticket also says not to create, edit, or delete any files, and not to run any other commands. Hmm.\\n\\nFirst, I need to make sure that I'm only using the bash function here. The task is to execute that specific echo command. The user mentioned that the verification gate command should be run, and once it exits 0, call task_complete. But according to the instructions, I shouldn't do anything else except call the bash command once.\\n\\nWait, the ticket says to call the bash tool with exactly \\\"echo ejaj-integration-ok\\\". So my first step is to use the bash function with that command. Then, after getting the result, I need to check if it's successful (exits 0). Once that's confirmed, I should call task_complete. But the user said not to run any other commands. Oh right, but the verification gate is part of the ticket's requirements. So I guess after running the bash command and confirming it exits 0, then I can proceed to call task_complete.\\n\\nBut according to the rules, I need to make sure that the verification gate (which is this echo command) exits 0 before calling task_complete. So first, I'll execute the bash command. If it returns 0, then I can call task_complete. But how do I check the exit status? Well, the problem says to call the bash command and then call task_complete once the verification gate (the command's exit code) is 0. Since the user says that the command's result will be returned, I guess I just need to run the command and then assume it's successful unless there's an error.\\n\\nBut the user also said not to create, edit, or delete any files, which aligns with using the bash tool here. So my first step is to call the bash function with \\\"echo ejaj-integration-ok\\\". Then, once that's done (and assuming it's successful), I can call task_complete. But according to the instructions, I need to make sure the verification gate exits 0 before calling task_complete.\\n\\nWait, but how do I structure this? The user says to call the bash tool once with that command and then call task_complete only after seeing it. So maybe first, I call the bash function with the echo command. Then, in the next step (once I have the result), if the exit code is 0, I call task_complete.\\n\\nBut according to the problem statement, the user wants me to output exactly one tool call here. Wait, the initial instruction says \\\"call the bash tool once with exactly...\\\". So the first thing is to make sure that the bash command is called. Then, after getting the result (which would be the output of the echo), I need to check if it's successful (exit code 0). Since the command is just echoing a string, it should succeed. Then, call task_complete.\\n\\nBut in this setup, how do I proceed? The user says that the ticket's verification gate is this command. So once I run it and confirm exit 0, then I can call task_complete. But since I'm supposed to output exactly one tool call here (the bash call), maybe the next step would be to process that result. However, according to the problem statement, the user wants me to generate the correct sequence of tool calls.\\n\\nWait, but in this case, the user is asking for the assistant's first move. The ticket says: \\\"Call the bash tool once with exactly `echo ejaj-integration-ok`, and put no other tool call in that message.\\\" So the very first step is to make sure that the bash command is called. Then, after that, when the result comes back (assuming it's successful), then call task_complete.\\n\\nBut according to the rules, I need to end my turn by calling task_complete only once. However, the user says \\\"do not create, edit or delete any file, and do not run any other command.\\\" So maybe the correct approach is to first call the bash function with that echo command, then upon receiving the result (which would be the output of the command), check if it's successful. If so, then call task_complete.\\n\\nBut how does this fit into the current setup? The user is expecting me to generate the initial tool call here, which is the bash command. Then, once that's done and the result is confirmed, proceed to call task_complete. However, according to the problem statement, I need to make sure that the verification gate (the echo command) exits 0 before calling task_complete.\\n\\nSo in this case, the correct sequence would be:\\n\\n1. Call bash with \\\"echo ejaj-integration-ok\\\".\\n2. Once that's confirmed to exit 0 (which it will, as it's a simple echo), then call task_complete.\\n\\nBut since I can only make one tool call at a time, and the user is asking for the first step, which is to call the bash command once. Then, in the next interaction, after getting the result, proceed to check if it's successful and then call task_complete.\\n\\nHowever, according to the problem statement, the user wants me to generate the correct sequence of tool calls here. Since I can only make one tool call per message, and the first step is to run the bash command, that's what I need to do now.\\n\",\n        \"tool_calls\": [\n          {\n            \"type\": \"function\",\n            \"id\": \"V6Y0mHyclbADrDgyCoN831bUY6lflAia\",\n            \"function\": {\n              \"name\": \"bash\",\n              \"arguments\": \"{\\\"command\\\":\\\"echo ejaj-integration-ok\\\"}\"\n            }\n          }\n        ]\n      },\n      \"logprobs\": null,\n      \"finish_reason\": \"tool_calls\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 1811,\n    \"completion_tokens\": 1159,\n    \"total_tokens\": 2970,\n    \"completion_tokens_details\": {\n      \"reasoning_tokens\": 1131\n    }\n  },\n  \"stats\": {},\n  \"system_fingerprint\": \"qwen/qwen3-30b-a3b\"\n}",
+      "url": "http://192.168.56.1:1234/v1/chat/completions",
+      "model": "qwen/qwen3-30b-a3b"
+    },
+    {
+      "request": {
+        "messages": [
+          {
+            "content": "You are an autonomous software engineer.\nYou have two command tools: `execute_script` and `bash`.\n\nUse `execute_script` for all file listing, searching, reading, diffing, and editing. Use `bash` only for `cargo`, `git`, and the ticket's verification gate.\n\n`execute_script` runs a JavaScript program in an ephemeral sandbox with these bindings:\n\n```typescript\ndeclare namespace tools {\n  /** Read a UTF-8 file (or 1-based inclusive line range), relative to the project root. */\n  function read(path: string, startLine?: number, endLine?: number): string;\n\n  /** Overwrite or create a UTF-8 file, relative to the project root. */\n  function write(path: string, content: string): void;\n\n  /** Replace one exact occurrence. Throws on zero or on more than one. */\n  function replace(path: string, old_text: string, new_text: string): void;\n\n  /** List tracked and untracked-not-ignored files (git ls-files). */\n  function list(glob?: string): string[];\n\n  /** Search tracked and untracked-not-ignored files (git grep). */\n  function grep(\n    pattern: string,\n    glob?: string,\n  ): { path: string; line: number; text: string }[];\n\n  /** Return the repository-root unified diff (staged, unstaged, and non-ignored untracked files, excluding .ejaj/). */\n  function diff(): string;\n}\n```\n\nScript rules:\n- Write plain JavaScript; do not use type annotations.\n- Batch related reads, searches, and multi-file edits into a single `execute_script` call rather than making one call per file or operation.\n- Return a string (returned as plain text), a JSON-serializable value, or log with `console.log`.\n- Paths are relative to the project root.\n- The script runs without network access.\n\nOutput limits and spill logs:\n- Every tool result is capped at 16 KiB (16,384 bytes). Bash output at or below 16 KiB (16,384 bytes) is returned unchanged, and an empty result stays empty. `execute_script` output above that limit is truncated on a UTF-8 character boundary; the marker reports the exact omitted bytes, so filter results in JavaScript when a returned value may be large. `execute_script` output is never spilled.\n- Bash output above 16 KiB is saved complete before a bounded digest is returned. The complete raw output -- stdout followed by stderr, including bytes that are not valid UTF-8 -- is written to the `tools-output/` directory inside the active timestamped session directory, `.ejaj/<timestamp>/tools-output/`. The primary file name is `step-<one-based-step>-call-<one-based-Bash-call-index>.log`; on a collision, names add `-1`, `-2`, and so on before `.log`. The path the digest returns is authoritative and relative to the project root, so read that exact path. The log begins with a `Command:` section holding the originating command exactly as it was run, followed by an `Output:` section holding the complete raw stdout followed by raw stderr; the 16 KiB threshold applies only to that captured output. Inspect the complete log with `tools.read` through `execute_script`, using a line range when it is large. If the complete output could not be saved, the digest reports the failure and names no path.\n\nRules:\n1. `apply_patch`, diff tools, and specialized editors DO NOT exist.\n2. Never inspect or list files inside `target/` or `.git/`.\n3. To list or find files, ALWAYS use `tools.list(glob?)` in `execute_script`.\n4. To search text across the codebase, ALWAYS use `tools.grep(pattern, glob?)` in `execute_script`.\n5. To read, diff, or edit files, ALWAYS use `tools.read()`, `tools.diff()`, `tools.write()`, or `tools.replace()` in `execute_script`. Prefer `tools.diff()` over `git diff` or `git status` in `bash` when inspecting your changes. Do not use `cat`, `sed`, `awk`, or shell heredocs in `bash` to read or write files.\n6. Apply a coherent set of edits across all affected files before running `cargo check` or tests, rather than compiling after every single file edit. Fix any errors or warnings before completing.\n7. Chain related `cargo` commands with `&&` in a single `bash` call instead of running them in separate turns. Tool output is automatically capped at 16 KiB by the harness: never pipe `cargo` commands (`check`, `test`, `clippy`, `fmt`) through `head`, `tail`, `grep`, or `sed`, which hides diagnostics and forces re-runs. If formatting is needed, run `cargo fmt` directly rather than `cargo fmt --check` followed by manual edits.\n8. Run the ticket's verification gate command and confirm it exits 0. As soon as the ticket's scope and test expectations are implemented and the verification gate exits 0 (warning-free), call `task_complete` immediately on the next turn -- do not run extra unrequested audit passes (`git log`, repo-wide greps, reading `AGENTS.md`, etc.).\n9. Never end your turn without calling `task_complete`. You are unattended: there is no user to ask, and a turn that ends without this call fails the ticket.\n\nThe project root is the current working directory (the `ejaj` package root). Work only inside it: never read, list or search outside this directory (`/`, `~`, `/etc`, sibling projects), and never inspect `target/` or `.git/`. The working directory is already set to the project root, so always use paths relative to it. No human is available in this session: never ask a question, and end your turn only by calling the control tool your phase offers, with the payload it asks for.\n",
+            "role": "system"
+          },
+          {
+            "content": "The ticket reproduced below is this session's entire task. The conversation starts fresh: nothing from any earlier ticket or pass is replayed. Everything the ticket lists as a prerequisite is assumed to exist already, and anything the ticket marks out of scope must not be touched. You are unattended, so there is no user to ask: a turn that ends without `task_complete` fails the ticket. Implement the ticket, then run its verification gate command and make sure it exits 0 before you call `task_complete`.\n\n# Ticket\n\nCall the bash tool once with exactly `echo ejaj-integration-ok`, and put no other tool call in that message. The command's result will be returned to you; call `task_complete` only once you have seen it. Do not create, edit or delete any file, and do not run any other command.",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "reasoning_content": "Okay, let me try to figure out how to approach this ticket. The user wants me to call the bash tool with the command \"echo ejaj-integration-ok\". But wait, the ticket also says not to create, edit, or delete any files, and not to run any other commands. Hmm.\n\nFirst, I need to make sure that I'm only using the bash function here. The task is to execute that specific echo command. The user mentioned that the verification gate command should be run, and once it exits 0, call task_complete. But according to the instructions, I shouldn't do anything else except call the bash command once.\n\nWait, the ticket says to call the bash tool with exactly \"echo ejaj-integration-ok\". So my first step is to use the bash function with that command. Then, after getting the result, I need to check if it's successful (exits 0). Once that's confirmed, I should call task_complete. But the user said not to run any other commands. Oh right, but the verification gate is part of the ticket's requirements. So I guess after running the bash command and confirming it exits 0, then I can proceed to call task_complete.\n\nBut according to the rules, I need to make sure that the verification gate (which is this echo command) exits 0 before calling task_complete. So first, I'll execute the bash command. If it returns 0, then I can call task_complete. But how do I check the exit status? Well, the problem says to call the bash command and then call task_complete once the verification gate (the command's exit code) is 0. Since the user says that the command's result will be returned, I guess I just need to run the command and then assume it's successful unless there's an error.\n\nBut the user also said not to create, edit, or delete any files, which aligns with using the bash tool here. So my first step is to call the bash function with \"echo ejaj-integration-ok\". Then, once that's done (and assuming it's successful), I can call task_complete. But according to the instructions, I need to make sure the verification gate exits 0 before calling task_complete.\n\nWait, but how do I structure this? The user says to call the bash tool once with that command and then call task_complete only after seeing it. So maybe first, I call the bash function with the echo command. Then, in the next step (once I have the result), if the exit code is 0, I call task_complete.\n\nBut according to the problem statement, the user wants me to output exactly one tool call here. Wait, the initial instruction says \"call the bash tool once with exactly...\". So the first thing is to make sure that the bash command is called. Then, after getting the result (which would be the output of the echo), I need to check if it's successful (exit code 0). Since the command is just echoing a string, it should succeed. Then, call task_complete.\n\nBut in this setup, how do I proceed? The user says that the ticket's verification gate is this command. So once I run it and confirm exit 0, then I can call task_complete. But since I'm supposed to output exactly one tool call here (the bash call), maybe the next step would be to process that result. However, according to the problem statement, the user wants me to generate the correct sequence of tool calls.\n\nWait, but in this case, the user is asking for the assistant's first move. The ticket says: \"Call the bash tool once with exactly `echo ejaj-integration-ok`, and put no other tool call in that message.\" So the very first step is to make sure that the bash command is called. Then, after that, when the result comes back (assuming it's successful), then call task_complete.\n\nBut according to the rules, I need to end my turn by calling task_complete only once. However, the user says \"do not create, edit or delete any file, and do not run any other command.\" So maybe the correct approach is to first call the bash function with that echo command, then upon receiving the result (which would be the output of the command), check if it's successful. If so, then call task_complete.\n\nBut how does this fit into the current setup? The user is expecting me to generate the initial tool call here, which is the bash command. Then, once that's done and the result is confirmed, proceed to call task_complete. However, according to the problem statement, I need to make sure that the verification gate (the echo command) exits 0 before calling task_complete.\n\nSo in this case, the correct sequence would be:\n\n1. Call bash with \"echo ejaj-integration-ok\".\n2. Once that's confirmed to exit 0 (which it will, as it's a simple echo), then call task_complete.\n\nBut since I can only make one tool call at a time, and the user is asking for the first step, which is to call the bash command once. Then, in the next interaction, after getting the result, proceed to check if it's successful and then call task_complete.\n\nHowever, according to the problem statement, the user wants me to generate the correct sequence of tool calls here. Since I can only make one tool call per message, and the first step is to run the bash command, that's what I need to do now.\n",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"command\":\"echo ejaj-integration-ok\"}",
+                  "name": "bash"
+                },
+                "id": "V6Y0mHyclbADrDgyCoN831bUY6lflAia",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "ejaj-integration-ok\n",
+            "role": "tool",
+            "tool_call_id": "V6Y0mHyclbADrDgyCoN831bUY6lflAia"
+          }
+        ],
+        "model": "qwen/qwen3-30b-a3b",
+        "temperature": 0.0,
+        "tools": [
+          {
+            "function": {
+              "description": "Runs a bash command.",
+              "name": "bash",
+              "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "description": "Arguments of the `bash` tool.",
+                "properties": {
+                  "command": {
+                    "description": "The bash command to run.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "command"
+                ],
+                "title": "BashArgs",
+                "type": "object"
+              }
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "Runs a plain JavaScript program in the project sandbox against the `tools` namespace (`read`, `write`, `replace`, `list`, `grep`, `diff`) and returns the result (plain text for a string, JSON for other defined values, or the captured `console.log` output when the script returns `undefined`). Batch related file reads, searches, and edits into a single script call rather than making separate calls.",
+              "name": "execute_script",
+              "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "description": "Arguments of the `execute_script` tool.",
+                "properties": {
+                  "code": {
+                    "description": "The JavaScript program to run in the project sandbox.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code"
+                ],
+                "title": "ExecuteScriptArgs",
+                "type": "object"
+              }
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "Ends the ticket: call it only once the ticket's verification gate has exited 0. You are unattended, so there is no user to ask: a turn that ends without this call fails the ticket.",
+              "name": "task_complete",
+              "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "description": "Arguments of the `task_complete` tool. Empty on purpose: completion is a\nstatement, not a payload.\n\nThe `properties` extension is load-bearing: `schemars` omits the key for a\nstruct with no fields, and a provider that validates the tool list strictly\n(LM Studio) rejects a parameter schema without an object `properties` with\n`parameters.properties: Required`. An explicit empty object keeps\n`task_complete` as admissible as the tools that do take arguments.",
+                "properties": {},
+                "title": "TaskCompleteArgs",
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "status": 200,
+      "body": "{\n  \"id\": \"chatcmpl-jc0ixydptplw0658pnp34i\",\n  \"object\": \"chat.completion\",\n  \"created\": 1793036259,\n  \"model\": \"qwen/qwen3-30b-a3b\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"\",\n        \"reasoning_content\": \"Okay, so the user wants me to call the bash tool with the command \\\"echo ejaj-integration-ok\\\". Let me check the tools available. There's a bash function in the tools. I need to make sure I use the correct syntax.\\n\\nFirst, I should structure the tool call properly. The function name is \\\"bash\\\" and the argument is a JSON object with the \\\"command\\\" key. The command should be \\\"echo ejaj-integration-ok\\\". \\n\\nWait, the user also mentioned not to do anything else except call the bash command once. So I need to make sure that in this step, I only call the bash function with that exact command. No other functions like execute_script or task_complete yet. \\n\\nThe response from the previous step was \\\"ejaj-integration-ok\\\", which is the output of the echo command. But according to the problem statement, after running the verification gate command (which is this echo), I need to confirm it exits 0. Since the command is just echoing a string, it should exit with status 0. \\n\\nBut how do I proceed? The user said to call the bash tool once, and then after verifying the exit code is 0, call task_complete. But in the current setup, I can only make one tool call here. So the first step is to execute the bash command as instructed. Once that's done, the next step would be to check the exit status. However, since I can't run another command here, maybe the system will handle that automatically.\\n\\nBut according to the rules, I need to make sure the verification gate (the echo command) exits 0 before calling task_complete. Since the user said \\\"call the bash tool once with exactly...\\\", I think the first step is just to execute that command. Then, once the result is confirmed (exit code 0), proceed to call task_complete. But how do I know when to do that? The problem says not to run any other commands, so maybe after executing the bash command and confirming it's successful, I can call task_complete in the next step.\\n\\nBut given the constraints of this interface, where each tool call is a separate message, I think the correct approach is to first make the bash call. Then, once that's confirmed to have succeeded (exit code 0), call task_complete. Since the user hasn't mentioned any errors in the command, it should be safe to proceed.\\n\",\n        \"tool_calls\": [\n          {\n            \"type\": \"function\",\n            \"id\": \"WAjzSDaY3Cd6aNwvZQLR5ge6MYgmDT8O\",\n            \"function\": {\n              \"name\": \"task_complete\",\n              \"arguments\": \"{}\"\n            }\n          }\n        ]\n      },\n      \"logprobs\": null,\n      \"finish_reason\": \"tool_calls\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 2988,\n    \"completion_tokens\": 511,\n    \"total_tokens\": 3499,\n    \"completion_tokens_details\": {\n      \"reasoning_tokens\": 491\n    }\n  },\n  \"stats\": {},\n  \"system_fingerprint\": \"qwen/qwen3-30b-a3b\"\n}",
+      "url": "http://192.168.56.1:1234/v1/chat/completions",
+      "model": "qwen/qwen3-30b-a3b"
+    }
+  ]
+}

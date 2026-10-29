@@ -1,0 +1,73 @@
+{
+  "url": "http://192.168.56.1:1234/v1/chat/completions",
+  "model": "qwen/qwen3-30b-a3b",
+  "recorded_at": "1792141397",
+  "exchanges": [
+    {
+      "request": {
+        "messages": [
+          {
+            "content": "You are a terse assistant.",
+            "role": "system"
+          },
+          {
+            "content": "Reply with exactly one word: pong",
+            "role": "user"
+          }
+        ],
+        "model": "qwen/qwen3-30b-a3b",
+        "temperature": 0.0,
+        "tools": [
+          {
+            "function": {
+              "description": "Runs a plain JavaScript program in the project sandbox against the `tools` namespace (`read`, `write`, `replace`, `list`, `grep`, `diff`) and returns the result (plain text for a string, JSON for other defined values, or the captured `console.log` output when the script returns `undefined`). Batch related file reads, searches, and edits into a single script call rather than making separate calls.",
+              "name": "execute_script",
+              "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "description": "Arguments of the `execute_script` tool.",
+                "properties": {
+                  "code": {
+                    "description": "The JavaScript program to run in the project sandbox.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code"
+                ],
+                "title": "ExecuteScriptArgs",
+                "type": "object"
+              }
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "Ends the design interview and hands the agreed plan to the spec agent, which turns it into a technical specification for the code agent. Call it immediately, in the same turn, as soon as no blocking decision remains -- do not summarize the plan and wait for a separate confirmation turn, because a confirmation of decisions the user has already settled is redundant. Ask the user and wait only while a genuinely blocking decision is still open; never implement anything yourself. The `plan` argument must hold the complete plan as a markdown document following the template in the system prompt: it is all the spec agent receives.",
+              "name": "finish_plan",
+              "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "description": "Arguments of the `finish_plan` tool: the agreed plan as a markdown document.\n\nThe plan is a required argument because the spec agent never sees the\ninterview that produced it. Nothing is recovered from the transcript, so\nwhatever the plan agent writes here is exactly -- and only -- what the\nspec agent is handed. The harness parses the document back into a [`Plan`]\nwith [`Plan::from_markdown`], so the typed value -- not the model's text --\nis what crosses the harness boundary.",
+                "properties": {
+                  "plan": {
+                    "description": "The complete plan as a markdown document, following the template in the system prompt.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "plan"
+                ],
+                "title": "FinishPlanArgs",
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "status": 200,
+      "body": "{\n  \"id\": \"chatcmpl-5gawfbia4gkxsm4f3mrz7\",\n  \"object\": \"chat.completion\",\n  \"created\": 1792141383,\n  \"model\": \"qwen/qwen3-30b-a3b\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"pong\",\n        \"reasoning_content\": \"Okay, the user told me to reply with exactly one word: \\\"pong\\\". They probably expect me to acknowledge their message. But wait, they mentioned that if I call a function, I should output the tool_call XML. Let me check the instructions again.\\n\\nThe tools provided include execute_script and finish_plan. The user's query here is straightforward—they just want a \\\"pong\\\" response. But according to the rules, I can only use the functions when necessary. However, replying with \\\"pong\\\" directly isn't using any function. Since the user said to reply with exactly one word, maybe they want me to say \\\"pong\\\" without any extra text.\\n\\nBut wait, the instructions also say that if a function call is needed, I should output the tool_call XML. But in this case, the user's request is just to reply with \\\"pong\\\", which doesn't require using any of the provided functions. So maybe it's allowed to answer directly. However, the system message says to call functions when necessary. Since replying with \\\"pong\\\" isn't using any function, perhaps I should just respond with \\\"pong\\\" normally.\\n\\nBut there's a conflict here. The user might have intended for me to use the functions, but their instruction is to reply with exactly one word. Let me make sure. If I don't call any function and just reply with \\\"pong\\\", that's acceptable. However, according to the initial instructions, if no function is needed, I should respond normally. So in this case, replying with \\\"pong\\\" is correct.\\n\",\n        \"tool_calls\": []\n      },\n      \"logprobs\": null,\n      \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 442,\n    \"completion_tokens\": 321,\n    \"total_tokens\": 763,\n    \"completion_tokens_details\": {\n      \"reasoning_tokens\": 315\n    }\n  },\n  \"stats\": {},\n  \"system_fingerprint\": \"qwen/qwen3-30b-a3b\"\n}",
+      "url": "http://192.168.56.1:1234/v1/chat/completions",
+      "model": "qwen/qwen3-30b-a3b"
+    }
+  ]
+}

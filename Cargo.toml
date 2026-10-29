@@ -1,0 +1,22 @@
+[package]
+name = "ejaj"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dotenvy = "0.15.7"
+minreq = { version = "2", features = ["https-rustls"] }
+rquickjs = "0.14"
+rustyline = "18"
+schemars = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+termimad = "0.35.5"
+
+[lints.clippy]
+cognitive_complexity = "deny"
+collapsible_if = "deny"
+collapsible_match = "deny"
+collapsible_else_if = "deny"
+match_bool = "deny"
+manual_let_else = "warn"

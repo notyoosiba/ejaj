@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, llvm-tools-preview
+
+      - name: Install coverage and CRAP tools
+        run: cargo install cargo-llvm-cov cargo-crap --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Generate LCOV coverage
+        run: cargo llvm-cov --lcov --output-path lcov.info
+
+      - name: Enforce CRAP threshold
+        run: cargo crap --lcov lcov.info
