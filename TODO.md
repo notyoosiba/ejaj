@@ -47,7 +47,7 @@ pub fn should_retry(error: &CallError, attempt: u32) -> Option<Duration> {
 
 ## Tasks
 
-- [ ] **T01 — Retry HTTP `529`, `2xx` embedded API errors, and unusable-content responses in `src/retry.rs` and `src/llm/anthropic.rs`**
+- [x] **T01 — Retry HTTP `529`, `2xx` embedded API errors, and unusable-content responses in `src/retry.rs` and `src/llm/anthropic.rs`**
   - `depends_on`: `[]`
   - `files`: `src/retry.rs`, `src/llm/anthropic.rs`, `TODO.md`
   - `goal`: Make `retry::should_retry` retry HTTP `529` overload responses, `200..=299` embedded API error responses, and `CallError::Malformed` responses whose detail starts with `"the response carried no usable content"`.

@@ -1277,6 +1277,21 @@ mod tests {
             CallError::Api { status, message } => {
                 assert_eq!(status, 200);
                 assert_eq!(message, "overloaded");
+                let error = CallError::Api { status, message };
+                assert_eq!(should_retry(&error, 1), Some(Duration::from_secs(1)));
+            }
+            other => panic!("expected an API error, got {}", other),
+        }
+
+        let overloaded = r#"{"type":"error","error":{"message":"overloaded"}}"#;
+        match decode_error(&provider(), raw(529, overloaded)) {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 529);
+                assert_eq!(message, "overloaded");
+                let error = CallError::Api { status, message };
+                assert_eq!(should_retry(&error, 1), Some(Duration::from_secs(1)));
+                assert_eq!(should_retry(&error, 2), Some(Duration::from_secs(2)));
+                assert_eq!(should_retry(&error, 3), None);
             }
             other => panic!("expected an API error, got {}", other),
         }
@@ -1300,9 +1315,9 @@ mod tests {
             assert_eq!(should_retry(&error, 3), None);
         }
 
-        let malformed = decode_error(&provider(), raw(200, r#"{"content":[]}"#));
-        assert!(matches!(malformed, CallError::Malformed(_)));
-        assert!(should_retry(&malformed, 1).is_none());
+        let unusable = decode_error(&provider(), raw(200, r#"{"content":[]}"#));
+        assert!(matches!(unusable, CallError::Malformed(_)));
+        assert_eq!(should_retry(&unusable, 1), Some(Duration::from_secs(1)));
 
         let transport = decode_error(&provider(), raw(200, "not json"));
         assert!(matches!(transport, CallError::Transport(_)));
@@ -1325,6 +1340,39 @@ mod tests {
                 other => panic!("body {body}: expected a malformed error, got {}", other),
             }
         }
+    }
+
+    /// Malformed/invalid payload boundary: empty content is unusable and
+    /// retryable, non-array content keeps its distinct non-retryable detail, and
+    /// invalid JSON keeps its existing transport classification.
+    #[test]
+    fn when_decoding_given_empty_and_non_array_content_then_retries_only_unusable_content() {
+        let empty = decode_error(&provider(), raw(200, r#"{"content":[]}"#));
+        match &empty {
+            CallError::Malformed(detail) => assert_eq!(
+                detail,
+                "the response carried no usable content (content_types=[])"
+            ),
+            other => panic!("expected a malformed error, got {}", other),
+        }
+        assert_eq!(should_retry(&empty, 1), Some(Duration::from_secs(1)));
+        assert_eq!(should_retry(&empty, 2), Some(Duration::from_secs(2)));
+        assert_eq!(should_retry(&empty, 3), None);
+
+        for body in [r#"{"content":"text"}"#, r#"{"content":null}"#, r#"{"content":1}"#] {
+            let error = decode_error(&provider(), raw(200, body));
+            match &error {
+                CallError::Malformed(detail) => {
+                    assert_eq!(detail, "the response content was not an array", "body {body}")
+                }
+                other => panic!("body {body}: expected a malformed error, got {}", other),
+            }
+            assert!(should_retry(&error, 1).is_none(), "body {body}");
+        }
+
+        let invalid = decode_error(&provider(), raw(200, "not json"));
+        assert!(matches!(invalid, CallError::Transport(_)));
+        assert_eq!(should_retry(&invalid, 1), Some(Duration::from_secs(1)));
     }
 
     /// Minimum valid boundary: a one-message, configured-model request is a
@@ -1762,7 +1810,7 @@ mod tests {
             "detail must not echo the raw response body"
         );
         assert!(matches!(error, CallError::Malformed(_)));
-        assert!(should_retry(&error, 1).is_none());
+        assert_eq!(should_retry(&error, 1), Some(Duration::from_secs(1)));
     }
 
     /// Regression: usable text and valid tool calls still decode to the same
