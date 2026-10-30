@@ -872,26 +872,26 @@ fn when_review_exceeds_max_rounds_given_persistent_findings_then_summarises_and_
         "expected Step::Retry at round cap, got {step:?}"
     );
 
-    // The three permitted fix queues ran; the fourth review's fix ticket was
+    // The nine permitted fix queues ran; the tenth review's fix ticket was
     // reported but never queued.
-    assert!(dir.join("tickets/r1-1-verify-edge-case.md").is_file());
-    assert!(dir.join("tickets/r2-1-verify-edge-case.md").is_file());
-    assert!(dir.join("tickets/r3-1-verify-edge-case.md").is_file());
-    assert!(!dir.join("tickets/r4-1-verify-edge-case.md").exists());
+    for round in 1..=9 {
+        assert!(dir.join(format!("tickets/r{round}-1-verify-edge-case.md")).is_file());
+    }
+    assert!(!dir.join("tickets/r10-1-verify-edge-case.md").exists());
 
     let review_text = fs::read_to_string(dir.join("review.md")).unwrap();
-    for round in 1..=4 {
+    for round in 1..=10 {
         assert!(
             review_text.contains(&format!("## Round {round}")),
             "review round {round} must be rendered: {review_text}"
         );
     }
-    assert!(!review_text.contains("## Round 5"), "{review_text}");
+    assert!(!review_text.contains("## Round 11"), "{review_text}");
 
     // The summary still ran and noted the unresolved review findings.
     let summary_req = last_request(&transport);
     assert!(
-        summary_req.contains("maximum of 4 review rounds"),
+        summary_req.contains("maximum of 10 review rounds"),
         "{summary_req}"
     );
     assert_eq!(summary_artifact(&dir), common::SCRIPTED_SUMMARY);
@@ -2960,8 +2960,8 @@ fn when_summarizing_given_absent_correction_answer_then_fails_without_another_re
     let requests = summary_requests(&transport);
     assert_eq!(
         requests.len(),
-        2,
-        "the rejected initial answer is followed by exactly one correction request"
+        1 + ejaj::retry::MAX_ATTEMPTS as usize,
+        "the rejected initial answer is followed by one correction turn retried across the attempt budget"
     );
     assert!(
         requests[0].contains("Conventional-Commits-style header"),
@@ -2996,8 +2996,8 @@ fn when_summarizing_given_absent_initial_answer_then_fails_without_correction() 
     );
     assert_eq!(
         summary_requests(&transport).len(),
-        1,
-        "unusable content is never corrected"
+        ejaj::retry::MAX_ATTEMPTS as usize,
+        "unusable content retries at the transport boundary and is never corrected"
     );
     assert!(!dir.join("change-summary.md").exists());
 
@@ -3039,8 +3039,8 @@ fn when_summarizing_given_empty_text_then_fails_without_correction() {
     );
     assert_eq!(
         summary_requests(&transport).len(),
-        1,
-        "unusable content is never corrected"
+        ejaj::retry::MAX_ATTEMPTS as usize,
+        "unusable content retries at the transport boundary and is never corrected"
     );
     assert!(!dir.join("change-summary.md").exists());
 
@@ -3407,14 +3407,20 @@ fn when_summarizing_given_transport_failure_then_fails_without_correction() {
 /// The id of the original scripted ticket.
 const ORIGINAL_TICKET_ID: &str = "1-verify-command-output";
 
-/// The fix tickets the scripted review rounds report, in round order: the three
-/// fix queues the run executes and the fourth review's fix, which is reported
+/// The fix tickets the scripted review rounds report, in round order: the nine
+/// fix queues the run executes and the tenth review's fix, which is reported
 /// and never queued.
-const REVIEW_FIX_IDS: [&str; 4] = [
+const REVIEW_FIX_IDS: [&str; 10] = [
     "r1-1-verify-edge-case",
     "r2-1-verify-edge-case",
     "r3-1-verify-edge-case",
     "r4-1-verify-edge-case",
+    "r5-1-verify-edge-case",
+    "r6-1-verify-edge-case",
+    "r7-1-verify-edge-case",
+    "r8-1-verify-edge-case",
+    "r9-1-verify-edge-case",
+    "r10-1-verify-edge-case",
 ];
 
 /// A clean, footerless answer that names no generated ticket id.
@@ -3533,12 +3539,18 @@ fn answer_leaking(id: &str, region: LeakRegion) -> String {
 fn when_writing_summary_given_each_generated_ticket_id_then_rejects_before_publication() {
     // The table is the run's whole cumulative id set: an id the fixture started
     // generating without a case here would be a silently uncovered gap.
-    let cases: [(&str, LeakRegion); 5] = [
+    let cases: [(&str, LeakRegion); 11] = [
         (ORIGINAL_TICKET_ID, LeakRegion::Header),
         (REVIEW_FIX_IDS[0], LeakRegion::Body),
         (REVIEW_FIX_IDS[1], LeakRegion::Footer),
         (REVIEW_FIX_IDS[2], LeakRegion::Body),
         (REVIEW_FIX_IDS[3], LeakRegion::Footer),
+        (REVIEW_FIX_IDS[4], LeakRegion::Body),
+        (REVIEW_FIX_IDS[5], LeakRegion::Footer),
+        (REVIEW_FIX_IDS[6], LeakRegion::Body),
+        (REVIEW_FIX_IDS[7], LeakRegion::Footer),
+        (REVIEW_FIX_IDS[8], LeakRegion::Body),
+        (REVIEW_FIX_IDS[9], LeakRegion::Footer),
     ];
     let covered: Vec<&str> = cases.iter().map(|(id, _)| *id).collect();
     assert_eq!(
@@ -3596,7 +3608,7 @@ fn when_writing_summary_given_each_generated_ticket_id_then_rejects_before_publi
 /// reproduces it is refused at the review cap.
 #[test]
 fn when_writing_summary_given_review_fix_id_then_rejects_even_at_review_cap() {
-    let cap_fix = REVIEW_FIX_IDS[3];
+    let cap_fix = REVIEW_FIX_IDS[9];
     let contaminated = format!(
         "test(pipeline): summarize the run\n\nThe review cap reported {cap_fix} without queueing it.\n"
     );
@@ -3611,12 +3623,12 @@ fn when_writing_summary_given_review_fix_id_then_rejects_even_at_review_cap() {
         "the review cap keeps its retryable step: {step:?}"
     );
     assert!(
-        dir.join("tickets/r3-1-verify-edge-case.md").is_file(),
-        "the third fix queue's ticket was written and executed"
+        dir.join("tickets/r9-1-verify-edge-case.md").is_file(),
+        "the ninth fix queue's ticket was written and executed"
     );
     assert!(
-        !dir.join("tickets/r4-1-verify-edge-case.md").exists(),
-        "the fourth review's fix is reported but never written as a ticket file"
+        !dir.join("tickets/r10-1-verify-edge-case.md").exists(),
+        "the tenth review's fix is reported but never written as a ticket file"
     );
 
     let requests = summary_requests(&transport);
@@ -3648,7 +3660,7 @@ fn when_writing_summary_given_review_fix_id_then_rejects_even_at_review_cap() {
 /// and an answer naming any of them is refused.
 #[test]
 fn when_writing_summary_given_all_review_rounds_then_checks_cap_round_fix_id() {
-    let contaminated = "test(pipeline): summarize the run\n\nFixes r1-1-verify-edge-case and r4-1-verify-edge-case shipped.\n";
+    let contaminated = "test(pipeline): summarize the run\n\nFixes r1-1-verify-edge-case and r10-1-verify-edge-case shipped.\n";
     let script = common::SummaryScript::Turns(vec![
         common::SummaryReply::Answer(contaminated.to_string()),
         common::SummaryReply::Answer(CLEAN_SUMMARY.to_string()),
@@ -3722,16 +3734,16 @@ fn when_building_summary_request_given_queue_and_review_reports_then_preserves_i
     assert!(report.contains(ORIGINAL_TICKET_ID), "{report}");
     let review = fs::read_to_string(dir.join("review.md"))
         .unwrap_or_else(|e| common::failed("the review artifact", &e.to_string()));
-    assert!(review.contains("r4-1-verify-edge-case"), "{review}");
-    for id in &REVIEW_FIX_IDS[..3] {
+    assert!(review.contains("r10-1-verify-edge-case"), "{review}");
+    for id in &REVIEW_FIX_IDS[..9] {
         assert!(
             dir.join(format!("tickets/{id}.md")).is_file(),
             "the executed fix ticket {id} must be on disk: {review}"
         );
     }
     assert!(
-        !dir.join("tickets/r4-1-verify-edge-case.md").exists(),
-        "the fourth review's fix is reported but never written as a ticket file"
+        !dir.join("tickets/r10-1-verify-edge-case.md").exists(),
+        "the tenth review's fix is reported but never written as a ticket file"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -13464,4 +13476,200 @@ fn when_finalizing_given_ignored_artifact_directory_on_default_branch_then_keeps
         "pre-staged artifact change\n",
         "the force-tracked artifact's working-tree contents stay untouched"
     );
+}
+
+fn review_reply_with_finding(
+    finding_id: &str,
+    category: &str,
+    target: &str,
+    ticket_id: &str,
+) -> HandoverReply {
+    let args = serde_json::json!({
+        "review": {
+            "scorecard": {
+                "keeper_coverage": "Core entry-point behavior verified.",
+                "sediment_and_coupling": "Zero internal mocks.",
+                "inferred_assumptions": "Assumptions verified.",
+                "boundary_matrix": "Boundary defect remains.",
+                "code_and_scope": "Follow-up fix required."
+            },
+            "findings": [{
+                "id": finding_id,
+                "category": category,
+                "target": target,
+                "detail": "Verify command output handles the empty boundary case."
+            }],
+            "fixes": [{
+                "id": ticket_id,
+                "title": "Verify command output handles empty boundary case",
+                "objective": "Confirm that the command output check covers the empty boundary case.",
+                "acceptance_criteria": ["[Pass] The command outputs exactly \"ejaj-e2e-ok\" when run"],
+                "prerequisites_assumed": "The initial verification ticket completed.",
+                "out_of_scope": ["No repository file edits"],
+                "scope_of_changes": ["Verify the empty boundary case for command output."],
+                "test_expectations": ["when_checking_output_given_empty_boundary_then_confirms_ejaj_e2e_ok"],
+                "verification_gate": "if [ \"$(echo 'ejaj-e2e-ok')\" != 'ejaj-e2e-ok' ]; then exit 1; fi",
+                "blocked_by": [],
+                "blocks": []
+            }]
+        }
+    })
+    .to_string();
+    HandoverReply::tool("finish_review", args)
+}
+
+#[test]
+fn when_reviewing_given_reopened_finding_after_intermediate_round_then_breaks_circuit_and_returns_retry()
+ {
+    let plan = common::harmless_plan_fixture();
+    let plan_markdown = plan.to_markdown();
+    let run = handover_run(vec![
+        finish_plan_reply(&plan_markdown),
+        finish_spec_reply(),
+        finish_tickets_reply(),
+        HandoverReply::tool("finish_triage", ready_triage_arguments()),
+        // Queue round 1
+        bash_reply(),
+        task_complete_reply(),
+        // Review round 1 reports f1-regression
+        review_reply_with_finding("f1-regression", "boundary-matrix", "src/app.ts:click", "r1-1-fix"),
+        // Queue round 2
+        bash_reply(),
+        task_complete_reply(),
+        // Review round 2 reports a different finding f2-other (f1-regression passed)
+        review_reply_with_finding("f2-other", "code-and-scope", "src/other.ts:init", "r2-1-fix"),
+        // Queue round 3
+        bash_reply(),
+        task_complete_reply(),
+        // Review round 3 re-opens f1-regression -> circuit breaker trips!
+        review_reply_with_finding("f1-regression", "boundary-matrix", "src/app.ts:click", "r3-1-fix"),
+        // Summary pass receives the circuit-broken termination outcome.
+        HandoverReply::Error(CallError::Api {
+            status: 400,
+            message: "stop at summary after circuit break".to_string(),
+        }),
+    ]);
+    let HandoverRun {
+        mut pipeline,
+        transport,
+        artifacts,
+        repository,
+        dir,
+    } = run;
+
+    let step = pipeline.ask("first request", &artifacts);
+    assert!(matches!(step, Step::SummaryFailed { .. }), "{step:?}");
+
+    // Round 3's fix ticket must NOT be written to disk because the circuit breaker stopped the loop.
+    assert!(artifacts.join("tickets/r1-1-fix.md").is_file());
+    assert!(artifacts.join("tickets/r2-1-fix.md").is_file());
+    assert!(!artifacts.join("tickets/r3-1-fix.md").exists());
+
+    let requests = transport.requests();
+    let summary_request = requests.last().expect("summary request was sent").to_string();
+    assert!(
+        summary_request.contains("review circuit breaker stopped the run on review round 3"),
+        "{summary_request}"
+    );
+    assert!(
+        summary_request.contains("re-opened"),
+        "{summary_request}"
+    );
+
+    drop(repository);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_resuming_after_incomplete_queue_given_dirty_working_tree_then_allows_next_plan_turn_on_same_pipeline()
+ {
+    let repository = committed_repository();
+    let target = repository.path().join("tracked.txt");
+    let dirty_command = format!("printf 'uncommitted retry work\\n' > '{}'", target.display());
+    let first_session = repository.path().join(".ejaj/retry-session-1");
+    let second_session = repository.path().join(".ejaj/retry-session-2");
+
+    let transport = Arc::new(
+        common::ScriptedTransport::new()
+            .with_gate(common::GateScript::Failing)
+            .with_bash_command(dirty_command)
+            .with_repeating_handoffs(),
+    );
+    let config = common::scripted_pipeline_with_transport(transport.clone());
+    let mut pipeline = Pipeline::new(&config, common::scope(), repository.path());
+
+    let first = pipeline.ask(&common::harmless_plan_request(), &first_session);
+    assert!(
+        matches!(first, Step::Retry),
+        "the failing gate leaves the run in Step::Retry: {first:?}"
+    );
+    assert!(
+        repository.status().contains("tracked.txt"),
+        "the incomplete run left uncommitted changes in the working tree"
+    );
+
+    // A second ask on the same Pipeline instance must not fail preflight on the
+    // uncommitted changes left by the first incomplete run.
+    let second = pipeline.ask(&common::harmless_plan_request(), &second_session);
+    assert!(
+        matches!(second, Step::Retry),
+        "the follow-up ask must pass preflight and run instead of failing with GitFailed: {second:?}"
+    );
+    assert!(second_session.join("plan.md").is_file());
+
+    let _ = fs::remove_dir_all(repository.path());
+}
+
+#[test]
+fn when_transition_gate_fails_once_given_project_test_suite_then_queues_repair_ticket_before_review()
+ {
+    let repository = committed_repository();
+    repository.write(
+        "package.json",
+        r#"{"name":"suite-gate-check","version":"0.1.0","scripts":{"test":"test -f suite-fixed.txt"}}"#,
+    );
+    repository.commit_all("add package.json test suite");
+    let session = repository.path().join(".ejaj/transition-gate-session");
+    let fix_suite = format!(
+        "printf 'fixed\\n' > '{}'",
+        repository.path().join("suite-fixed.txt").display()
+    );
+
+    let transport = Arc::new(
+        common::ScriptedTransport::new()
+            .with_review(common::ReviewScript::Pass)
+            .with_code_replies(vec![
+                // Queue round 1: narrow ticket passes, but suite-fixed.txt is still missing.
+                common::CodeReply::ToolCall {
+                    narration: None,
+                    command: "echo ejaj-e2e-ok".to_string(),
+                },
+                common::CodeReply::Complete(None),
+                // Queue round 2 (transition-gate repair ticket): creates suite-fixed.txt.
+                common::CodeReply::ToolCall {
+                    narration: None,
+                    command: fix_suite,
+                },
+                common::CodeReply::Complete(None),
+            ]),
+    );
+    let config = common::scripted_pipeline_with_transport(transport.clone());
+    let mut pipeline = Pipeline::new(&config, common::scope(), repository.path());
+
+    let step = pipeline.ask(&common::harmless_plan_request(), &session);
+    assert!(
+        matches!(step, Step::Complete),
+        "after the transition-gate repair ticket fixes the suite, the run completes: {step:?}"
+    );
+    assert!(
+        session.join("tickets/g1-1-fix-full-test-suite.md").is_file(),
+        "the transition gate must persist its repair ticket before review"
+    );
+    assert_eq!(
+        review_contexts(&transport).len(),
+        1,
+        "review runs only after the transition-gate repair round makes the full suite pass"
+    );
+
+    let _ = fs::remove_dir_all(repository.path());
 }

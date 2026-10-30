@@ -898,6 +898,7 @@ pub fn fixing_review_json(round: usize) -> String {
 /// fix queue's own outcome independently of the original queue's.
 fn fixing_review_json_with_gate(round: usize, gate: &str) -> String {
     let finding_id = format!("f{round}-edge-case");
+    let finding_target = format!("1-verify-command-output:round-{round}");
     let ticket_id = format!("r{round}-1-verify-edge-case");
     serde_json::json!({
         "review": {
@@ -911,7 +912,7 @@ fn fixing_review_json_with_gate(round: usize, gate: &str) -> String {
             "findings": [{
                 "id": finding_id,
                 "category": "boundary-matrix",
-                "target": "1-verify-command-output",
+                "target": finding_target,
                 "detail": "Verify command output handles the empty boundary case."
             }],
             "fixes": [{

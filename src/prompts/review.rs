@@ -16,7 +16,11 @@ Batch related reads and searches into one script call. Never write, build or tes
 2. **Complete the Pre-Flight Audit Scorecard (`scorecard`):** every field is required and non-blank:
    - `keeper_coverage`: verify coverage across the 4 Keeper Categories:
      1. Core Entry-Point Behaviors (real caller journeys via CLI, API, or public interface).
-     2. Edge-Case Tables (consolidated parameterized table).
+     2. Edge-Case Tables (a consolidated parameterized table when boundary cases share the same \
+input/assertion shape, OR the explicit per-dimension boundary tests named in the executed \
+tickets' `test_expectations` across the 5 boundary dimensions; never reject a suite solely for \
+using the explicit per-dimension `when_<action>_given_<context>_then_<outcome>` tests its tickets \
+specified instead of a single table).
      3. Contract & Invariant Checks (schemas, error envelopes, consumer invariants).
      4. Regression Tests (applicable when the spec targets a bug fix).
    - `sediment_and_coupling`: confirm zero internal mocks (internal classes, services, and local \
@@ -39,8 +43,12 @@ internal function or class names in test titles are strictly forbidden.
    - **When no defects remain:** pass `findings: []` and `fixes: []`. The pipeline will write \
 `review.md` and proceed to the change summary.
    - **When defects remain:** list the highest-priority defects in `findings` and emit the ordered \
-`fixes` tickets that resolve them. Every finding must be covered in substance by at least one fix \
-ticket, and every fix ticket must satisfy all ticket rules:
+`fixes` tickets that resolve them. When a finding from any prior review round is still unresolved, \
+or when a later fix ticket breaks behavior that an earlier finding covered, reuse that earlier \
+finding's exact `id` in `findings` (while giving the new fix ticket a fresh `r<round>-<n>-<slug>` \
+ticket `id`); assign a new `finding.id` only to a defect not reported in any prior review round. \
+Every finding must be covered in substance by at least one fix ticket, and every fix ticket must \
+satisfy all ticket rules:
      - `id`: a new unique ticket id (`[A-Za-z0-9._-]+`, e.g. `r1-1-<slug>`) that does not collide \
 with any ticket id already executed in this run.
      - `blocked_by` / `blocks`: may only reference other fix tickets emitted in this same `fixes` list.
@@ -76,6 +84,21 @@ mod tests {
             "code_and_scope",
             "when_<action>_given_<context>_then_<outcome>",
             "finish_review",
+        ] {
+            assert!(
+                REVIEW_SYSTEM_PROMPT.contains(needle),
+                "REVIEW_SYSTEM_PROMPT must contain `{needle}`"
+            );
+        }
+    }
+
+    #[test]
+    fn when_inspecting_review_prompt_given_edge_case_table_and_finding_reuse_rules_then_documents_both_contracts()
+     {
+        for needle in [
+            "explicit per-dimension boundary tests named in the executed tickets' `test_expectations`",
+            "never reject a suite solely for using the explicit per-dimension",
+            "reuse that earlier finding's exact `id` in `findings`",
         ] {
             assert!(
                 REVIEW_SYSTEM_PROMPT.contains(needle),

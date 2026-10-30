@@ -1507,7 +1507,8 @@ mod tests {
     fn when_summarizing_given_absent_initial_answer_then_preserves_existing_failure_without_correction()
      {
         let mut messages = reasoned_summary_transcript();
-        let script = Script::new(vec![reply(None, &[])]);
+        let attempts = crate::retry::MAX_ATTEMPTS as usize;
+        let script = Script::new(vec![reply(None, &[]); attempts]);
         let config = mid_config(script.clone());
 
         match summary_pass(&mut messages, &config, &[], InvocationContext::default()) {
@@ -1516,8 +1517,8 @@ mod tests {
         }
         assert_eq!(
             script.requests().len(),
-            1,
-            "an absent answer must not trigger a correction request"
+            attempts,
+            "an absent answer retries only at the transport boundary and never triggers a correction request"
         );
     }
 

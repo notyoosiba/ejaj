@@ -125,6 +125,13 @@ pub(crate) fn preflight(root: &Path) -> Result<(), GitFailure> {
     )))
 }
 
+/// Verify that `root` is a readable Git repository without requiring a clean
+/// working tree, used when a pipeline session resumes at `plan>>` after its
+/// own incomplete queue/review run left uncommitted changes.
+pub(crate) fn preflight_repository(root: &Path) -> Result<(), GitFailure> {
+    status(root).map_err(preflight_failure).map(|_| ())
+}
+
 /// A failed preflight, in the same staged shape as the operations that record a
 /// finished run: the status read that begins every invocation is an operation
 /// too, and the caller reports it exactly like the staging and the commit.

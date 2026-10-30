@@ -2106,14 +2106,15 @@ mod tests {
             None
         );
 
-        let script = Script::new(vec![native_reply(None, &[])]);
+        let attempts = crate::retry::MAX_ATTEMPTS as usize;
+        let script = Script::new(vec![native_reply(None, &[]); attempts]);
         let config = config(script.clone());
         let mut messages = summary_transcript();
         match run_agent_loop(&mut messages, &config, Phase::Summary, Source::None) {
             Stop::Failed(FailureKind::Malformed) => {}
             _ => panic!("a native turn with no content blocks is an unusable response"),
         }
-        assert_eq!(script.requests(), 1);
+        assert_eq!(script.requests(), attempts);
     }
 
     /// Read-only boundary: this is a narration-only policy change, so the

@@ -44,12 +44,15 @@ use std::path::{Path, PathBuf};
 /// Upper bound on review-generated fix queue rounds in one [`Pipeline::ask`]:
 /// each of these rounds runs a review pass, queues the fix set that review
 /// emitted, runs the queue, and then reviews again.
-pub const MAX_FIX_QUEUE_ROUNDS: usize = 3;
+pub const MAX_FIX_QUEUE_ROUNDS: usize = 9;
 /// Upper bound on review passes in one [`Pipeline::ask`]: the review of the
 /// original queue plus one review after each review-generated fix queue round,
-/// so the last permitted fix set is followed by the fourth review that can pass
+/// so the last permitted fix set is followed by the tenth review that can pass
 /// the run.
 pub const MAX_REVIEW_ROUNDS: usize = MAX_FIX_QUEUE_ROUNDS + 1;
+/// Consecutive review rounds (or transition-gate attempts) that may fail on
+/// the same finding or target before the circuit breaker stops the loop.
+pub const MAX_STALLED_REVIEW_ROUNDS: usize = 3;
 /// What the REPL should do after one [`Pipeline::ask`].
 #[derive(Debug)]
 pub enum Step {
@@ -108,6 +111,10 @@ pub struct Pipeline {
     /// run would change is not clean.
     root: PathBuf,
     plan_agent: plan::Session,
+    /// Whether an earlier invocation on this pipeline instance reached the
+    /// queue and returned `Step::Retry` without committing its working-tree
+    /// changes.
+    dirty_from_retry: bool,
 }
 
 impl Pipeline {
@@ -121,6 +128,7 @@ impl Pipeline {
             scope: scope.to_string(),
             root: root.as_ref().to_path_buf(),
             plan_agent: plan::Session::new(config, scope),
+            dirty_from_retry: false,
         }
     }
 
@@ -146,7 +154,7 @@ impl Pipeline {
         // as the staging and the commit that record a finished run, so every
         // fatal Git failure reaches the caller as one result, distinguished only
         // by the stage it names.
-        if let Err(failure) = git::preflight(&self.root) {
+        if let Err(failure) = self.preflight_root() {
             return Step::GitFailed {
                 stage: failure.stage,
                 reason: failure.reason,
@@ -240,6 +248,18 @@ impl Pipeline {
         // succeeded, so a fatal Git failure is never presented as a successful
         // completion.
         self.finish(run, &plan, &text)
+    }
+
+    /// Check the project root before a new REPL line starts. A fresh session
+    /// requires a clean tree; a session resuming after its own incomplete
+    /// queue/review run allows the uncommitted changes that run left behind
+    /// while still requiring a readable Git repository.
+    fn preflight_root(&self) -> Result<(), git::GitFailure> {
+        if self.dirty_from_retry {
+            git::preflight_repository(&self.root)
+        } else {
+            git::preflight(&self.root)
+        }
     }
 
     /// Ask the plan interview one turn and keep only a validated handoff.
@@ -490,8 +510,16 @@ impl Pipeline {
             progress
                 .prior_completed
                 .extend(progress.current_set.tickets.iter().cloned());
-            progress.review_round += 1;
 
+            match self.transition_gate(&mut progress, tickets_dir)? {
+                TransitionGate::Passed => {}
+                TransitionGate::Queued => continue,
+                TransitionGate::Terminated(termination) => {
+                    return Ok(RunReview::terminated(termination, result.report, &progress));
+                }
+            }
+
+            progress.review_round += 1;
             match self.review_round(
                 &mut progress,
                 specification,
@@ -556,6 +584,75 @@ impl Pipeline {
         let overhead_label = format!("ticket-queue round {} overhead", progress.queue_round);
         let _ = status::shared().elapsed_log(&overhead_label, contributions.residual(elapsed));
         result
+    }
+
+    /// Run the repository-wide full test suite gate after a resolved queue
+    /// round and before the review agent is called, when the project root
+    /// declares a standard test manifest (`Cargo.toml` or `package.json`).
+    fn transition_gate(
+        &self,
+        progress: &mut ReviewProgress,
+        tickets_dir: &Path,
+    ) -> Result<TransitionGate, Step> {
+        let Some(command) = transition_gate_command(&self.root) else {
+            progress.transition_failures = 0;
+            return Ok(TransitionGate::Passed);
+        };
+
+        let _ = status::shared().stdout_log(&format!("\n=== Transition gate ({command}) ===\n"));
+        match crate::tools::run_command_in(&self.root, command) {
+            Ok(_) => {
+                progress.transition_failures = 0;
+                let _ =
+                    status::shared().stdout_log(&format!("[INFO] transition gate `{command}` passed"));
+                Ok(TransitionGate::Passed)
+            }
+            Err(output) => {
+                self.handle_transition_gate_failure(progress, tickets_dir, command, &output)
+            }
+        }
+    }
+
+    /// Queue a synthetic repair ticket for a failed transition gate, or stop
+    /// when the consecutive failure bound or fix-round cap is reached.
+    fn handle_transition_gate_failure(
+        &self,
+        progress: &mut ReviewProgress,
+        tickets_dir: &Path,
+        command: &str,
+        output: &str,
+    ) -> Result<TransitionGate, Step> {
+        progress.transition_failures += 1;
+        let reason = transition_failure_excerpt(output);
+        if progress.transition_failures >= MAX_STALLED_REVIEW_ROUNDS
+            || progress.queue_round > MAX_FIX_QUEUE_ROUNDS
+        {
+            let _ = status::shared().stderr_log(&format!(
+                "[WARN] transition gate `{command}` failed after queue round {} ({reason}); \
+                 the plan tool must be called again to start a new run.",
+                progress.queue_round
+            ));
+            return Ok(TransitionGate::Terminated(
+                RunTermination::TransitionGateFailed {
+                    round: progress.queue_round,
+                    command: command.to_string(),
+                    reason,
+                },
+            ));
+        }
+
+        let _ = status::shared().stderr_log(&format!(
+            "[WARN] transition gate `{command}` failed after queue round {}; \
+             queueing a repair ticket before review.",
+            progress.queue_round
+        ));
+        let ticket = transition_fix_ticket(progress.queue_round, command, &reason);
+        write_tickets(tickets_dir, std::slice::from_ref(&ticket))?;
+        progress.all_tickets.push(ticket.clone());
+        progress.current_set = TicketSet {
+            tickets: vec![ticket],
+        };
+        Ok(TransitionGate::Queued)
     }
 
     /// Run one review round, write its cumulative artifact and either queue its
@@ -631,10 +728,21 @@ impl Pipeline {
             return Ok(ReviewRound::Passed);
         }
 
-        // The last permitted review still reported fixes: every one of the
-        // three review-generated fix queues has run, and the final review's fix
-        // set is deliberately not queued. The run stays incomplete and
-        // retryable, exactly as any other non-passing review does.
+        let prior_reviews = &progress.reviews[..progress.reviews.len() - 1];
+        if let Some(reason) = review_circuit_breaker(prior_reviews, &review_report) {
+            let _ = status::shared().stderr_log(&format!(
+                "[WARN] review circuit breaker tripped on round {round} ({reason}); \
+                 the plan tool must be called again to start a new run."
+            ));
+            return Ok(ReviewRound::Terminated(
+                RunTermination::ReviewCircuitBroken { round, reason },
+            ));
+        }
+
+        // The last permitted review still reported fixes: every permitted
+        // review-generated fix queue has run, and the final review's fix set
+        // is deliberately not queued. The run stays incomplete and retryable,
+        // exactly as any other non-passing review does.
         if round >= MAX_REVIEW_ROUNDS {
             let _ = status::shared().stderr_log(&format!(
                 "[WARN] review still reported {} finding(s) after {MAX_REVIEW_ROUNDS} review \
@@ -715,22 +823,17 @@ impl Pipeline {
     fn finish(&mut self, run: RunReview, plan: &Plan, text: &str) -> Step {
         let _ = emit_summary(&mut status::shared(), text);
 
-        match &run.termination {
-            RunTermination::Queue(orchestrator::Outcome::Resolved) => Step::Complete,
-            RunTermination::Queue(outcome) => {
-                self.downstream_retry(plan, "queue", queue_retry_detail(outcome, &run.report))
-            }
-            RunTermination::ReviewIncomplete { reason } => {
-                self.downstream_retry(plan, "review", format!("did not complete: {reason}"))
-            }
-            RunTermination::ReviewCapReached { rounds, findings } => self.downstream_retry(
-                plan,
-                "review",
-                format!(
-                    "still reported {findings} unresolved finding(s) after {rounds} review rounds"
-                ),
-            ),
+        if matches!(
+            &run.termination,
+            RunTermination::Queue(orchestrator::Outcome::Resolved)
+        ) {
+            self.dirty_from_retry = false;
+            return Step::Complete;
         }
+
+        self.dirty_from_retry = true;
+        let (phase, detail) = retry_termination_detail(&run.termination, &run.report);
+        self.downstream_retry(plan, phase, detail)
     }
 
     /// Record one concise downstream phase outcome in the plan agent's
@@ -866,12 +969,33 @@ fn authorizes_queue(report: &TriageReport) -> bool {
 enum RunTermination {
     /// Ended on the queue's own outcome (or after a passing review for `Resolved`).
     Queue(orchestrator::Outcome),
+    /// The full-suite transition gate between the queue and review failed and
+    /// could not be repaired within the round bound.
+    TransitionGateFailed {
+        round: usize,
+        command: String,
+        reason: String,
+    },
     /// The queue resolved, but the review pass ended without `finish_review`.
     ReviewIncomplete { reason: String },
     /// The last permitted review still emitted fix tickets, so its fix set is
-    /// reported but never queued: three review-generated fix queues have
-    /// already run.
+    /// reported but never queued.
     ReviewCapReached { rounds: usize, findings: usize },
+    /// The review circuit breaker stopped the loop because a finding re-opened
+    /// after passing an intermediate round or stalled for consecutive rounds.
+    ReviewCircuitBroken { round: usize, reason: String },
+}
+
+/// Outcome of the full-suite transition gate between a resolved queue round
+/// and the review pass.
+enum TransitionGate {
+    /// No transition gate applies, or the full test suite exited 0.
+    Passed,
+    /// The transition gate failed and queued a repair ticket for the next
+    /// queue round.
+    Queued,
+    /// The transition gate failed at the round or consecutive-failure cap.
+    Terminated(RunTermination),
 }
 
 /// The mutable state one queue/review loop accumulates: the accepted reviews,
@@ -879,29 +1003,29 @@ enum RunTermination {
 /// round numbers.
 struct ReviewProgress {
     prior_completed: Vec<Ticket>,
-    original_tickets: Vec<Ticket>,
     all_tickets: Vec<Ticket>,
     current_set: TicketSet,
     reviews: Vec<ReviewReport>,
     review_markdown: String,
     review_round: usize,
     queue_round: usize,
+    transition_failures: usize,
 }
 
 impl ReviewProgress {
-    /// Seed the loop from the original draft set, keeping the original typed
-    /// tickets apart for the summary's generated-id gate.
+    /// Seed the loop from the original draft set, keeping all executed tickets
+    /// for the summary's generated-id gate.
     fn new(set: TicketSet) -> ReviewProgress {
-        let original_tickets = set.tickets.clone();
+        let all_tickets = set.tickets.clone();
         ReviewProgress {
             prior_completed: Vec::new(),
-            all_tickets: original_tickets.clone(),
-            original_tickets,
+            all_tickets,
             current_set: set,
             reviews: Vec::new(),
             review_markdown: String::new(),
             review_round: 0,
             queue_round: 0,
+            transition_failures: 0,
         }
     }
 }
@@ -926,7 +1050,7 @@ struct RunReview {
 
 impl RunReview {
     /// Keep the loop's final queue report and cumulative review content, with
-    /// the generated-id set built from the original tickets and every accepted
+    /// the generated-id set built from every queued ticket and every accepted
     /// review report.
     fn terminated(
         termination: RunTermination,
@@ -937,37 +1061,208 @@ impl RunReview {
             termination,
             report,
             review_markdown: progress.review_markdown.clone(),
-            generated_ids: generated_ticket_ids(&progress.original_tickets, &progress.reviews),
+            generated_ids: generated_ticket_ids(&progress.all_tickets, &progress.reviews),
         }
     }
 }
 
-/// Every generated ticket id this run created, for the summary's id gate: the
-/// original typed tickets, then every accepted review report's fix tickets.
-///
-/// The review reports include the final allowed round's report, so a fix ticket
-/// the cap round reported but never queued or wrote as a ticket file is still
-/// part of the set: the summary must not name that one either.
-fn generated_ticket_ids(original: &[Ticket], reviews: &[ReviewReport]) -> Vec<String> {
-    let mut ids: Vec<String> = original
+/// Every generated ticket id this run created, for the summary's id gate: every
+/// queued ticket (original, transition-gate repair, and review fix), plus any
+/// unqueued fix tickets from the final review report.
+fn generated_ticket_ids(all_tickets: &[Ticket], reviews: &[ReviewReport]) -> Vec<String> {
+    let mut ids: Vec<String> = all_tickets
         .iter()
         .map(|ticket| ticket.id.trim().to_string())
         .collect();
     for review in reviews {
-        ids.extend(
-            review
-                .fixes
-                .iter()
-                .map(|ticket| ticket.id.trim().to_string()),
-        );
+        for ticket in &review.fixes {
+            let id = ticket.id.trim().to_string();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
     }
     ids
+}
+
+/// The repository-wide test command to run between a resolved queue round and
+/// the review pass, when the project root declares a standard manifest.
+fn transition_gate_command(root: &Path) -> Option<&'static str> {
+    if root.join("Cargo.toml").is_file() {
+        Some("cargo test")
+    } else if root.join("package.json").is_file() {
+        Some("npm test")
+    } else {
+        None
+    }
+}
+
+/// Bounded tail excerpt of a failed transition-gate command's output.
+fn transition_failure_excerpt(output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return "command exited non-zero with no output".to_string();
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= 1_200 {
+        trimmed.to_string()
+    } else {
+        let tail: String = chars[chars.len() - 1_200..].iter().collect();
+        format!("...{tail}")
+    }
+}
+
+/// Build a synthetic repair ticket when the full-suite transition gate fails
+/// after a queue round's narrow gates all passed.
+fn transition_fix_ticket(queue_round: usize, command: &str, excerpt: &str) -> Ticket {
+    Ticket {
+        id: format!("g{queue_round}-1-fix-full-test-suite"),
+        blocked_by: Vec::new(),
+        blocks: Vec::new(),
+        title: format!("Fix full test suite regression ({command})"),
+        objective: format!(
+            "The ticket queue resolved its narrow verification gates, but the full-suite \
+             transition gate `{command}` failed before review. Fix the regression so \
+             `{command}` exits 0."
+        ),
+        acceptance_criteria: vec![format!(
+            "The full test suite command `{command}` exits with code 0."
+        )],
+        prerequisites_assumed: format!(
+            "Queue round {queue_round} completed, and `{command}` failed with:\n{excerpt}"
+        ),
+        out_of_scope: vec!["Unrelated features outside the specification.".to_string()],
+        scope_of_changes: vec![format!(
+            "Resolve the cross-suite regression reported by `{command}`."
+        )],
+        test_expectations: vec![
+            "when_running_full_test_suite_given_completed_queue_round_then_all_repository_tests_pass"
+                .to_string(),
+        ],
+        verification_gate: command.to_string(),
+    }
+}
+
+/// Whether `report` contains a finding matching `finding` by id or by
+/// normalized `(category, target)`.
+fn report_matches_finding(
+    report: &ReviewReport,
+    finding: &crate::review::ReviewFinding,
+) -> bool {
+    let id = finding.id.trim();
+    let category = finding.category.trim();
+    let target = finding.target.trim();
+    report.findings.iter().any(|prior| {
+        prior.id.trim().eq_ignore_ascii_case(id)
+            || (prior.category.trim().eq_ignore_ascii_case(category)
+                && prior.target.trim().eq_ignore_ascii_case(target))
+    })
+}
+
+/// Detect a finding that was reported in an earlier round, disappeared in the
+/// immediately preceding round, and re-opened in `current`.
+fn reopened_finding(
+    prior_reviews: &[ReviewReport],
+    current: &ReviewReport,
+) -> Option<String> {
+    let [older @ .., previous] = prior_reviews else {
+        return None;
+    };
+    if older.is_empty() {
+        return None;
+    }
+    current.findings.iter().find_map(|finding| {
+        let reopened = !report_matches_finding(previous, finding)
+            && older.iter().any(|report| report_matches_finding(report, finding));
+        reopened.then(|| {
+            format!(
+                "finding `{}` on `{}` re-opened after passing an intermediate review round",
+                finding.id.trim(),
+                finding.target.trim()
+            )
+        })
+    })
+}
+
+/// Detect a finding that has remained unresolved for
+/// [`MAX_STALLED_REVIEW_ROUNDS`] consecutive review rounds.
+fn stalled_finding(
+    prior_reviews: &[ReviewReport],
+    current: &ReviewReport,
+) -> Option<String> {
+    let needed = MAX_STALLED_REVIEW_ROUNDS - 1;
+    if prior_reviews.len() < needed {
+        return None;
+    }
+    let window = &prior_reviews[prior_reviews.len() - needed..];
+    current.findings.iter().find_map(|finding| {
+        let stalled = window
+            .iter()
+            .all(|report| report_matches_finding(report, finding));
+        stalled.then(|| {
+            format!(
+                "finding `{}` on `{}` remained unresolved for {MAX_STALLED_REVIEW_ROUNDS} \
+                 consecutive review rounds",
+                finding.id.trim(),
+                finding.target.trim()
+            )
+        })
+    })
+}
+
+/// Check whether `current` trips the review circuit breaker against
+/// `prior_reviews`.
+fn review_circuit_breaker(
+    prior_reviews: &[ReviewReport],
+    current: &ReviewReport,
+) -> Option<String> {
+    reopened_finding(prior_reviews, current).or_else(|| stalled_finding(prior_reviews, current))
+}
+
+/// The phase name and concise detail handed to `downstream_retry` for a
+/// non-passing run termination.
+fn retry_termination_detail(
+    termination: &RunTermination,
+    report: &str,
+) -> (&'static str, String) {
+    match termination {
+        RunTermination::Queue(outcome) => ("queue", queue_retry_detail(outcome, report)),
+        RunTermination::TransitionGateFailed {
+            round,
+            command,
+            reason,
+        } => (
+            "queue",
+            format!("transition gate `{command}` failed after queue round {round}: {reason}"),
+        ),
+        RunTermination::ReviewIncomplete { reason } => {
+            ("review", format!("did not complete: {reason}"))
+        }
+        RunTermination::ReviewCapReached { rounds, findings } => (
+            "review",
+            format!(
+                "still reported {findings} unresolved finding(s) after {rounds} review rounds"
+            ),
+        ),
+        RunTermination::ReviewCircuitBroken { round, reason } => (
+            "review",
+            format!("circuit breaker stopped the run on review round {round} ({reason})"),
+        ),
+    }
 }
 
 /// Format the run termination in the terms the summary pass receives.
 fn termination_outcome(termination: &RunTermination) -> String {
     match termination {
         RunTermination::Queue(outcome) => queue_outcome(outcome),
+        RunTermination::TransitionGateFailed {
+            round,
+            command,
+            reason,
+        } => format!(
+            "Incomplete: the queue completed its tickets in round {round}, but the full-suite \
+             transition gate `{command}` failed before review: {reason}."
+        ),
         RunTermination::ReviewIncomplete { reason } => format!(
             "Incomplete: the queue completed every ticket, but the review pass did not complete: \
              {reason}."
@@ -975,6 +1270,10 @@ fn termination_outcome(termination: &RunTermination) -> String {
         RunTermination::ReviewCapReached { rounds, findings } => format!(
             "Incomplete: the review pass still reported {findings} unresolved finding(s) after \
              the maximum of {rounds} review rounds."
+        ),
+        RunTermination::ReviewCircuitBroken { round, reason } => format!(
+            "Incomplete: the review circuit breaker stopped the run on review round {round} \
+             ({reason})."
         ),
     }
 }
@@ -1499,6 +1798,108 @@ mod tests {
         assert!(!dir.join("plan.md").exists());
         assert!(!dir.join("spec.md").exists());
         assert!(!dir.join("tickets").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn sample_scorecard() -> crate::review::ReviewScorecard {
+        crate::review::ReviewScorecard {
+            keeper_coverage: "ok".to_string(),
+            sediment_and_coupling: "ok".to_string(),
+            inferred_assumptions: "ok".to_string(),
+            boundary_matrix: "ok".to_string(),
+            code_and_scope: "ok".to_string(),
+        }
+    }
+
+    fn sample_fix_ticket(id: &str) -> Ticket {
+        Ticket {
+            id: id.to_string(),
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+            title: "Fix boundary defect".to_string(),
+            objective: "Resolve the boundary defect reported in review.".to_string(),
+            acceptance_criteria: vec!["The boundary case passes.".to_string()],
+            prerequisites_assumed: "Existing module is present.".to_string(),
+            out_of_scope: vec!["None.".to_string()],
+            scope_of_changes: vec!["Update the boundary handler.".to_string()],
+            test_expectations: vec![
+                "when_handling_boundary_given_edge_input_then_preserves_invariant".to_string(),
+            ],
+            verification_gate: "cargo test".to_string(),
+        }
+    }
+
+    fn sample_review_report(finding_id: &str, category: &str, target: &str, ticket_id: &str) -> ReviewReport {
+        ReviewReport {
+            scorecard: sample_scorecard(),
+            findings: vec![crate::review::ReviewFinding {
+                id: finding_id.to_string(),
+                category: category.to_string(),
+                target: target.to_string(),
+                detail: "Defect detail.".to_string(),
+            }],
+            fixes: vec![sample_fix_ticket(ticket_id)],
+        }
+    }
+
+    #[test]
+    fn when_checking_review_bounds_given_ten_round_contract_then_exposes_nine_fix_queues_and_ten_reviews()
+     {
+        assert_eq!(MAX_FIX_QUEUE_ROUNDS, 9);
+        assert_eq!(MAX_REVIEW_ROUNDS, 10);
+        assert_eq!(MAX_STALLED_REVIEW_ROUNDS, 3);
+    }
+
+    #[test]
+    fn when_checking_review_history_given_reopened_finding_then_trips_circuit_breaker() {
+        let r1 = sample_review_report("f1-click", "boundary-matrix", "src/ui/appView.ts", "r1-1");
+        let r2 = sample_review_report("f2-clock", "contract", "src/ui/timer.ts", "r2-1");
+        let r3 = sample_review_report("f1-click", "boundary-matrix", "src/ui/appView.ts", "r3-1");
+
+        let reason = review_circuit_breaker(&[r1, r2], &r3)
+            .expect("a finding that re-opens after passing round 2 must trip the circuit breaker");
+        assert!(reason.contains("f1-click"), "{reason}");
+        assert!(reason.contains("re-opened"), "{reason}");
+    }
+
+    #[test]
+    fn when_checking_review_history_given_stalled_finding_across_three_rounds_then_trips_circuit_breaker()
+     {
+        let r1 = sample_review_report("f1-click", "boundary-matrix", "src/ui/appView.ts", "r1-1");
+        let r2 = sample_review_report("f2-click", "boundary-matrix", "src/ui/appView.ts", "r2-1");
+        let r3 = sample_review_report("f3-click", "boundary-matrix", "src/ui/appView.ts", "r3-1");
+
+        assert!(
+            review_circuit_breaker(std::slice::from_ref(&r1), &r2).is_none(),
+            "two consecutive rounds on the same target must still allow one more fix attempt"
+        );
+        let reason = review_circuit_breaker(&[r1, r2], &r3)
+            .expect("three consecutive rounds on the same category and target must trip the circuit breaker");
+        assert!(reason.contains("src/ui/appView.ts"), "{reason}");
+        assert!(reason.contains("3 consecutive review rounds"), "{reason}");
+    }
+
+    #[test]
+    fn when_checking_review_history_given_distinct_findings_then_allows_progression() {
+        let r1 = sample_review_report("f1", "boundary-matrix", "src/a.rs", "r1-1");
+        let r2 = sample_review_report("f2", "boundary-matrix", "src/b.rs", "r2-1");
+        let r3 = sample_review_report("f3", "boundary-matrix", "src/c.rs", "r3-1");
+
+        assert!(review_circuit_breaker(&[r1, r2], &r3).is_none());
+    }
+
+    #[test]
+    fn when_detecting_transition_gate_given_project_manifests_then_selects_matching_suite_command()
+    {
+        let root = scratch_dir("transition-gate-manifest");
+        assert_eq!(transition_gate_command(&root), None);
+
+        fs::write(root.join("package.json"), "{}").unwrap();
+        assert_eq!(transition_gate_command(&root), Some("npm test"));
+
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        assert_eq!(transition_gate_command(&root), Some("cargo test"));
 
         let _ = fs::remove_dir_all(&root);
     }
