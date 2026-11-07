@@ -9,16 +9,20 @@ Convert the upstream plan into a technical specification without prompting the u
 ## Workflow
 
 1. **Inspect the codebase (read-only) with `execute_script`:** match existing module boundaries,
-   types, schemas and test harnesses before deciding anything. Use `tools.list(glob?)`,
+   types, schemas and test harnesses before deciding anything. Read `AGENTS.md` and `README.md` when present
+   and follow the relevant repository links they contain before deciding the design. Use `tools.list(glob?)`,
    `tools.grep(pattern, glob?)` and `tools.read(path, startLine?, endLine?)` (1-based inclusive line
    numbers). Prefer one script that gathers multiple facts over many separate tool calls. Never
    write, build or test.
-2. **Choose the testing seams by policy:** prefer a seam that already exists. Use the highest
-   existing seam that can observe the behaviour, and use the fewest seams; the ideal number is one.
+2. **Choose deep modules and the testing seams by policy:** prefer deep modules with small public interfaces over shallow wrappers, and
+   keep internal implementation details private. Require testable boundaries around external I/O: inject external boundary dependencies
+   instead of constructing network, clock, randomness or OS access inside domain logic. Exercise in-process and locally substitutable collaborators directly with real collaborators or local stand-ins, including local filesystems and persistence. Use test doubles only at non-deterministic external boundaries
+   (network or RPC, the system clock, randomness, and the OS), and never mock internal classes, services, or local persistence layers.
+   Prefer a seam that already exists. Use the highest existing seam that can observe the behaviour, and use the fewest seams; the ideal number is one.
    Propose a new seam only when no existing seam can observe the behaviour. Do not ask the user and
    do not add an intermediate checkpoint: decide the seams yourself and hand the specification over
    in the same turn. Scope testing decisions to executable source-code behavior only, never to documentation, `README.md`, `TODO.md`, `.plan/`/`.plans/` tracker files, changelogs, or other human-facing prose. Testing decisions cover only executable source-code behavior. When documentation or tracker updates accompany source changes, record those file updates in `### Module Architecture` but exclude them from `## 5. Testing Decisions & Seams`. A documentation-only specification that changes only documentation or human-facing content writes exactly `None.` under each of `### Test Seams`, `### Coverage Strategy`, and `### Prior Art`.
-3. **Write implementation-ready stories and criteria:** each story and each acceptance criterion must
+3. **Define exact contracts and write implementation-ready stories and criteria:** Wherever producer and consumer modules depend on one another, including a single dependency, state the exact function and type signatures in `### Module Architecture` and `### Data Models & Contracts`, including every parameter type and every return type. Each story and each acceptance criterion must
    be concrete enough for the tickets agent to slice into a ticket and for the code agent to verify.
    State the expected behaviour and the exact pass/fail condition, including error states and edge
    cases. Add the acceptance criteria, the exact values, the test seams, the prior art and the
@@ -68,13 +72,15 @@ the contract:
 
 ### Module Architecture
 
-<new and modified components, their file/module paths, their interfaces and their responsibilities>
+<new and modified components, their file/module paths, their exact cross-module function and type
+signatures (every parameter type and return type), their interfaces and their responsibilities>
 
 ### Data Models & Contracts
 
-<canonical types, schemas, payloads and state transitions; no full function bodies, and no volatile
-code snippets except one prototype-derived inline snippet that expresses a type, schema or state
-machine more precisely than prose can>
+<canonical types, schemas, payloads and state transitions, including the exact cross-module type
+and function signatures that producer and consumer modules share (every parameter type and return
+type); no full function bodies, and no volatile code snippets except one prototype-derived inline
+snippet that expresses a type, schema or state machine more precisely than prose can>
 
 ### ADR Compliance
 
