@@ -14,7 +14,7 @@ change set, `tools.read(path, startLine?, endLine?)` to inspect the modified and
 and test files, and `tools.list(glob?)` / `tools.grep(pattern, glob?)` to check existing seams. \
 Batch related reads and searches into one script call. Never write, build or test.
 2. **Complete the Pre-Flight Audit Scorecard (`scorecard`):** every field is required and non-blank:
-   - `keeper_coverage`: verify coverage across the 4 Keeper Categories:
+   - `keeper_coverage`: verify coverage across the 4 Keeper Categories. Audit executable source-code behavior only; never request unit tests for documentation, `README.md`, `TODO.md`, or `.plan/`/`.plans/` tracker files:
      1. Core Entry-Point Behaviors (real caller journeys via CLI, API, or public interface).
      2. Edge-Case Tables (a consolidated parameterized table when boundary cases share the same \
 input/assertion shape, OR the explicit per-dimension boundary tests named in the executed \
@@ -28,7 +28,7 @@ persistence layers are never mocked; test doubles are restricted strictly to non
 external boundaries), no tautologies, and no private state introspection.
    - `inferred_assumptions`: explicit log of inferred assumptions (boundaries, status codes, \
 default schemas) verified against the implementation.
-   - `boundary_matrix`: evaluate the Mandatory 5-Dimension Boundary Matrix across the test suite:
+   - `boundary_matrix`: evaluate the Mandatory 5-Dimension Boundary Matrix across the test suite. Evaluate the boundary matrix for executable source-code behavior only; never request unit tests for documentation, `README.md`, `TODO.md`, or `.plan/`/`.plans/` tracker files:
      1. Empty / Zero / Nil
      2. Minimum valid boundary
      3. Maximum limit / Upper boundary
@@ -53,9 +53,7 @@ satisfy all ticket rules:
 with any ticket id already executed in this run.
      - `blocked_by` / `blocks`: may only reference other fix tickets emitted in this same `fixes` list.
      - `title`, `objective`, `prerequisites_assumed`, `out_of_scope`, `scope_of_changes`, \
-`acceptance_criteria` (at least one non-blank criterion), `test_expectations` (at least one \
-non-blank entry, and every entry must name a `when_<action>_given_<context>_then_<outcome>` test \
-identifier), and `verification_gate` (exact command exiting 0).
+`acceptance_criteria` (at least one non-blank criterion), `test_expectations` (when the fix adds test cases every entry must name a `when_<action>_given_<context>_then_<outcome>` test identifier; a fix ticket that adds no new test cases may pass `test_expectations: []`, which renders as `None.`), and `verification_gate` (exact command exiting 0).
 
 Always end by calling `finish_review`; never end your turn with a plain reply.";
 
@@ -71,7 +69,289 @@ read-only with `execute_script` (`tools.diff()` and `tools.read()`) and hand ove
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::prompts::{
+        PLAN_SYSTEM_PROMPT, REVIEW_SYSTEM_PROMPT, SPEC_SYSTEM_PROMPT, TICKETS_SYSTEM_PROMPT,
+    };
+
+    fn assert_contains_all(prompt_name: &str, prompt: &str, needles: &[&str]) {
+        for needle in needles {
+            assert!(
+                prompt.contains(needle),
+                "{prompt_name} must contain `{needle}`"
+            );
+        }
+    }
+
+    const PLAN_HEADINGS: &[&str] = &[
+        "Interview the user to align on core architectural",
+        "# <the goal in one line>",
+        "## 1. Decisions",
+        "## 2. Defaults Chosen",
+        "## 3. Constraints",
+        "## 4. Open Questions",
+    ];
+
+    const SPEC_HEADINGS: &[&str] = &[
+        "Convert the upstream plan into a technical specification without prompting the user.",
+        "## 1. Problem Statement",
+        "## 2. Solution Overview",
+        "## 3. User Stories & Acceptance Criteria",
+        "## 4. Implementation Decisions",
+        "### Module Architecture",
+        "### Data Models & Contracts",
+        "### ADR Compliance",
+        "## 5. Testing Decisions & Seams",
+        "### Test Seams",
+        "### Coverage Strategy",
+        "### Prior Art",
+        "## 6. Out of Scope",
+        "## 7. Deferred Items & Operational Risks",
+    ];
+
+    const TICKET_TEMPLATE: &[&str] = &[
+        "Turn the specification below into an ordered set of tickets without prompting the user.",
+        "## Test Expectations",
+        "## Verification Gate",
+        "`test_expectations`",
+        "`verification_gate`",
+    ];
+
+    const REVIEW_FIELDS: &[&str] = &[
+        "keeper_coverage",
+        "sediment_and_coupling",
+        "inferred_assumptions",
+        "boundary_matrix",
+        "code_and_scope",
+        "finish_review",
+    ];
+
+    /// Every phase prompt must hand over through its own terminal tool. Losing
+    /// a marker would leave the agent without an exit and stall the pipeline.
+    const PHASE_HANDOFF_MARKERS: &[(&str, &str, &str)] = &[
+        ("PLAN_SYSTEM_PROMPT", PLAN_SYSTEM_PROMPT, "finish_plan"),
+        ("SPEC_SYSTEM_PROMPT", SPEC_SYSTEM_PROMPT, "finish_spec"),
+        ("TICKETS_SYSTEM_PROMPT", TICKETS_SYSTEM_PROMPT, "finish_tickets"),
+        ("REVIEW_SYSTEM_PROMPT", REVIEW_SYSTEM_PROMPT, "finish_review"),
+    ];
+
+    #[test]
+    fn when_checking_phase_handoffs_given_prompt_contracts_then_required_markers_remain_present() {
+        for (prompt_name, prompt, marker) in PHASE_HANDOFF_MARKERS {
+            assert_contains_all(prompt_name, prompt, &[marker]);
+        }
+    }
+
+    #[test]
+    fn when_reading_phase_prompts_given_source_only_rules_then_all_four_constants_define_scope() {
+        assert_contains_all(
+            "PLAN_SYSTEM_PROMPT",
+            PLAN_SYSTEM_PROMPT,
+            &[
+                "Automated tests apply only to executable source code",
+                "never to documentation, `README.md`, `TODO.md`, changelogs, or tracker directories (`.plan/`, including this repository's `.plans/` spelling)",
+            ],
+        );
+        assert_contains_all(
+            "SPEC_SYSTEM_PROMPT",
+            SPEC_SYSTEM_PROMPT,
+            &[
+                "Scope testing decisions to executable source-code behavior only",
+                "Testing decisions cover only executable source-code behavior",
+                "record those file updates in `### Module Architecture` but exclude them from `## 5. Testing Decisions & Seams`",
+            ],
+        );
+        assert_contains_all(
+            "TICKETS_SYSTEM_PROMPT",
+            TICKETS_SYSTEM_PROMPT,
+            &[
+                "test cases the ticket adds or updates for executable source-code behavior",
+                "test expectations are required only for executable source-code behavior",
+            ],
+        );
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "Audit executable source-code behavior only",
+                "Evaluate the boundary matrix for executable source-code behavior only",
+            ],
+        );
+    }
+
+    #[test]
+    fn when_planning_documentation_given_obsolete_markdown_assertions_then_prompt_requires_removal()
+    {
+        assert_contains_all(
+            "PLAN_SYSTEM_PROMPT",
+            PLAN_SYSTEM_PROMPT,
+            &[
+                "Remove obsolete tests that assert markdown or tracker text or checklist status rather than refreshing them",
+            ],
+        );
+    }
+
+    #[test]
+    fn when_specifying_documentation_only_work_given_test_sections_then_prompt_requires_none() {
+        assert_contains_all(
+            "SPEC_SYSTEM_PROMPT",
+            SPEC_SYSTEM_PROMPT,
+            &[
+                "never to documentation, `README.md`, `TODO.md`, `.plan/`/`.plans/` tracker files, changelogs, or other human-facing prose",
+                "When documentation or tracker updates accompany source changes, record those file updates in `### Module Architecture` but exclude them from `## 5. Testing Decisions & Seams`",
+                "A documentation-only specification that changes only documentation or human-facing content writes exactly `None.` under each of `### Test Seams`, `### Coverage Strategy`, and `### Prior Art`",
+            ],
+        );
+    }
+
+    #[test]
+    fn when_ticketing_documentation_only_work_given_no_source_changes_then_empty_expectations_are_permitted()
+     {
+        assert_contains_all(
+            "TICKETS_SYSTEM_PROMPT",
+            TICKETS_SYSTEM_PROMPT,
+            &[
+                "Fold `README.md`, `TODO.md`, documentation, and `.plan/`/`.plans/` tracker updates into the executable-behavior ticket whose deliverable needs them; never create standalone documentation or tracker tickets for those accompanying updates.",
+                "A documentation-only or markdown-only ticket that modifies only documentation or markdown files and no executable source code may pass `test_expectations: []`, which renders as `None.`",
+            ],
+        );
+    }
+
+    #[test]
+    fn when_reviewing_fixes_given_no_new_test_cases_then_empty_expectations_are_permitted() {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "when the fix adds test cases every entry must name a `when_<action>_given_<context>_then_<outcome>` test identifier",
+                "a fix ticket that adds no new test cases may pass `test_expectations: []`, which renders as `None.`",
+            ],
+        );
+    }
+
+    #[test]
+    fn when_checking_prompt_contracts_given_substantive_test_expectations_then_bdd_naming_and_templates_remain_required()
+     {
+        assert_contains_all("PLAN_SYSTEM_PROMPT", PLAN_SYSTEM_PROMPT, PLAN_HEADINGS);
+        assert_contains_all("SPEC_SYSTEM_PROMPT", SPEC_SYSTEM_PROMPT, SPEC_HEADINGS);
+        assert_contains_all(
+            "TICKETS_SYSTEM_PROMPT",
+            TICKETS_SYSTEM_PROMPT,
+            TICKET_TEMPLATE,
+        );
+        assert_contains_all("REVIEW_SYSTEM_PROMPT", REVIEW_SYSTEM_PROMPT, REVIEW_FIELDS);
+        assert_contains_all(
+            "TICKETS_SYSTEM_PROMPT",
+            TICKETS_SYSTEM_PROMPT,
+            &[
+                "lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>`",
+                "every substantive entry must name its test",
+            ],
+        );
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "when_<action>_given_<context>_then_<outcome>",
+                "reuse that earlier finding's exact `id` in `findings`",
+            ],
+        );
+    }
+
+    #[test]
+    fn when_auditing_prompt_contracts_given_human_facing_files_then_tests_are_not_requested() {
+        assert_contains_all(
+            "PLAN_SYSTEM_PROMPT",
+            PLAN_SYSTEM_PROMPT,
+            &["Automated tests apply only to executable source code"],
+        );
+        assert_contains_all(
+            "SPEC_SYSTEM_PROMPT",
+            SPEC_SYSTEM_PROMPT,
+            &[
+                "never to documentation, `README.md`, `TODO.md`, `.plan/`/`.plans/` tracker files, changelogs, or other human-facing prose",
+            ],
+        );
+        assert_contains_all(
+            "TICKETS_SYSTEM_PROMPT",
+            TICKETS_SYSTEM_PROMPT,
+            &[
+                "never for documentation, `README.md`, `TODO.md`, `.plan/`/`.plans/` tracker files, or other human-facing prose",
+            ],
+        );
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "never request unit tests for documentation, `README.md`, `TODO.md`, or `.plan/`/`.plans/` tracker files",
+            ],
+        );
+    }
+
+    #[test]
+    fn when_ticketing_empty_expectations_given_documentation_only_work_then_none_is_permitted() {
+        assert_contains_all(
+            "TICKETS_SYSTEM_PROMPT",
+            TICKETS_SYSTEM_PROMPT,
+            &[
+                "modifies only documentation or markdown files and no executable source code may pass `test_expectations: []`, which renders as `None.`",
+            ],
+        );
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &["fix ticket that adds no new test cases may pass `test_expectations: []`"],
+        );
+    }
+
+    #[test]
+    fn when_including_one_source_behavior_expectation_given_a_ticket_then_bdd_naming_remains_required()
+     {
+        assert_contains_all(
+            "TICKETS_SYSTEM_PROMPT",
+            TICKETS_SYSTEM_PROMPT,
+            &[
+                "Every ticket that changes executable source code must carry at least one non-blank entry in `test_expectations`",
+                "every substantive entry must name its test in lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>` form",
+            ],
+        );
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "every entry must name a `when_<action>_given_<context>_then_<outcome>` test identifier",
+            ],
+        );
+    }
+
+    #[test]
+    fn when_assessing_prompt_boundaries_given_no_numeric_payload_or_access_rules_then_these_dimensions_are_not_applicable()
+     {
+        for (name, prompt) in [
+            ("PLAN_SYSTEM_PROMPT", PLAN_SYSTEM_PROMPT),
+            ("SPEC_SYSTEM_PROMPT", SPEC_SYSTEM_PROMPT),
+            ("TICKETS_SYSTEM_PROMPT", TICKETS_SYSTEM_PROMPT),
+            ("REVIEW_SYSTEM_PROMPT", REVIEW_SYSTEM_PROMPT),
+        ] {
+            assert!(
+                prompt.contains("executable source-code")
+                    || prompt.contains("executable source code"),
+                "{name} must scope automated testing to executable source-code behavior"
+            );
+            for forbidden in [
+                "HTTP 401",
+                "HTTP 403",
+                "payload validation rule",
+                "access-control rule",
+                "numeric limit",
+                "maximum number of test expectations",
+            ] {
+                assert!(
+                    !prompt.contains(forbidden),
+                    "{name} must not introduce numeric, payload-validation, or access-control constraints: `{forbidden}`"
+                );
+            }
+        }
+    }
 
     #[test]
     fn when_inspecting_review_prompt_given_blueprint_rules_then_contains_required_disciplines() {

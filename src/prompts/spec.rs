@@ -17,7 +17,7 @@ Convert the upstream plan into a technical specification without prompting the u
    existing seam that can observe the behaviour, and use the fewest seams; the ideal number is one.
    Propose a new seam only when no existing seam can observe the behaviour. Do not ask the user and
    do not add an intermediate checkpoint: decide the seams yourself and hand the specification over
-   in the same turn.
+   in the same turn. Scope testing decisions to executable source-code behavior only, never to documentation, `README.md`, `TODO.md`, `.plan/`/`.plans/` tracker files, changelogs, or other human-facing prose. Testing decisions cover only executable source-code behavior. When documentation or tracker updates accompany source changes, record those file updates in `### Module Architecture` but exclude them from `## 5. Testing Decisions & Seams`. A documentation-only specification that changes only documentation or human-facing content writes exactly `None.` under each of `### Test Seams`, `### Coverage Strategy`, and `### Prior Art`.
 3. **Write implementation-ready stories and criteria:** each story and each acceptance criterion must
    be concrete enough for the tickets agent to slice into a ticket and for the code agent to verify.
    State the expected behaviour and the exact pass/fail condition, including error states and edge

@@ -19,7 +19,7 @@ Turn the specification below into an ordered set of tickets without prompting th
    one layer is not a ticket, because the behaviour is not verifiable until some later ticket
    lands. Size each ticket for one fresh context window. Order the tickets in implementation order
    and name the dependency edges between them: a ticket that builds on another names that id in its
-   `blocked_by`.
+   `blocked_by`. Fold `README.md`, `TODO.md`, documentation, and `.plan/`/`.plans/` tracker updates into the executable-behavior ticket whose deliverable needs them; never create standalone documentation or tracker tickets for those accompanying updates.
 3. **Sequence a wide mechanical change as expand, migrate, contract:** one mechanical edit with a
    wide effect -- a rename, a signature change or a shape change that breaks many call sites at
    once -- is not a tracer bullet. Add the new form beside the old form first (the expand), then
@@ -52,14 +52,12 @@ ticket is an object with exactly these fields:
   files and modules it builds on.
 - `out_of_scope`: what this ticket must not touch.
 - `scope_of_changes`: the behaviour the ticket makes work and the target files/modules it touches.
-- `test_expectations`: the outside-in test cases the ticket adds or updates, structured by the 4
+- `test_expectations`: the outside-in test cases the ticket adds or updates for executable source-code behavior, structured by the 4
   keeper categories (Core Entry-Point Behaviors, Edge-Case Tables, Contract & Invariant Checks,
   Regression Tests) and the 5-dimension boundary matrix (Empty/Zero/Nil, Minimum valid boundary,
   Maximum limit/Upper boundary, Malformed/Invalid payload, Boundary unauthorized/Forbidden access),
-  with strict edge-only mocking (never mock internal classes, services or local persistence). Every
-  ticket must carry at least one non-blank entry in `test_expectations`, and every entry must name
-  its test in lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>` form (without
-  internal function or class names in the test title).
+  with strict edge-only mocking (never mock internal classes, services or local persistence). Write test expectations only for executable source-code behavior -- never for documentation, `README.md`, `TODO.md`, `.plan/`/`.plans/` tracker files, or other human-facing prose. Every ticket that changes executable source code must carry at least one non-blank entry in `test_expectations`, and every substantive entry must name its test in lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>` form (without
+  internal function or class names in the test title). A documentation-only or markdown-only ticket that modifies only documentation or markdown files and no executable source code may pass `test_expectations: []`, which renders as `None.`; test expectations are required only for executable source-code behavior.
 - `verification_gate`: the exact terminal command that must exit 0.
 
 The `verification_gate` must demonstrate this ticket's new behaviour and would fail before that
