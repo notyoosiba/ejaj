@@ -53,14 +53,14 @@ The Agent Brief is the triage-only restatement of the ticket for the code agent.
 - target_behavior: what the code agent must make true, in prose, as one paragraph.
 - acceptance_criteria: the machine-verifiable pass and fail conditions. At least one entry, and each entry must be checkable by a command, a rendered output or a named boundary -- a blank entry is rejected even beside a valid one.
 - out_of_scope: at least one boundary the code agent must not cross, and no blank entry. Write None. when the ticket excludes nothing.
-- blocked_by: the draft ticket's own dependency ids, unchanged. Never add a dependency, never drop one, never repeat one, and never name a ticket that is not in the draft set.
+- blocked_by: the draft ticket's own dependency ids from its YAML front matter under ## Original Tickets, unchanged. Never add a dependency, never drop one, never repeat one, never copy task ids from TODO.md or .plan/.plans tracker files, and never name a ticket that is not in the draft set.
 
 ## Output rules
 
 - Classify every draft ticket of the set exactly once. A missing classification, a duplicated one and one for a ticket that is not in the draft set are all rejected.
 - Keep each classification's ticket_id and ticket_title exactly as the draft ticket carries them; a padded or reworded value is rejected.
 - Every classification records at least one non-blank note that says what was audited.
-- Carry the dependencies the draft ticket declared, unchanged, in the brief's blocked_by.
+- Carry the dependencies the draft ticket declared in its YAML front matter, unchanged, in the brief's blocked_by.
 - A ready-for-agent classification carries the Agent Brief and no blocker_explanation; a ready-for-human, needs-info or wontfix classification carries the blocker_explanation and no Agent Brief.
 - Rejected payloads are corrections, not failures: fix the payload the error names and hand it over again. The pass ends only on a report the boundary accepted."#;
 
@@ -108,6 +108,7 @@ mod tests {
             "ticket_title",
             "notes",
             "original ticket",
+            "YAML front matter",
         ] {
             assert!(
                 TRIAGE_SYSTEM_PROMPT.contains(needle),

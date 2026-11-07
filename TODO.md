@@ -91,8 +91,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 ### Wave 0: Root Foundation (`PROPOSAL-3-non-code-test-expectations.md`)
 
 - [x] **`T01` — Optional `test_expectations` in Validator, `transition_fix_ticket`, & `ticket_kickoff`**
-  - `blocked_by`: `[]`
-  - `blocks`: `["T02"]`
+  - `depends_on`: `[]`
+  - `unblocks`: `["T02"]`
   - `plans`: [`.plans/PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md)
   - `files`: `src/tickets.rs`, `src/pipeline.rs`, `src/prompts/code.rs`
   - `tasks`:
@@ -102,8 +102,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib tickets && cargo test --lib prompts::code && cargo test --lib pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [x] **`T02` — Enforce Executable Source-Code-Only Testing Across Phase Prompts**
-  - `blocked_by`: `["T01"]`
-  - `blocks`: `["T05"]`
+  - `depends_on`: `["T01"]`
+  - `unblocks`: `["T05"]`
   - `plans`: [`.plans/PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md)
   - `files`: `src/prompts/plan.rs`, `src/prompts/spec.rs`, `src/prompts/tickets.rs`, `src/prompts/review.rs`
   - `tasks`:
@@ -118,8 +118,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 ### Wave 1: Phase Prompt Upgrades (`T05` → `T04` → `T03` → `T06` — Rebuild `ejaj` Before Runtime Tasks)
 
 - [ ] **`T05` — `REVIEW_SYSTEM_PROMPT` Upgrades (Diff-First Inspection, Internal Exports, & Scoped Round 2+ Re-Review)**
-  - `blocked_by`: `["T02"]`
-  - `blocks`: `["T04"]`
+  - `depends_on`: `[]` (`T02` complete)
+  - `unblocks`: `["T04"]`
   - `plans`: [`.plans/03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md), [`.plans/PROPOSAL-8-internal-module-exports-in-review.md`](./.plans/PROPOSAL-8-internal-module-exports-in-review.md)
   - `files`: `src/prompts/review.rs`
   - `tasks`:
@@ -130,8 +130,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib prompts::review && cargo test --test pipeline && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T04` — `CODE_TDD_DISCIPLINE` Upgrades (Vertical Slices, No Artificial Red Probes, & Tracker Edits Last)**
-  - `blocked_by`: `["T05"]`
-  - `blocks`: `["T03"]`
+  - `depends_on`: `["T05"]`
+  - `unblocks`: `["T03"]`
   - `plans`: [`.plans/03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md), [`.plans/PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md), [`.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md)
   - `files`: `src/prompts/code.rs`
   - `tasks`:
@@ -140,8 +140,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib prompts::code && cargo test --test llm_wire && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T03` — Plan & Spec Prompt Upgrades (First-Turn Reconnaissance, Deep Modules, & Cross-Module Signatures)**
-  - `blocked_by`: `["T04"]`
-  - `blocks`: `["T06"]`
+  - `depends_on`: `["T04"]`
+  - `unblocks`: `["T06"]`
   - `plans`: [`.plans/01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md)
   - `files`: `src/prompts/plan.rs`, `src/prompts/spec.rs`
   - `tasks`:
@@ -150,8 +150,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib prompts::plan && cargo test --lib prompts::spec && cargo test --test pipeline && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T06` — `TICKETS_SYSTEM_PROMPT` Upgrades (Per-Ticket Scope Cap & Cross-Ticket Signatures)**
-  - `blocked_by`: `["T03"]`
-  - `blocks`: `["T07", "T11", "T12", "T13", "T14"]`
+  - `depends_on`: `["T03"]`
+  - `unblocks`: `["T07", "T11", "T12", "T13", "T14"]`
   - `plans`: [`.plans/02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md), [`.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md)
   - `files`: `src/prompts/tickets.rs`
   - `tasks`:
@@ -164,8 +164,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 ### Wave 2: Triage/Pipeline Flow & Independent Runtime Hardening (`T07`–`T15`)
 
 - [ ] **`T07` — Add `TriageState::Done` Data Model & Upgrade `TRIAGE_SYSTEM_PROMPT`**
-  - `blocked_by`: `["T06"]`
-  - `blocks`: `["T08"]`
+  - `depends_on`: `["T06"]`
+  - `unblocks`: `["T08"]`
   - `plans`: [`.plans/PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md), [`.plans/02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md)
   - `files`: `src/triage.rs`, `src/prompts/triage.rs`, `src/tools.rs`
   - `tasks`:
@@ -174,8 +174,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib triage && cargo test --lib prompts::triage && cargo test --lib tools && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T08` — Pipeline Queue Authorization & Pre-Completion for `TriageState::Done` Tickets**
-  - `blocked_by`: `["T07"]`
-  - `blocks`: `["T09"]`
+  - `depends_on`: `["T07"]`
+  - `unblocks`: `["T09"]`
   - `plans`: [`.plans/PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md)
   - `files`: `src/pipeline.rs`, `tests/pipeline.rs`
   - `tasks`:
@@ -184,8 +184,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T09` — Forward Triage `notes` and `AgentBrief` to Code Agent Kickoff**
-  - `blocked_by`: `["T08"]`
-  - `blocks`: `["T10"]`
+  - `depends_on`: `["T08"]`
+  - `unblocks`: `["T10"]`
   - `plans`: [`.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md)
   - `files`: `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs`, `tests/pipeline.rs`
   - `tasks`:
@@ -194,8 +194,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib triage && cargo test --lib orchestrator && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T10` — Include Verification Gate Failure Excerpts in `queue-report.md` and Retry Handovers**
-  - `blocked_by`: `["T09"]`
-  - `blocks`: `["T16"]`
+  - `depends_on`: `["T09"]`
+  - `unblocks`: `["T16"]`
   - `plans`: [`.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md)
   - `files`: `src/orchestrator.rs`, `src/pipeline.rs`, `tests/pipeline.rs`
   - `tasks`:
@@ -204,8 +204,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib orchestrator && cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T11` — Shell Execution Hardening (Process-Group Isolation, Partial Timeout Output, & Non-Interactive Env)**
-  - `blocked_by`: `["T06"]`
-  - `blocks`: `["T18"]`
+  - `depends_on`: `["T06"]`
+  - `unblocks`: `["T18"]`
   - `plans`: [`.plans/05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md)
   - `files`: `src/tools.rs`
   - `tasks`:
@@ -215,8 +215,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib tools && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T12` — CRLF-Safe `tools.replace`, Multi-Match Line Numbers, & `tools.grep` Line Cap**
-  - `blocked_by`: `["T06"]`
-  - `blocks`: `[]`
+  - `depends_on`: `["T06"]`
+  - `unblocks`: `[]`
   - `plans`: [`.plans/09-file-editing-and-patch-matching.md`](./.plans/09-file-editing-and-patch-matching.md)
   - `files`: `src/script.rs`
   - `tasks`:
@@ -227,8 +227,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib script && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T13` — HTTP 408 Timeout Retry, Permanent 429 Quota Fast-Fail, & Retry-After Hints**
-  - `blocked_by`: `["T06"]`
-  - `blocks`: `["T17"]`
+  - `depends_on`: `["T06"]`
+  - `unblocks`: `["T17"]`
   - `plans`: [`.plans/12-http-retry-and-overload-resilience.md`](./.plans/12-http-retry-and-overload-resilience.md)
   - `files`: `src/retry.rs`
   - `tasks`:
@@ -238,8 +238,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib retry && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T14` — Provider Output-Token Truncation Detection (`Message.truncated`)**
-  - `blocked_by`: `["T06"]`
-  - `blocks`: `["T15"]`
+  - `depends_on`: `["T06"]`
+  - `unblocks`: `["T15"]`
   - `plans`: [`.plans/07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md)
   - `files`: `src/api.rs`, `src/llm/chat_completions.rs`, `src/llm/responses_api.rs`, `src/llm/anthropic.rs`
   - `tasks`:
@@ -248,8 +248,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib api && cargo test --lib llm && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T15` — In-Loop Missing-Tool / Truncation Recovery & Tool-Call Repetition Guard**
-  - `blocked_by`: `["T14"]`
-  - `blocks`: `["T16", "T17"]`
+  - `depends_on`: `["T14"]`
+  - `unblocks`: `["T16", "T17"]`
   - `plans`: [`.plans/07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md)
   - `files`: `src/loops/agent.rs`
   - `tasks`:
@@ -262,8 +262,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 ### Wave 3: Outer Pass Retries, Compaction Recovery, & Trajectory Persistence
 
 - [ ] **`T16` — Outer Single-Pass Retry for Unattended Handoff Passes (`spec_pass`, `tickets_pass`, `triage_pass`, `review_round`)**
-  - `blocked_by`: `["T10", "T15"]`
-  - `blocks`: `[]`
+  - `depends_on`: `["T10", "T15"]`
+  - `unblocks`: `[]`
   - `plans`: [`.plans/PROPOSAL-2-review-pass-retry.md`](./.plans/PROPOSAL-2-review-pass-retry.md)
   - `files`: `src/pipeline.rs`, `tests/pipeline.rs`
   - `tasks`:
@@ -272,8 +272,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T17` — Context Compaction Resilience, Tier-1 Soft Fallback, & HTTP 400/413/422 Overflow Recovery**
-  - `blocked_by`: `["T13", "T15"]`
-  - `blocks`: `["T18"]`
+  - `depends_on`: `["T13", "T15"]`
+  - `unblocks`: `["T18"]`
   - `plans`: [`.plans/11-context-compaction-and-overflow-recovery.md`](./.plans/11-context-compaction-and-overflow-recovery.md)
   - `files`: `src/loops/agent.rs`
   - `tasks`:
@@ -284,8 +284,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `verification_gate`: `cargo test --lib loops::agent && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T18` — Per-Loop Conversation Trajectory Persistence (`.traj.json`)**
-  - `blocked_by`: `["T11", "T17"]`
-  - `blocks`: `[]`
+  - `depends_on`: `["T11", "T17"]`
+  - `unblocks`: `[]`
   - `plans`: [`.plans/08-conversation-trajectory-persistence.md`](./.plans/08-conversation-trajectory-persistence.md)
   - `files`: `src/loops/agent.rs`, `src/tools.rs`
   - `tasks`:

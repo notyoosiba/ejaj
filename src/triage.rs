@@ -501,16 +501,17 @@ fn check_dependencies(
         }
     }
 
+    let expected = trimmed_entries(declared);
     for dependency in &carried {
         if !draft_ids.contains(dependency) {
             return Err(format!(
                 "[ERROR] the Agent Brief for {draft_id} depends on {dependency}, which is not a \
-                 draft ticket; every brief dependency must name a ticket of the draft set"
+                 draft ticket (the draft ticket declares [{}]); every brief dependency must name \
+                 a ticket of the draft set and carry the draft ticket's blocked_by ids unchanged",
+                expected.join(", ")
             ));
         }
     }
-
-    let expected = trimmed_entries(declared);
     if carried != expected {
         return Err(format!(
             "[ERROR] the Agent Brief for {draft_id} carries the dependencies [{}], but the draft \
@@ -1377,7 +1378,7 @@ cargo test triage::tests
                 "an unknown dependency",
                 unknown_dependency,
                 "9-absent",
-                "not a draft ticket",
+                "not a draft ticket (the draft ticket declares [1-first])",
             ),
             (
                 "a dropped dependency",
