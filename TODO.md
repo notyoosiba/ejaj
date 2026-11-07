@@ -8,7 +8,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 | Plan / Proposal | Status | Mapped DAG Tasks | Target Modules |
 | --- | --- | --- | --- |
-| [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) | `[-]` In Progress (`T01` done) | `T01`, `T02` | `src/tickets.rs`, `src/pipeline.rs`, `src/prompts/{plan,spec,tickets,code,review}.rs` |
+| [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) | [x] Complete (T01, T02 done) | `T01`, `T02` | `src/tickets.rs`, `src/pipeline.rs`, `src/prompts/{plan,spec,tickets,code,review}.rs` |
 | [`03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md) | `[ ]` Pending | `T02`, `T05`, `T04` | `src/prompts/review.rs`, `src/prompts/code.rs` |
 | [`PROPOSAL-8-internal-module-exports-in-review.md`](./.plans/PROPOSAL-8-internal-module-exports-in-review.md) | `[ ]` Pending | `T05` | `src/prompts/review.rs` |
 | [`PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md) | `[ ]` Pending | `T04` | `src/prompts/code.rs` |
@@ -42,7 +42,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 [x] [T01] PROPOSAL-3a: Validator, transition_fix_ticket & ticket_kickoff optional test_expectations
       │
       ▼
-[ ] [T02] PROPOSAL-3b: Source-code-only test rules across Plan, Spec, Tickets & Review prompts
+[x] [T02] PROPOSAL-3b: Source-code-only test rules across Plan, Spec, Tickets & Review prompts
       │
       ▼
 [ ] [T05] 03 + PROPOSAL-8: REVIEW_SYSTEM_PROMPT upgrades — scoped Round 2+ re-review & pub(crate) exports (src/prompts/review.rs)
@@ -101,7 +101,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `ticket_kickoff` (`src/prompts/code.rs`), skip prepending `CODE_TDD_DISCIPLINE` when the rendered ticket contains `## Test Expectations\n\nNone.\n`.
   - `verification_gate`: `cargo test --lib tickets && cargo test --lib prompts::code && cargo test --lib pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T02` — Enforce Executable Source-Code-Only Testing Across Phase Prompts**
+- [x] **`T02` — Enforce Executable Source-Code-Only Testing Across Phase Prompts**
   - `blocked_by`: `["T01"]`
   - `blocks`: `["T05"]`
   - `plans`: [`.plans/PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md)

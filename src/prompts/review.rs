@@ -14,7 +14,7 @@ change set, `tools.read(path, startLine?, endLine?)` to inspect the modified and
 and test files, and `tools.list(glob?)` / `tools.grep(pattern, glob?)` to check existing seams. \
 Batch related reads and searches into one script call. Never write, build or test.
 2. **Complete the Pre-Flight Audit Scorecard (`scorecard`):** every field is required and non-blank:
-   - `keeper_coverage`: verify coverage across the 4 Keeper Categories. Audit executable source-code behavior only; never request unit tests for documentation, `README.md`, `TODO.md`, or `.plan/`/`.plans/` tracker files:
+   - `keeper_coverage`: verify coverage across the 4 Keeper Categories. Audit executable source-code behavior only; never emit findings or fix tickets that request unit tests for documentation, `README.md`, `TODO.md`, changelogs, `.plan/`/`.plans/` tracker files, or other human-facing prose:
      1. Core Entry-Point Behaviors (real caller journeys via CLI, API, or public interface).
      2. Edge-Case Tables (a consolidated parameterized table when boundary cases share the same \
 input/assertion shape, OR the explicit per-dimension boundary tests named in the executed \
@@ -28,7 +28,7 @@ persistence layers are never mocked; test doubles are restricted strictly to non
 external boundaries), no tautologies, and no private state introspection.
    - `inferred_assumptions`: explicit log of inferred assumptions (boundaries, status codes, \
 default schemas) verified against the implementation.
-   - `boundary_matrix`: evaluate the Mandatory 5-Dimension Boundary Matrix across the test suite. Evaluate the boundary matrix for executable source-code behavior only; never request unit tests for documentation, `README.md`, `TODO.md`, or `.plan/`/`.plans/` tracker files:
+   - `boundary_matrix`: evaluate the Mandatory 5-Dimension Boundary Matrix across the test suite. Evaluate the boundary matrix for executable source-code behavior only; never emit findings or fix tickets that request unit tests for documentation, `README.md`, `TODO.md`, changelogs, `.plan/`/`.plans/` tracker files, or other human-facing prose:
      1. Empty / Zero / Nil
      2. Minimum valid boundary
      3. Maximum limit / Upper boundary
@@ -53,7 +53,7 @@ satisfy all ticket rules:
 with any ticket id already executed in this run.
      - `blocked_by` / `blocks`: may only reference other fix tickets emitted in this same `fixes` list.
      - `title`, `objective`, `prerequisites_assumed`, `out_of_scope`, `scope_of_changes`, \
-`acceptance_criteria` (at least one non-blank criterion), `test_expectations` (when the fix adds test cases every entry must name a `when_<action>_given_<context>_then_<outcome>` test identifier; a fix ticket that adds no new test cases may pass `test_expectations: []`, which renders as `None.`), and `verification_gate` (exact command exiting 0).
+`acceptance_criteria` (at least one non-blank criterion), `test_expectations`, and `verification_gate` (exact command exiting 0). A documentation-only fix ticket that changes no executable source code and modifies only documentation or markdown may pass `test_expectations: []`, which renders as `None.`. Every fix ticket that changes executable source code must carry at least one non-blank `test_expectations` entry, even when the fix adds no new test case, and every entry must name a test in lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>` form; uppercase, whitespace, punctuation, or otherwise malformed identifiers are rejected; never request tests for documentation, `README.md`, `TODO.md`, changelogs, `.plan/`/`.plans/` tracker files, or other human-facing prose.
 
 Always end by calling `finish_review`; never end your turn with a plain reply.";
 
@@ -80,6 +80,36 @@ mod tests {
                 "{prompt_name} must contain `{needle}`"
             );
         }
+    }
+
+    /// The caller-intent test identifier form the review contract requires for
+    /// every fix expectation: lowercase `snake_case` with exactly one action,
+    /// context, and outcome segment. Uppercase, whitespace, punctuation, and
+    /// structurally malformed identifiers are rejected.
+    fn names_bdd_test(entry: &str) -> bool {
+        if entry.is_empty() || entry != entry.trim() {
+            return false;
+        }
+        if !entry
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        {
+            return false;
+        }
+        let Some(rest) = entry.strip_prefix("when_") else {
+            return false;
+        };
+        let Some((action, rest)) = rest.split_once("_given_") else {
+            return false;
+        };
+        let Some((context, outcome)) = rest.split_once("_then_") else {
+            return false;
+        };
+        let segments = [action, context, outcome];
+        segments.iter().all(|segment| !segment.is_empty())
+            && segments
+                .iter()
+                .all(|segment| !segment.contains("_given_") && !segment.contains("_then_"))
     }
 
     const PLAN_HEADINGS: &[&str] = &[
@@ -130,8 +160,16 @@ mod tests {
     const PHASE_HANDOFF_MARKERS: &[(&str, &str, &str)] = &[
         ("PLAN_SYSTEM_PROMPT", PLAN_SYSTEM_PROMPT, "finish_plan"),
         ("SPEC_SYSTEM_PROMPT", SPEC_SYSTEM_PROMPT, "finish_spec"),
-        ("TICKETS_SYSTEM_PROMPT", TICKETS_SYSTEM_PROMPT, "finish_tickets"),
-        ("REVIEW_SYSTEM_PROMPT", REVIEW_SYSTEM_PROMPT, "finish_review"),
+        (
+            "TICKETS_SYSTEM_PROMPT",
+            TICKETS_SYSTEM_PROMPT,
+            "finish_tickets",
+        ),
+        (
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            "finish_review",
+        ),
     ];
 
     #[test]
@@ -148,7 +186,7 @@ mod tests {
             PLAN_SYSTEM_PROMPT,
             &[
                 "Automated tests apply only to executable source code",
-                "never to documentation, `README.md`, `TODO.md`, changelogs, or tracker directories (`.plan/`, including this repository's `.plans/` spelling)",
+                "never to documentation, `README.md`, `TODO.md`, changelogs, or tracker directories (`.plan/`, including this repository's `.plans/` spelling), or other human-facing prose",
             ],
         );
         assert_contains_all(
@@ -216,15 +254,140 @@ mod tests {
         );
     }
 
+    /// Documentation-only review fixes change no executable source code, so the
+    /// contract permits an empty expectation list.
     #[test]
-    fn when_reviewing_fixes_given_no_new_test_cases_then_empty_expectations_are_permitted() {
+    fn when_reviewing_fixes_given_documentation_only_changes_then_empty_expectations_are_permitted()
+    {
         assert_contains_all(
             "REVIEW_SYSTEM_PROMPT",
             REVIEW_SYSTEM_PROMPT,
             &[
-                "when the fix adds test cases every entry must name a `when_<action>_given_<context>_then_<outcome>` test identifier",
-                "a fix ticket that adds no new test cases may pass `test_expectations: []`, which renders as `None.`",
+                "A documentation-only fix ticket that changes no executable source code and modifies only documentation or markdown may pass `test_expectations: []`, which renders as `None.`",
             ],
+        );
+    }
+
+    /// A fix that changes executable source code always needs a test
+    /// expectation, even when it happens to add no new test case.
+    #[test]
+    fn when_reviewing_fixes_given_executable_source_changes_then_expectations_are_required() {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "Every fix ticket that changes executable source code must carry at least one non-blank `test_expectations` entry, even when the fix adds no new test case",
+            ],
+        );
+        assert!(
+            !REVIEW_SYSTEM_PROMPT.contains("a fix ticket that adds no new test cases may pass"),
+            "REVIEW_SYSTEM_PROMPT must not permit empty expectations for executable-source fixes"
+        );
+    }
+
+    /// Edge-case table across the empty, whitespace, uppercase, punctuation,
+    /// and structurally malformed dimensions: only the lowercase `snake_case`
+    /// BDD form is accepted, and the minimum valid identifier passes without
+    /// relying on the length of a hard-coded expectation array.
+    #[test]
+    fn when_reviewing_fixes_given_malformed_expectation_identifiers_then_lowercase_bdd_form_is_required()
+     {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "every entry must name a test in lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>` form",
+                "uppercase, whitespace, punctuation, or otherwise malformed identifiers are rejected",
+            ],
+        );
+
+        let valid = "when_fixing_executable_source_given_one_behaviour_change_then_names_its_test";
+        assert!(
+            names_bdd_test(valid),
+            "the minimum valid lowercase BDD identifier must be accepted"
+        );
+
+        let malformed = [
+            "",
+            "   ",
+            "when fixing executable source given one behaviour change then names its test",
+            "When_fixing_executable_source_given_one_behaviour_change_then_names_its_test",
+            "when_fixing_executable_Source_given_one_behaviour_change_then_names_its_test",
+            "when_fixing_executable_source-given_one_behaviour_change_then_names_its_test",
+            "when_fixing_executable_source_given_one_behaviour_change_then_names_its_test.",
+            "when_fixing_executable_source_given_one_behaviour_change_then_names_its_test ",
+            " when_fixing_executable_source_given_one_behaviour_change_then_names_its_test",
+            "fixing_executable_source_given_one_behaviour_change_then_names_its_test",
+            "when_fixing_executable_source_one_behaviour_change_then_names_its_test",
+            "when_fixing_executable_source_given_one_behaviour_change_names_its_test",
+            "when__given_one_behaviour_change_then_names_its_test",
+            "when_fixing_executable_source_given__then_names_its_test",
+            "when_fixing_executable_source_given_one_behaviour_change_then_",
+            "when_fixing_executable_source_given_one_behaviour_change_then_names_its_test_then_extra",
+        ];
+        for entry in malformed {
+            assert!(
+                !names_bdd_test(entry),
+                "malformed expectation `{entry}` must be rejected"
+            );
+        }
+    }
+
+    /// Core entry-point behavior: the review pass confines its coverage and
+    /// boundary audit to executable source code and forbids test requests for
+    /// human-facing content.
+    #[test]
+    fn when_reviewing_prompts_given_source_only_test_scope_then_human_facing_test_requests_are_forbidden()
+     {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "Audit executable source-code behavior only",
+                "Evaluate the boundary matrix for executable source-code behavior only",
+                "never emit findings or fix tickets that request unit tests for documentation, `README.md`, `TODO.md`, changelogs, `.plan/`/`.plans/` tracker files, or other human-facing prose",
+                "never request tests for documentation, `README.md`, `TODO.md`, changelogs, `.plan/`/`.plans/` tracker files, or other human-facing prose",
+            ],
+        );
+    }
+
+    /// Contract and invariant check: fix expectations for source changes need a
+    /// non-blank entry in the required BDD identifier form.
+    #[test]
+    fn when_reviewing_prompt_contracts_given_fix_expectation_rules_then_source_changes_require_nonblank_bdd_expectations()
+     {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "Every fix ticket that changes executable source code must carry at least one non-blank `test_expectations` entry",
+                "every entry must name a test in lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>` form",
+            ],
+        );
+        assert!(
+            !REVIEW_SYSTEM_PROMPT.contains("a fix ticket that adds no new test cases may pass"),
+            "REVIEW_SYSTEM_PROMPT must not restore the broad empty-expectation exception"
+        );
+    }
+
+    /// Regression guard: findings and fix tickets never request tests for
+    /// human-facing prose, and documentation-only fixes alone may omit them.
+    #[test]
+    fn when_reviewing_prompts_given_human_facing_content_then_findings_and_fixes_do_not_request_tests()
+     {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "never emit findings or fix tickets that request unit tests for documentation, `README.md`, `TODO.md`, changelogs, `.plan/`/`.plans/` tracker files, or other human-facing prose",
+                "never request tests for documentation, `README.md`, `TODO.md`, changelogs, `.plan/`/`.plans/` tracker files, or other human-facing prose",
+            ],
+        );
+        assert!(
+            !REVIEW_SYSTEM_PROMPT.contains(
+                "a fix ticket that adds no new test cases may pass `test_expectations: []`"
+            ),
+            "REVIEW_SYSTEM_PROMPT must not restore the broad empty-expectation exception"
         );
     }
 
@@ -282,7 +445,7 @@ mod tests {
             "REVIEW_SYSTEM_PROMPT",
             REVIEW_SYSTEM_PROMPT,
             &[
-                "never request unit tests for documentation, `README.md`, `TODO.md`, or `.plan/`/`.plans/` tracker files",
+                "never emit findings or fix tickets that request unit tests for documentation, `README.md`, `TODO.md`, changelogs, `.plan/`/`.plans/` tracker files, or other human-facing prose",
             ],
         );
     }
@@ -299,7 +462,9 @@ mod tests {
         assert_contains_all(
             "REVIEW_SYSTEM_PROMPT",
             REVIEW_SYSTEM_PROMPT,
-            &["fix ticket that adds no new test cases may pass `test_expectations: []`"],
+            &[
+                "A documentation-only fix ticket that changes no executable source code and modifies only documentation or markdown may pass `test_expectations: []`",
+            ],
         );
     }
 
@@ -318,7 +483,7 @@ mod tests {
             "REVIEW_SYSTEM_PROMPT",
             REVIEW_SYSTEM_PROMPT,
             &[
-                "every entry must name a `when_<action>_given_<context>_then_<outcome>` test identifier",
+                "every entry must name a test in lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>` form",
             ],
         );
     }

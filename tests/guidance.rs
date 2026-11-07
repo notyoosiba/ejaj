@@ -1,8 +1,9 @@
-//! Repository-guidance contract tests: the operator documentation must describe
-//! the same canonical mid/giga configuration and hybrid routing the binary
-//! implements. These tests read the checked-in files at the filesystem
-//! boundary, so a stale mode table, variable block or startup rule fails loudly
-//! before it can mislead an operator.
+//! Repository-configuration contract tests: the checked-in Clippy policy, the
+//! coverage-based CRAP configuration and the GitHub Actions workflow must
+//! enforce the executable quality gates the project is built with. These tests
+//! read the checked-in configuration at the filesystem boundary, so a weakened
+//! lint threshold or a skipped CI gate fails loudly before it can erode the
+//! project's executable configuration.
 
 use std::fs;
 use std::path::PathBuf;
@@ -13,136 +14,6 @@ fn guidance(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(name);
     fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()))
-}
-
-fn env_example() -> String {
-    guidance(".env.example")
-}
-
-fn agents() -> String {
-    guidance("AGENTS.md")
-}
-
-/// Empty/zero/nil boundary: with no mid overrides, the example still shows the
-/// unchanged local LM Studio endpoint and model, plus the keyless auth switch.
-#[test]
-fn when_reading_guidance_given_unset_mid_overrides_then_shows_local_defaults() {
-    let text = env_example();
-
-    assert!(
-        text.contains("LLM_MID_URL=http://192.168.56.1:1234/v1/chat/completions"),
-        "the example no longer shows the unchanged mid local endpoint:\n{text}"
-    );
-    assert!(
-        text.contains("LLM_MID_MODEL=local-model"),
-        "the example no longer shows the unchanged mid local model:\n{text}"
-    );
-    assert!(
-        text.contains("LLM_MID_AUTH=none"),
-        "the example does not show keyless local mid use:\n{text}"
-    );
-}
-
-/// Minimum valid boundary: giga needs both coordinates, and both guidance files
-/// say so rather than describing a half-written block as usable.
-#[test]
-fn when_documenting_given_minimal_giga_configuration_then_requires_both_coordinates() {
-    for (name, text) in [(".env.example", env_example()), ("AGENTS.md", agents())] {
-        assert!(
-            text.contains("LLM_GIGA_URL"),
-            "{name} does not name LLM_GIGA_URL:\n{text}"
-        );
-        assert!(
-            text.contains("LLM_GIGA_MODEL"),
-            "{name} does not name LLM_GIGA_MODEL:\n{text}"
-        );
-        assert!(
-            text.to_ascii_lowercase().contains("both"),
-            "{name} does not say both giga coordinates are required:\n{text}"
-        );
-    }
-}
-
-/// Upper boundary: the worked example lists every canonical variable and the
-/// full effort range, maximum included.
-#[test]
-fn when_reading_guidance_given_full_provider_example_then_documents_max_effort() {
-    let text = env_example();
-
-    for variable in [
-        "LLM_MID_URL",
-        "LLM_MID_MODEL",
-        "LLM_MID_API_KEY",
-        "LLM_MID_AUTH",
-        "LLM_MID_REASONING_EFFORT",
-        "LLM_GIGA_URL",
-        "LLM_GIGA_MODEL",
-        "LLM_GIGA_API_KEY",
-        "LLM_GIGA_AUTH",
-        "LLM_GIGA_REASONING_EFFORT",
-    ] {
-        assert!(
-            text.contains(variable),
-            "the example omits the canonical variable {variable}:\n{text}"
-        );
-    }
-    assert!(
-        text.contains("max"),
-        "the example no longer documents the maximum effort:\n{text}"
-    );
-}
-
-/// Malformed/invalid payload: a giga block carrying only one coordinate is a
-/// startup failure, and the guidance says so with the canonical names.
-#[test]
-fn when_reading_guidance_given_partial_giga_configuration_then_documents_startup_failure() {
-    let text = agents();
-    let lower = text.to_ascii_lowercase();
-
-    assert!(
-        text.contains("LLM_GIGA_URL") && text.contains("LLM_GIGA_MODEL"),
-        "the startup rules do not name both giga coordinates:\n{text}"
-    );
-    assert!(
-        lower.contains("half-written") || lower.contains("half written"),
-        "the startup rules do not describe a half-written giga block:\n{text}"
-    );
-    assert!(
-        lower.contains("fatal"),
-        "the startup rules do not call the failure fatal:\n{text}"
-    );
-    assert!(
-        lower.contains("exit status 1") || lower.contains("exit 1") || lower.contains("status 1"),
-        "the startup rules do not name the failure status:\n{text}"
-    );
-}
-
-/// Unauthorized/forbidden boundary: a keyless https endpoint needs the
-/// role-specific auth switch, and the guidance names mid and giga separately.
-#[test]
-fn when_reading_guidance_given_keyless_https_provider_then_documents_role_specific_auth() {
-    let text = agents();
-
-    assert!(
-        text.to_ascii_lowercase().contains("https://"),
-        "the auth rule no longer talks about https endpoints:\n{text}"
-    );
-    assert!(
-        text.contains("LLM_MID_API_KEY") && text.contains("LLM_MID_AUTH=none"),
-        "the mid auth rule is missing:\n{text}"
-    );
-    assert!(
-        text.contains("LLM_GIGA_API_KEY") && text.contains("LLM_GIGA_AUTH=none"),
-        "the giga auth rule is missing:\n{text}"
-    );
-    assert!(
-        !text.contains("LLM_PROVIDER_URL"),
-        "the guidance still names the legacy provider block:\n{text}"
-    );
-    assert!(
-        !text.contains("LLM_ARCHITECT_URL"),
-        "the guidance still names the legacy architect block:\n{text}"
-    );
 }
 
 /// Core entry-point, contract and regression guardrail for the crate-wide
