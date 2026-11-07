@@ -204,18 +204,36 @@ before you call `task_complete`.
 /// kickoffs in the ticket queue.
 pub const CODE_TDD_DISCIPLINE: &str = "\
 Follow a strict Red-First TDD loop for this ticket:\n\
-1. Author the outside-in tests listed in `## Test Expectations` first, using exact \
-`when_<action>_given_<context>_then_<outcome>` test titles (never put internal function or \
-class names in test titles).\n\
-2. Enforce strict edge-only mocking: never mock internal classes, services, or local persistence \
+1. Author the outside-in tests in `## Test Expectations` before making any production changes, \
+using exact `when_<action>_given_<context>_then_<outcome>` test titles (never put internal function \
+or class names in test titles). Exercise behavior through the public seam rather than requiring \
+tests of internal helpers.\n\
+2. Work in focused vertical red-green slices: after authoring each expectation, run a focused \
+test command with `bash`; a naturally failing test guides the implementation, while a passing \
+regression or boundary test is sufficient evidence to proceed with the production implementation \
+without manufacturing an artificial red failure. A focused test command is for iteration only and \
+does not replace the ticket-supplied `verification_gate`.\n\
+3. Enforce strict edge-only mocking: never mock internal classes, services, or local persistence \
 layers, and never introspect private state; restrict test doubles strictly to non-deterministic \
 external boundaries.\n\
-3. Cover the ticket's applicable keeper categories (Core Entry-Point Behaviors, Edge-Case Tables \
+4. Cover the ticket's applicable keeper categories (Core Entry-Point Behaviors, Edge-Case Tables \
 across Empty/Zero/Nil, Minimum valid, Maximum limit, Malformed/Invalid, and Unauthorized/Forbidden \
 boundaries, Contract & Invariant Checks, and Regression Tests).\n\
-4. Run the test command with `bash` to observe the expected red failure before implementing \
-production changes, then implement the production code and run the ticket's `verification_gate` \
-until it exits 0.\n\n";
+5. Do not widen `pub` visibility on internal helpers solely to test them.\n\
+6. When behavior is consolidated behind a deeper seam, replace tests that became obsolete and \
+coupled to the former internal behavior rather than preserving those tests alongside the new seam \
+tests.\n\
+7. Test assertions must use independent, known literal expected values, not values derived from \
+the implementation under test.\n\
+8. If a newly authored regression or boundary test already passes, that passing test is \
+sufficient evidence to proceed with the production implementation: do not manufacture an \
+artificial red failure, and never sabotage, stash, or back up production files to force a test to \
+fail.\n\
+9. After implementing the production code, run the ticket's `verification_gate` with `bash` until \
+it exits successfully.\n\
+10. Make any needed `TODO.md` and `.plan/*.md` tracker edits last, immediately before running the \
+verification gate. If the gate fails, revert those tracker edits first, then proceed with further \
+fixes or another gate run; do not revert production or test changes.\n\n";
 
 /// Build the user kickoff message for `ticket`. Rendered queue tickets (which
 /// begin with YAML front matter `---\n`) include [`CODE_TDD_DISCIPLINE`] unless
@@ -257,6 +275,59 @@ mod tests {
             .split_once("\n8. ")
             .expect("rule seven must end before rule eight")
             .0
+    }
+
+    /// Literal opening of the Red-First discipline. Deliberately independent of
+    /// the production constant so a kickoff assertion cannot pass by
+    /// recomputing the implementation's own formula.
+    const DISCIPLINE_LITERAL_PREFIX: &str = "Follow a strict Red-First TDD loop for this ticket:\n";
+
+    /// Literal sentence that opens the shared kickoff prompt.
+    const KICKOFF_PROMPT_LITERAL_PREFIX: &str =
+        "The ticket reproduced below is this session's entire task.";
+
+    /// Literal boundary the kickoff prompt leaves immediately before the
+    /// appended rendered ticket.
+    const TICKET_LITERAL_BOUNDARY: &str = "\n\n# Ticket\n\n";
+
+    /// Assert the disciplined kickoff with independent literal expectations and
+    /// exact preservation of the supplied rendered ticket.
+    fn assert_disciplined_kickoff_preserves_ticket(kickoff: &str, ticket: &str) {
+        let prefix = kickoff.strip_suffix(ticket).unwrap_or_else(|| {
+            panic!("the supplied rendered ticket must be appended byte for byte: {kickoff:?}")
+        });
+        assert!(
+            prefix.starts_with(DISCIPLINE_LITERAL_PREFIX),
+            "the kickoff must open with the literal discipline: {prefix:?}"
+        );
+        assert!(
+            prefix.contains(KICKOFF_PROMPT_LITERAL_PREFIX),
+            "the kickoff must carry the literal shared prompt: {prefix:?}"
+        );
+        assert!(
+            prefix.ends_with(TICKET_LITERAL_BOUNDARY),
+            "the kickoff prompt must end at the literal ticket boundary: {prefix:?}"
+        );
+    }
+
+    /// Assert the minimal kickoff with independent literal expectations and
+    /// exact preservation of the supplied rendered ticket.
+    fn assert_minimal_kickoff_preserves_ticket(kickoff: &str, ticket: &str) {
+        let prefix = kickoff.strip_suffix(ticket).unwrap_or_else(|| {
+            panic!("the supplied ticket must be appended byte for byte: {kickoff:?}")
+        });
+        assert!(
+            !prefix.contains(DISCIPLINE_LITERAL_PREFIX),
+            "the minimal kickoff must omit the discipline: {prefix:?}"
+        );
+        assert!(
+            prefix.starts_with(KICKOFF_PROMPT_LITERAL_PREFIX),
+            "the minimal kickoff must open with the literal shared prompt: {prefix:?}"
+        );
+        assert!(
+            prefix.ends_with(TICKET_LITERAL_BOUNDARY),
+            "the kickoff prompt must end at the literal ticket boundary: {prefix:?}"
+        );
     }
 
     /// Core entry-point behavior: Rule 7 names the same 16 KiB cap the
@@ -528,7 +599,7 @@ mod tests {
 
         let bare = "Call the bash tool once.";
         let bare_kickoff = ticket_kickoff(bare);
-        assert_eq!(bare_kickoff, format!("{CODE_TICKET_KICKOFF_PROMPT}{bare}"));
+        assert_minimal_kickoff_preserves_ticket(&bare_kickoff, bare);
     }
 
     /// A rendered ticket built through the real renderer, so the canonical
@@ -606,7 +677,7 @@ mod tests {
     {
         let rendered = rendered_ticket(Vec::new());
         let kickoff = ticket_kickoff(&rendered);
-        assert_eq!(kickoff, format!("{CODE_TICKET_KICKOFF_PROMPT}{rendered}"));
+        assert_minimal_kickoff_preserves_ticket(&kickoff, &rendered);
         assert!(kickoff.ends_with(&rendered));
     }
 
@@ -622,7 +693,7 @@ mod tests {
 
         let kickoff = ticket_kickoff(&rendered);
         assert!(!kickoff.contains(CODE_TDD_DISCIPLINE));
-        assert_eq!(kickoff, format!("{CODE_TICKET_KICKOFF_PROMPT}{rendered}"));
+        assert_minimal_kickoff_preserves_ticket(&kickoff, &rendered);
     }
 
     /// Edge-case table: a rendered ticket with expectations keeps the existing
@@ -659,10 +730,7 @@ mod tests {
         assert!(kickoff.contains(CODE_TDD_DISCIPLINE));
         assert!(kickoff.contains("Red-First TDD"));
         assert!(kickoff.contains(CODE_TICKET_KICKOFF_PROMPT));
-        assert_eq!(
-            kickoff,
-            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
-        );
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
         assert!(kickoff.ends_with(&rendered));
     }
 
@@ -685,10 +753,7 @@ mod tests {
         assert!(kickoff.contains(CODE_TDD_DISCIPLINE));
         assert!(kickoff.contains("Red-First TDD"));
         assert!(kickoff.contains(CODE_TICKET_KICKOFF_PROMPT));
-        assert_eq!(
-            kickoff,
-            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
-        );
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
         assert!(kickoff.ends_with(&rendered));
     }
 
@@ -715,10 +780,7 @@ mod tests {
         assert!(kickoff.contains(CODE_TDD_DISCIPLINE));
         assert!(kickoff.contains("Red-First TDD"));
         assert!(kickoff.contains(CODE_TICKET_KICKOFF_PROMPT));
-        assert_eq!(
-            kickoff,
-            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
-        );
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
         assert!(kickoff.ends_with(&rendered));
     }
 
@@ -750,10 +812,7 @@ mod tests {
         assert!(kickoff.contains(CODE_TDD_DISCIPLINE));
         assert!(kickoff.contains("Red-First TDD"));
         assert!(kickoff.contains(CODE_TICKET_KICKOFF_PROMPT));
-        assert_eq!(
-            kickoff,
-            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
-        );
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
         assert!(kickoff.ends_with(&rendered));
     }
 
@@ -772,7 +831,7 @@ mod tests {
 
         let kickoff = ticket_kickoff(&rendered);
         assert!(!kickoff.contains(CODE_TDD_DISCIPLINE));
-        assert_eq!(kickoff, format!("{CODE_TICKET_KICKOFF_PROMPT}{rendered}"));
+        assert_minimal_kickoff_preserves_ticket(&kickoff, &rendered);
     }
 
     /// Regression: the full discipline and the full rendered ticket survive
@@ -784,10 +843,7 @@ mod tests {
         ]);
 
         let kickoff = ticket_kickoff(&rendered);
-        assert_eq!(
-            kickoff,
-            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
-        );
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
         assert!(kickoff.contains("## Test Expectations\n\n- when_running"));
     }
 
@@ -798,10 +854,7 @@ mod tests {
      {
         let rendered = rendered_ticket(vec!["when_a_given_b_then_c"]);
         let kickoff = ticket_kickoff(&rendered);
-        assert_eq!(
-            kickoff,
-            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
-        );
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
     }
 
     /// Maximum/upper boundary: a long expectation is neither truncated nor
@@ -820,10 +873,7 @@ mod tests {
             kickoff.contains(&long),
             "the long expectation must not be truncated"
         );
-        assert_eq!(
-            kickoff,
-            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
-        );
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
     }
 
     /// Malformed payload: only the exact canonical no-expectations section
@@ -854,8 +904,215 @@ mod tests {
     fn when_building_kickoff_given_bare_prompt_then_keeps_minimal_prefix() {
         let bare = "Call the bash tool once.";
         let kickoff = ticket_kickoff(bare);
-        assert_eq!(kickoff, format!("{CODE_TICKET_KICKOFF_PROMPT}{bare}"));
+        assert_minimal_kickoff_preserves_ticket(&kickoff, bare);
         assert!(!kickoff.contains(CODE_TDD_DISCIPLINE));
         assert!(!kickoff.contains("Red-First TDD"));
+    }
+
+    /// Core entry-point behavior: a rendered ticket with source-code test
+    /// expectations receives the complete discipline at the existing kickoff
+    /// seam: tests first, public-seam vertical slices, a focused iteration
+    /// command, and the ticket-supplied gate which the focused command never
+    /// replaces.
+    #[test]
+    fn when_rendering_ticket_given_source_test_expectations_then_delivers_complete_tdd_guidance() {
+        let rendered = rendered_ticket(vec![
+            "when_running_the_suite_given_repair_then_all_tests_pass",
+        ]);
+        let kickoff = ticket_kickoff(&rendered);
+
+        for needle in [
+            "Author the outside-in tests in `## Test Expectations` before making any production changes",
+            "Exercise behavior through the public seam rather than requiring tests of internal helpers",
+            "focused vertical red-green slices",
+            "run a focused test command with `bash`",
+            "does not replace the ticket-supplied `verification_gate`",
+            "run the ticket's `verification_gate` with `bash` until it exits successfully",
+        ] {
+            assert!(
+                kickoff.contains(needle),
+                "the discipline must contain `{needle}`: {kickoff}"
+            );
+        }
+        assert!(kickoff.ends_with(&rendered));
+    }
+
+    /// Edge-case table: the conditional discipline contract holds for the
+    /// empty/zero/nil, minimum-valid, malformed/non-canonical and upper
+    /// boundaries.
+    #[test]
+    fn when_rendering_ticket_given_empty_and_boundary_expectations_then_keeps_conditional_discipline_contract()
+     {
+        for rendered in [
+            rendered_ticket(Vec::new()),
+            rendered_ticket(vec!["", "   ", "\t \n"]),
+        ] {
+            assert!(
+                rendered.contains("## Test Expectations\n\nNone."),
+                "the renderer must emit the canonical marker: {rendered}"
+            );
+            let kickoff = ticket_kickoff(&rendered);
+            assert!(!kickoff.contains(CODE_TDD_DISCIPLINE));
+            assert_minimal_kickoff_preserves_ticket(&kickoff, &rendered);
+        }
+
+        let one = rendered_ticket(vec!["when_a_given_b_then_c"]);
+        let one_kickoff = ticket_kickoff(&one);
+
+        assert_disciplined_kickoff_preserves_ticket(&one_kickoff, &one);
+
+        let canonical = rendered_ticket(Vec::new());
+        for section in [
+            "## Test Expectations\nNone.",
+            "## Test Expectations\n\n**None.**",
+            "## Test Expectations\n\n- None.",
+            "## Test Expectations\n \nNone.",
+            "## Test Expectations\n\nnone.",
+        ] {
+            let rendered = canonical.replace("## Test Expectations\n\nNone.", section);
+            let kickoff = ticket_kickoff(&rendered);
+            assert!(
+                kickoff.contains(CODE_TDD_DISCIPLINE),
+                "only the exact canonical section may omit discipline: {section:?}"
+            );
+            assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
+        }
+
+        let long = format!(
+            "when_{}_given_a_full_suite_regression_then_reports",
+            "long".repeat(2_000)
+        );
+        let upper = rendered_ticket(vec![&long]);
+        let kickoff = ticket_kickoff(&upper);
+        assert!(
+            kickoff.contains(&long),
+            "the long expectation must not be truncated"
+        );
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &upper);
+    }
+
+    /// Contract & invariant: the discipline preserves encapsulation and
+    /// independent oracles, forbids manufactured reds, and orders tracker edits
+    /// last with rollback of only those edits.
+    #[test]
+    fn when_rendering_ticket_given_discipline_contract_then_preserves_encapsulation_and_independent_oracles()
+     {
+        let rendered = rendered_ticket(vec!["when_a_given_b_then_c"]);
+        let kickoff = ticket_kickoff(&rendered);
+        for needle in [
+            "Do not widen `pub` visibility on internal helpers solely to test them",
+            "replace tests that became obsolete and coupled to the former internal behavior rather than preserving those tests alongside the new seam tests",
+            "Test assertions must use independent, known literal expected values, not values derived from the implementation under test",
+            "never mock internal classes, services, or local persistence layers",
+            "never introspect private state",
+            "restrict test doubles strictly to non-deterministic external boundaries",
+            "never sabotage, stash, or back up production files",
+            "do not manufacture an artificial red failure",
+            "sufficient evidence to proceed with the production implementation",
+            "`TODO.md` and `.plan/*.md` tracker edits last, immediately before running the verification gate",
+            "revert those tracker edits first",
+            "do not revert production or test changes",
+        ] {
+            assert!(
+                kickoff.contains(needle),
+                "the discipline must contain `{needle}`: {kickoff}"
+            );
+        }
+    }
+
+    /// Core entry-point behavior: a rendered ticket with a passing regression or
+    /// boundary expectation receives guidance that the passing result is
+    /// sufficient evidence to implement production code, without manufacturing
+    /// a red failure or sabotaging production files.
+    #[test]
+    fn when_rendering_ticket_given_passing_boundary_test_then_allows_production_implementation() {
+        let rendered = rendered_ticket(vec![
+            "when_reading_a_boundary_input_given_empty_value_then_returns_the_default",
+        ]);
+        let kickoff = ticket_kickoff(&rendered);
+
+        for needle in [
+            "a naturally failing test guides the implementation",
+            "a passing regression or boundary test is sufficient evidence to proceed",
+            "without manufacturing an artificial red failure",
+            "never sabotage, stash, or back up production files to force a test to fail",
+            "After implementing the production code, run the ticket's `verification_gate` with `bash` until it exits successfully",
+        ] {
+            assert!(
+                kickoff.contains(needle),
+                "the discipline must allow a passing boundary test to proceed: {kickoff}"
+            );
+        }
+        assert!(
+            !kickoff.contains("observe the expected red failure"),
+            "the discipline must not require an observed red failure: {kickoff}"
+        );
+        assert!(kickoff.ends_with(&rendered));
+    }
+
+    /// Contract & invariant: the kickoff contract is checked with independent
+    /// literal prefixes rather than values rebuilt from the production
+    /// constants, and the supplied rendered ticket is preserved byte for byte.
+    #[test]
+    fn when_building_ticket_kickoff_given_rendered_ticket_then_checks_independent_prefix_and_preserves_ticket()
+     {
+        let rendered = rendered_ticket(vec!["when_a_given_b_then_c"]);
+        let kickoff = ticket_kickoff(&rendered);
+
+        assert!(
+            kickoff.starts_with("Follow a strict Red-First TDD loop for this ticket:\n"),
+            "the kickoff must open with the literal discipline: {kickoff:?}"
+        );
+        assert!(
+            kickoff.contains("The ticket reproduced below is this session's entire task."),
+            "the kickoff must carry the literal shared prompt: {kickoff:?}"
+        );
+        assert_eq!(
+            &kickoff[kickoff.len() - rendered.len()..],
+            rendered,
+            "the rendered ticket must be preserved as the exact suffix"
+        );
+
+        let without_expectations = rendered_ticket(Vec::new());
+        let minimal = ticket_kickoff(&without_expectations);
+        assert!(
+            minimal.starts_with("The ticket reproduced below is this session's entire task."),
+            "the minimal kickoff must open with the literal shared prompt: {minimal:?}"
+        );
+        assert!(
+            !minimal.contains("Follow a strict Red-First TDD loop for this ticket:"),
+            "the minimal kickoff must omit the discipline: {minimal:?}"
+        );
+        assert_eq!(
+            &minimal[minimal.len() - without_expectations.len()..],
+            without_expectations,
+            "the no-expectations rendered ticket must be preserved as the exact suffix"
+        );
+
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
+        assert_minimal_kickoff_preserves_ticket(&minimal, &without_expectations);
+    }
+
+    /// Regression: the rendered ticket stays byte-for-byte appended, a bare
+    /// kickoff keeps the minimal prefix, and canonical no-expectations tickets
+    /// still omit the discipline.
+    #[test]
+    fn when_building_ticket_kickoff_given_rendered_ticket_then_preserves_complete_ticket_and_minimal_bare_prefix()
+     {
+        let rendered = rendered_ticket(vec!["when_a_given_b_then_c"]);
+        let kickoff = ticket_kickoff(&rendered);
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
+        assert!(kickoff.ends_with(&rendered));
+
+        let bare = "Call the bash tool once.";
+        let bare_kickoff = ticket_kickoff(bare);
+
+        assert_minimal_kickoff_preserves_ticket(&bare_kickoff, bare);
+
+        let empty = rendered_ticket(Vec::new());
+        assert!(empty.contains("## Test Expectations\n\nNone."));
+        let empty_kickoff = ticket_kickoff(&empty);
+
+        assert_minimal_kickoff_preserves_ticket(&empty_kickoff, &empty);
     }
 }
