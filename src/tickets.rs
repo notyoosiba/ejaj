@@ -74,7 +74,8 @@ pub struct Ticket {
     pub out_of_scope: Vec<String>,
     /// The changes the ticket makes.
     pub scope_of_changes: Vec<String>,
-    /// The tests the ticket adds or updates.
+    /// The tests the ticket adds or updates; empty, blank, or the `None.` marker when no
+    /// source-code test applies.
     pub test_expectations: Vec<String>,
     /// The exact terminal command that must exit 0.
     pub verification_gate: String,
@@ -171,10 +172,13 @@ impl TicketSet {
     /// `verification_gate` must each have at least [`TITLE_MIN_CHARS`], [`OBJECTIVE_MIN_CHARS`]
     /// and [`GATE_MIN_CHARS`] trimmed Unicode characters; the objective must not restate the title
     /// after trimming, Unicode case folding and collapsing consecutive whitespace;
-    /// `prerequisites_assumed` must be non-blank; and at least one of `out_of_scope`,
+    /// `prerequisites_assumed` must be non-blank; at least one of `out_of_scope`,
     /// `scope_of_changes`, `test_expectations` and `acceptance_criteria` must hold a non-blank
-    /// entry, because blank entries carry no content. `blocks` stays documentation (it never
-    /// affects scheduling) and no other content is judged.
+    /// entry, because blank entries carry no content; and every `test_expectations` entry that is
+    /// neither blank nor the `None.` marker must name a
+    /// `when_<action>_given_<context>_then_<outcome>` test. Test expectations are optional
+    /// because not every ticket has an applicable source-code test. `blocks` stays documentation
+    /// (it never affects scheduling) and no other content is judged.
     pub fn validate(&self) -> Result<(), String> {
         if self.tickets.is_empty() {
             return Err(
@@ -303,26 +307,18 @@ impl TicketSet {
                      non-blank entry so the code agent knows what to do"
                 ));
             }
-            let non_blank_tests: Vec<&str> = ticket
+            let substantive_tests = ticket
                 .test_expectations
                 .iter()
                 .map(|entry| entry.trim())
-                .filter(|entry| !entry.is_empty())
-                .collect();
-            if non_blank_tests.is_empty() {
-                return Err(format!(
-                    "[ERROR] ticket `{id}` has no `test_expectations`; every ticket must list at \
-                     least one test expectation naming a \
-                     `when_<action>_given_<context>_then_<outcome>` test case"
-                ));
-            }
-            for entry in non_blank_tests {
+                .filter(|entry| !entry.is_empty() && !is_none_marker(entry));
+            for entry in substantive_tests {
                 if !has_bdd_test_name(entry) {
                     return Err(format!(
                         "[ERROR] ticket `{id}` has a `test_expectations` entry without a \
                          `when_<action>_given_<context>_then_<outcome>` test identifier: \
-                         \"{entry}\"; every test expectation must name its test in lowercase \
-                         snake_case `when_<action>_given_<context>_then_<outcome>` form"
+                         \"{entry}\"; every substantive test expectation must name its test in \
+                         lowercase snake_case `when_<action>_given_<context>_then_<outcome>` form"
                     ));
                 }
             }
@@ -330,6 +326,12 @@ impl TicketSet {
 
         Ok(())
     }
+}
+
+/// Whether `entry` is the specification module's `None.` marker, ignoring surrounding
+/// whitespace and ASCII case.
+fn is_none_marker(entry: &str) -> bool {
+    entry.trim().eq_ignore_ascii_case(NONE)
 }
 
 /// Whether `text` contains a valid `when_<action>_given_<context>_then_<outcome>`
@@ -944,7 +946,7 @@ cargo test tickets
 
     /// A ticket whose four content lists are all empty has nothing to implement and is refused.
     #[test]
-    fn a_ticket_with_no_content_in_any_list_is_refused() {
+    fn when_validating_ticket_given_all_content_lists_blank_then_rejects() {
         let mut set = valid_set();
         set.tickets[0].out_of_scope.clear();
         set.tickets[0].scope_of_changes.clear();
@@ -1014,24 +1016,111 @@ cargo test tickets
     }
 
     #[test]
-    fn when_validating_ticket_given_empty_test_expectations_then_refuses() {
+    fn when_validating_ticket_given_empty_expectations_then_accepts() {
         let mut set = valid_set();
         set.tickets[0].test_expectations.clear();
-        let error = set.validate().expect_err("must not validate");
-        assert!(error.contains("1-first"), "{error}");
-        assert!(error.contains("test_expectations"), "{error}");
+        assert_eq!(set.validate(), Ok(()));
     }
 
     #[test]
-    fn when_validating_ticket_given_non_bdd_test_expectation_then_refuses() {
+    fn when_validating_ticket_given_empty_and_whitespace_expectations_then_accepts() {
+        let mut set = valid_set();
+        set.tickets[0].test_expectations.clear();
+        assert_eq!(set.validate(), Ok(()));
+
+        for blank in ["", "   ", "\n", "\t \n"] {
+            let mut set = valid_set();
+            set.tickets[0].test_expectations = vec![blank.to_string()];
+            assert_eq!(
+                set.validate(),
+                Ok(()),
+                "a blank expectation {blank:?} must not be required to name a test"
+            );
+        }
+    }
+
+    #[test]
+    fn when_validating_ticket_given_blank_marker_and_valid_expectations_then_accepts() {
+        let mut set = valid_set();
+        set.tickets[0].test_expectations = vec![
+            "   ".to_string(),
+            "None.".to_string(),
+            "  nOnE.  ".to_string(),
+            "  when_mixing_given_blanks_and_markers_then_accepts  ".to_string(),
+        ];
+        assert_eq!(set.validate(), Ok(()));
+    }
+
+    #[test]
+    fn when_validating_ticket_given_none_marker_as_only_content_then_accepts() {
+        let mut set = valid_set();
+        set.tickets[0].out_of_scope.clear();
+        set.tickets[0].scope_of_changes.clear();
+        set.tickets[0].test_expectations = vec!["None.".to_string()];
+        set.tickets[0].acceptance_criteria.clear();
+        assert_eq!(set.validate(), Ok(()));
+    }
+
+    #[test]
+    fn when_validating_ticket_given_malformed_substantive_expectation_then_reports_bdd_requirement()
+    {
         let mut set = valid_set();
         set.tickets[0].test_expectations = vec!["it tests the first slice".to_string()];
         let error = set.validate().expect_err("must not validate");
         assert!(error.contains("1-first"), "{error}");
+        assert!(error.contains("test_expectations"), "{error}");
         assert!(
             error.contains("when_<action>_given_<context>_then_<outcome>"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn when_validating_ticket_given_marker_and_malformed_expectation_then_rejects() {
+        let mut set = valid_set();
+        set.tickets[0].test_expectations =
+            vec!["None.".to_string(), "it tests the first slice".to_string()];
+        let error = set.validate().expect_err("must not validate");
+        assert!(error.contains("1-first"), "{error}");
+        assert!(error.contains("test_expectations"), "{error}");
+        assert!(error.contains("it tests the first slice"), "{error}");
+    }
+
+    #[test]
+    fn when_validating_ticket_given_marker_and_minimum_valid_bdd_name_then_accepts() {
+        let mut set = valid_set();
+        set.tickets[0].test_expectations =
+            vec!["  nOnE.  ".to_string(), "when_a_given_b_then_c".to_string()];
+        assert_eq!(set.validate(), Ok(()));
+    }
+
+    #[test]
+    fn when_validating_ticket_given_long_substantive_expectation_then_checks_bdd_name() {
+        let long_prose = "no identifier here ".repeat(400);
+        let mut set = valid_set();
+        set.tickets[0].test_expectations = vec![long_prose.clone()];
+        let error = set.validate().expect_err("must not validate");
+        assert!(error.contains("test_expectations"), "{error}");
+        assert!(
+            error.contains("when_<action>_given_<context>_then_<outcome>"),
+            "{error}"
+        );
+
+        let long_bdd =
+            format!("{long_prose}when_long_entry_given_unbounded_size_then_still_checks");
+        let mut set = valid_set();
+        set.tickets[0].test_expectations = vec![long_bdd];
+        assert_eq!(set.validate(), Ok(()));
+    }
+
+    #[test]
+    fn when_validating_ticket_given_malformed_non_marker_expectation_then_rejects() {
+        let mut set = valid_set();
+        set.tickets[0].test_expectations =
+            vec!["the queue handles it".to_string(), "None.".to_string()];
+        let error = set.validate().expect_err("must not validate");
+        assert!(error.contains("test_expectations"), "{error}");
+        assert!(error.contains("the queue handles it"), "{error}");
     }
 
     #[test]

@@ -6,6 +6,107 @@
 //! contract and the single implement-and-run-the-gate instruction; the ticket's
 //! own `Acceptance Criteria` section carries the criteria, unchanged.
 
+use crate::specification::NONE;
+use crate::tickets::{GATE_HEADING, SCOPE_HEADING, TEST_HEADING};
+
+/// The canonical rendered test-expectations section for a ticket that has no
+/// applicable source-code test. Only this exact section omits the discipline.
+fn no_expectations_section() -> String {
+    format!("{TEST_HEADING}\n\n{NONE}")
+}
+
+/// A Markdown fence delimiter: the length of its backtick run and whether
+/// anything other than whitespace follows that run.
+///
+/// Markdown allows up to three leading spaces before the delimiter. A run of at
+/// least three backticks opens a fence, but only a delimiter with nothing but
+/// whitespace after it can close one. A triple-backtick-prefixed command line
+/// with trailing text is therefore not a closing fence.
+fn fence_delimiter(line: &str) -> Option<(usize, bool)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let ticks = rest.len() - rest.trim_start_matches('`').len();
+    if ticks < 3 {
+        return None;
+    }
+    Some((ticks, rest[ticks..].trim().is_empty()))
+}
+
+/// Locate the first (`last == false`) or last (`last == true`) line-anchored
+/// occurrence of `heading` outside a fenced code block.
+///
+/// Rendered section headings always occupy a full line outside a fence, while
+/// the verification-gate command is itself fenced. Heading-like text inside
+/// that command is therefore never a section boundary. A closing fence must use
+/// at least as many backticks as its opener and carry nothing but whitespace
+/// after them, so a non-closing triple-backtick-prefixed command line keeps the
+/// fence open.
+fn locate_section_heading(text: &str, heading: &str, last: bool) -> Option<usize> {
+    let mut fence_opener: Option<usize> = None;
+    let mut found = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        match fence_opener {
+            Some(opener) => {
+                if let Some((ticks, closes)) = fence_delimiter(line)
+                    && closes
+                    && ticks >= opener
+                {
+                    fence_opener = None;
+                }
+            }
+            None => {
+                if let Some((ticks, _)) = fence_delimiter(line) {
+                    fence_opener = Some(ticks);
+                } else if line.trim_end_matches(['\r', '\n']) == heading {
+                    if !last {
+                        return Some(offset);
+                    }
+                    found = Some(offset);
+                }
+            }
+        }
+        offset += line.len();
+    }
+    found
+}
+
+fn find_section_heading(text: &str, heading: &str) -> Option<usize> {
+    locate_section_heading(text, heading, false)
+}
+
+fn rfind_section_heading(text: &str, heading: &str) -> Option<usize> {
+    locate_section_heading(text, heading, true)
+}
+
+/// Whether the rendered ticket's actual test-expectations section is exactly
+/// the canonical no-expectations section.
+///
+/// The renderer places the test-expectations section immediately after the
+/// scope-of-changes section and immediately before the verification-gate
+/// section, so the section is bounded by those two headings. Selecting the
+/// first `## Test Expectations` heading after `## Scope of Changes` ensures
+/// that canonical marker text embedded inside a substantive test expectation is
+/// treated as part of that expectation's body rather than as the section root.
+fn has_no_expectations_section(ticket: &str) -> bool {
+    let before_gate = match rfind_section_heading(ticket, GATE_HEADING) {
+        Some(gate_start) => &ticket[..gate_start],
+        None => ticket,
+    }
+    .trim_end_matches('\n');
+    let after_scope = match rfind_section_heading(before_gate, SCOPE_HEADING) {
+        Some(scope_start) => &before_gate[scope_start..],
+        None => before_gate,
+    };
+    let Some(section_start) = find_section_heading(after_scope, TEST_HEADING) else {
+        return false;
+    };
+    after_scope[section_start..] == no_expectations_section()
+}
+
 /// System prompt for the code agent (`execute_script` and `bash` tool loop).
 pub const CODE_SYSTEM_PROMPT: &str = "\
 You are an autonomous software engineer.
@@ -117,10 +218,13 @@ production changes, then implement the production code and run the ticket's `ver
 until it exits 0.\n\n";
 
 /// Build the user kickoff message for `ticket`. Rendered queue tickets (which
-/// begin with YAML front matter `---\n`) include [`CODE_TDD_DISCIPLINE`]; bare
-/// wire-test prompts keep the minimal [`CODE_TICKET_KICKOFF_PROMPT`] prefix.
+/// begin with YAML front matter `---\n`) include [`CODE_TDD_DISCIPLINE`] unless
+/// their test-expectations section is exactly the canonical
+/// `## Test Expectations\n\nNone.` text; bare wire-test prompts keep the
+/// minimal [`CODE_TICKET_KICKOFF_PROMPT`] prefix.
 pub fn ticket_kickoff(ticket: &str) -> String {
-    if ticket.starts_with("---\n") {
+    let rendered = ticket.starts_with("---\n");
+    if rendered && !has_no_expectations_section(ticket) {
         format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{ticket}")
     } else {
         format!("{CODE_TICKET_KICKOFF_PROMPT}{ticket}")
@@ -425,5 +529,333 @@ mod tests {
         let bare = "Call the bash tool once.";
         let bare_kickoff = ticket_kickoff(bare);
         assert_eq!(bare_kickoff, format!("{CODE_TICKET_KICKOFF_PROMPT}{bare}"));
+    }
+
+    /// A rendered ticket built through the real renderer, so the canonical
+    /// section text is exercised end to end instead of being hard-coded.
+    fn rendered_ticket(test_expectations: Vec<&str>) -> String {
+        rendered_ticket_with_objective(
+            "Repair the cross-suite regression that the transition gate reported.",
+            test_expectations,
+        )
+    }
+
+    /// A rendered ticket whose verification gate is supplied by the caller, so
+    /// heading-like text can be embedded in the fenced command.
+    fn rendered_ticket_with_gate(test_expectations: Vec<&str>, verification_gate: &str) -> String {
+        use crate::tickets::Ticket;
+        Ticket {
+            id: "2-repair".to_string(),
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+            title: "Repair the suite".to_string(),
+            objective: "Repair the cross-suite regression that the transition gate reported."
+                .to_string(),
+            acceptance_criteria: vec!["The suite exits 0.".to_string()],
+            prerequisites_assumed: "The queue round completed.".to_string(),
+            out_of_scope: vec!["Unrelated features.".to_string()],
+            scope_of_changes: vec!["Resolve the regression.".to_string()],
+            test_expectations: test_expectations.into_iter().map(str::to_string).collect(),
+            verification_gate: verification_gate.to_string(),
+        }
+        .to_markdown()
+    }
+
+    /// A rendered ticket whose objective is supplied by the caller, so marker
+    /// text can be embedded in a field other than the test-expectations section.
+    fn rendered_ticket_with_objective(objective: &str, test_expectations: Vec<&str>) -> String {
+        use crate::tickets::Ticket;
+        Ticket {
+            id: "2-repair".to_string(),
+            blocked_by: Vec::new(),
+            blocks: Vec::new(),
+            title: "Repair the suite".to_string(),
+            objective: objective.to_string(),
+            acceptance_criteria: vec!["The suite exits 0.".to_string()],
+            prerequisites_assumed: "The queue round completed.".to_string(),
+            out_of_scope: vec!["Unrelated features.".to_string()],
+            scope_of_changes: vec!["Resolve the regression.".to_string()],
+            test_expectations: test_expectations.into_iter().map(str::to_string).collect(),
+            verification_gate: "cargo test".to_string(),
+        }
+        .to_markdown()
+    }
+
+    /// Core entry-point behavior: a rendered ticket whose test section is the
+    /// canonical no-expectations marker is kicked off without Red-First TDD.
+    #[test]
+    fn when_building_kickoff_given_rendered_ticket_without_expectations_then_omits_tdd_discipline()
+    {
+        let rendered = rendered_ticket(Vec::new());
+        assert!(
+            rendered.contains("## Test Expectations\n\nNone."),
+            "the renderer must emit the canonical marker: {rendered}"
+        );
+
+        let kickoff = ticket_kickoff(&rendered);
+        assert!(!kickoff.contains(CODE_TDD_DISCIPLINE));
+        assert!(!kickoff.contains("Red-First TDD"));
+        assert!(!kickoff.contains("when_<action>_given_<context>_then_<outcome>"));
+        assert!(kickoff.contains(CODE_TICKET_KICKOFF_PROMPT));
+    }
+
+    /// Contract: the prefix and the rendered ticket stay byte-for-byte
+    /// unchanged when the no-expectations section omits the discipline.
+    #[test]
+    fn when_building_kickoff_given_rendered_ticket_without_expectations_then_preserves_ticket_text()
+    {
+        let rendered = rendered_ticket(Vec::new());
+        let kickoff = ticket_kickoff(&rendered);
+        assert_eq!(kickoff, format!("{CODE_TICKET_KICKOFF_PROMPT}{rendered}"));
+        assert!(kickoff.ends_with(&rendered));
+    }
+
+    /// Edge-case table: the renderer's all-blank canonical form also omits the
+    /// discipline, because an all-blank list renders exactly like an empty one.
+    #[test]
+    fn when_building_kickoff_given_all_blank_rendered_expectations_then_omits_tdd_discipline() {
+        let rendered = rendered_ticket(vec!["", "   ", "\t \n"]);
+        assert!(
+            rendered.contains("## Test Expectations\n\nNone."),
+            "all-blank entries must render as the canonical marker: {rendered}"
+        );
+
+        let kickoff = ticket_kickoff(&rendered);
+        assert!(!kickoff.contains(CODE_TDD_DISCIPLINE));
+        assert_eq!(kickoff, format!("{CODE_TICKET_KICKOFF_PROMPT}{rendered}"));
+    }
+
+    /// Edge-case table: a rendered ticket with expectations keeps the existing
+    /// Red-First TDD discipline.
+    #[test]
+    fn when_building_kickoff_given_rendered_ticket_with_expectations_then_keeps_tdd_discipline() {
+        let rendered = rendered_ticket(vec![
+            "when_running_the_suite_given_repair_then_all_tests_pass",
+        ]);
+
+        let kickoff = ticket_kickoff(&rendered);
+        assert!(kickoff.contains(CODE_TDD_DISCIPLINE));
+        assert!(kickoff.contains("Red-First TDD"));
+        assert!(kickoff.contains(CODE_TICKET_KICKOFF_PROMPT));
+        assert!(kickoff.ends_with(&rendered));
+    }
+
+    /// Regression: the canonical no-expectations marker embedded in another
+    /// rendered field is not the test-expectations section, so the discipline
+    /// stays and the rendered ticket is preserved byte for byte.
+    #[test]
+    fn when_building_kickoff_given_expectation_marker_in_objective_and_test_expectation_then_keeps_tdd_discipline()
+     {
+        let rendered = rendered_ticket_with_objective(
+            "Repair the regression.\n\n## Test Expectations\n\nNone.\n\nKeep the suite green.",
+            vec!["when_running_the_suite_given_repair_then_all_tests_pass"],
+        );
+        assert!(
+            rendered.contains("## Test Expectations\n\nNone."),
+            "the objective must embed the canonical marker text: {rendered}"
+        );
+
+        let kickoff = ticket_kickoff(&rendered);
+        assert!(kickoff.contains(CODE_TDD_DISCIPLINE));
+        assert!(kickoff.contains("Red-First TDD"));
+        assert!(kickoff.contains(CODE_TICKET_KICKOFF_PROMPT));
+        assert_eq!(
+            kickoff,
+            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
+        );
+        assert!(kickoff.ends_with(&rendered));
+    }
+
+    /// Regression: canonical no-expectations marker text embedded inside a
+    /// substantive test expectation is part of that expectation item, not the
+    /// rendered section root, so the discipline is kept and the full ticket is
+    /// preserved.
+    #[test]
+    fn when_building_kickoff_given_expectation_marker_in_test_expectation_then_keeps_tdd_discipline()
+     {
+        let rendered = rendered_ticket(vec![
+            "when_running_the_suite_given_repair_then_all_tests_pass\n\n## Test Expectations\n\nNone.",
+        ]);
+        assert!(
+            rendered.contains("## Test Expectations\n\nNone."),
+            "the test expectation must embed the canonical marker text: {rendered}"
+        );
+
+        let kickoff = ticket_kickoff(&rendered);
+        assert!(kickoff.contains(CODE_TDD_DISCIPLINE));
+        assert!(kickoff.contains("Red-First TDD"));
+        assert!(kickoff.contains(CODE_TICKET_KICKOFF_PROMPT));
+        assert_eq!(
+            kickoff,
+            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
+        );
+        assert!(kickoff.ends_with(&rendered));
+    }
+
+    /// Regression: heading-like section text inside the fenced verification
+    /// command is not a rendered section, so it must not hide a substantive
+    /// expectation and suppress the discipline.
+    #[test]
+    fn when_building_kickoff_given_marker_in_fenced_verification_command_then_keeps_tdd_discipline()
+    {
+        let gate = "cargo test --lib prompts::code\n\n\
+                    ## Test Expectations\n\nNone.\n\n\
+                    ## Verification Gate\n\n\
+                    cargo test --lib prompts::code";
+        let rendered = rendered_ticket_with_gate(
+            vec!["when_running_the_suite_given_repair_then_all_tests_pass"],
+            gate,
+        );
+        assert!(
+            rendered.contains("## Test Expectations\n\nNone."),
+            "the fenced command must embed the canonical marker text: {rendered}"
+        );
+
+        let kickoff = ticket_kickoff(&rendered);
+        assert!(kickoff.contains(CODE_TDD_DISCIPLINE));
+        assert!(kickoff.contains("Red-First TDD"));
+        assert!(kickoff.contains(CODE_TICKET_KICKOFF_PROMPT));
+        assert_eq!(
+            kickoff,
+            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
+        );
+        assert!(kickoff.ends_with(&rendered));
+    }
+
+    /// Regression: a triple-backtick-prefixed command line with trailing
+    /// non-whitespace text is not a valid closing fence, so heading-like text
+    /// after it stays inside the fenced command and the discipline is kept.
+    #[test]
+    fn when_building_kickoff_given_nonclosing_fence_prefix_in_verification_command_then_keeps_tdd_discipline()
+     {
+        let gate = "cargo test --lib prompts::code\n\
+                    ```not-a-closing-fence\n\n\
+                    ## Test Expectations\n\nNone.\n\n\
+                    ## Verification Gate\n\n\
+                    cargo test --lib prompts::code";
+        let rendered = rendered_ticket_with_gate(
+            vec!["when_running_the_suite_given_repair_then_all_tests_pass"],
+            gate,
+        );
+        assert!(
+            rendered.contains("```not-a-closing-fence"),
+            "the fenced command must carry a non-closing fence prefix: {rendered}"
+        );
+        assert!(
+            rendered.contains("## Test Expectations\n\nNone."),
+            "the fenced command must embed the canonical marker text: {rendered}"
+        );
+
+        let kickoff = ticket_kickoff(&rendered);
+        assert!(kickoff.contains(CODE_TDD_DISCIPLINE));
+        assert!(kickoff.contains("Red-First TDD"));
+        assert!(kickoff.contains(CODE_TICKET_KICKOFF_PROMPT));
+        assert_eq!(
+            kickoff,
+            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
+        );
+        assert!(kickoff.ends_with(&rendered));
+    }
+
+    /// Contract: the canonical no-expectations section still omits the
+    /// discipline when the fenced command also carries heading-like text.
+    #[test]
+    fn when_building_kickoff_given_no_expectations_and_marker_in_fenced_verification_command_then_omits_tdd_discipline()
+     {
+        let gate =
+            "cargo test\n\n## Test Expectations\n\nNone.\n\n## Verification Gate\n\ncargo test";
+        let rendered = rendered_ticket_with_gate(Vec::new(), gate);
+        assert!(
+            rendered.contains("## Test Expectations\n\nNone."),
+            "the rendered ticket must carry both the real marker and the fenced one: {rendered}"
+        );
+
+        let kickoff = ticket_kickoff(&rendered);
+        assert!(!kickoff.contains(CODE_TDD_DISCIPLINE));
+        assert_eq!(kickoff, format!("{CODE_TICKET_KICKOFF_PROMPT}{rendered}"));
+    }
+
+    /// Regression: the full discipline and the full rendered ticket survive
+    /// unchanged for a ticket that does carry expectations.
+    #[test]
+    fn when_building_kickoff_given_rendered_ticket_with_expectations_then_preserves_full_ticket() {
+        let rendered = rendered_ticket(vec![
+            "when_running_the_suite_given_repair_then_all_tests_pass",
+        ]);
+
+        let kickoff = ticket_kickoff(&rendered);
+        assert_eq!(
+            kickoff,
+            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
+        );
+        assert!(kickoff.contains("## Test Expectations\n\n- when_running"));
+    }
+
+    /// Minimum valid boundary: one expectation is enough to keep the existing
+    /// discipline.
+    #[test]
+    fn when_building_kickoff_given_rendered_ticket_with_one_valid_expectation_then_keeps_tdd_discipline()
+     {
+        let rendered = rendered_ticket(vec!["when_a_given_b_then_c"]);
+        let kickoff = ticket_kickoff(&rendered);
+        assert_eq!(
+            kickoff,
+            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
+        );
+    }
+
+    /// Maximum/upper boundary: a long expectation is neither truncated nor
+    /// capped; the discipline and the full ticket survive.
+    #[test]
+    fn when_building_kickoff_given_rendered_ticket_with_long_expectation_then_preserves_full_ticket()
+     {
+        let long = format!(
+            "when_{}_given_a_full_suite_regression_then_reports",
+            "long".repeat(2_000)
+        );
+        let rendered = rendered_ticket(vec![&long]);
+
+        let kickoff = ticket_kickoff(&rendered);
+        assert!(
+            kickoff.contains(&long),
+            "the long expectation must not be truncated"
+        );
+        assert_eq!(
+            kickoff,
+            format!("{CODE_TDD_DISCIPLINE}{CODE_TICKET_KICKOFF_PROMPT}{rendered}")
+        );
+    }
+
+    /// Malformed payload: only the exact canonical no-expectations section
+    /// signal omits the discipline.
+    #[test]
+    fn when_building_kickoff_given_rendered_ticket_with_noncanonical_test_section_then_keeps_tdd_discipline()
+     {
+        let canonical = rendered_ticket(Vec::new());
+        for section in [
+            "## Test Expectations\nNone.",
+            "## Test Expectations\n\n**None.**",
+            "## Test Expectations\n\n- None.",
+            "## Test Expectations\n \nNone.",
+            "## Test Expectations\n\nnone.",
+        ] {
+            let rendered = canonical.replace("## Test Expectations\n\nNone.", section);
+            let kickoff = ticket_kickoff(&rendered);
+            assert!(
+                kickoff.contains(CODE_TDD_DISCIPLINE),
+                "only the exact canonical section may omit discipline: {section:?}"
+            );
+        }
+    }
+
+    /// Bare-prompt path: a non-rendered prompt keeps exactly the minimal
+    /// prefix, with no discipline regardless of its content.
+    #[test]
+    fn when_building_kickoff_given_bare_prompt_then_keeps_minimal_prefix() {
+        let bare = "Call the bash tool once.";
+        let kickoff = ticket_kickoff(bare);
+        assert_eq!(kickoff, format!("{CODE_TICKET_KICKOFF_PROMPT}{bare}"));
+        assert!(!kickoff.contains(CODE_TDD_DISCIPLINE));
+        assert!(!kickoff.contains("Red-First TDD"));
     }
 }

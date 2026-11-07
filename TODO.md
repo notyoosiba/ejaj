@@ -8,11 +8,11 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 | Plan / Proposal | Status | Mapped DAG Tasks | Target Modules |
 | --- | --- | --- | --- |
-| [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) | `[ ]` Pending (Root) | `T01`, `T02` | `src/tickets.rs`, `src/pipeline.rs`, `src/prompts/{plan,spec,tickets,code,review}.rs` |
-| [`01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md) | `[ ]` Pending | `T02`, `T03` | `src/prompts/plan.rs`, `src/prompts/spec.rs` |
-| [`03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md) | `[ ]` Pending | `T02`, `T04`, `T05` | `src/prompts/code.rs`, `src/prompts/review.rs` |
-| [`PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md) | `[ ]` Pending | `T04` | `src/prompts/code.rs` |
+| [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) | `[-]` In Progress (`T01` done) | `T01`, `T02` | `src/tickets.rs`, `src/pipeline.rs`, `src/prompts/{plan,spec,tickets,code,review}.rs` |
+| [`03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md) | `[ ]` Pending | `T02`, `T05`, `T04` | `src/prompts/review.rs`, `src/prompts/code.rs` |
 | [`PROPOSAL-8-internal-module-exports-in-review.md`](./.plans/PROPOSAL-8-internal-module-exports-in-review.md) | `[ ]` Pending | `T05` | `src/prompts/review.rs` |
+| [`PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md) | `[ ]` Pending | `T04` | `src/prompts/code.rs` |
+| [`01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md) | `[ ]` Pending | `T02`, `T03` | `src/prompts/plan.rs`, `src/prompts/spec.rs` |
 | [`PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md) | `[ ]` Pending | `T04`, `T06` | `src/prompts/code.rs`, `src/prompts/tickets.rs` |
 | [`02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md) | `[ ]` Pending | `T02`, `T06`, `T07` | `src/prompts/tickets.rs`, `src/prompts/triage.rs` |
 | [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | `[ ]` Pending | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
@@ -36,48 +36,52 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 ## 2. Task Dependency Graph (DAG)
 
-`T01` and `T02` implement [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) first so the validator, pipeline, and prompts support `test_expectations: []` (`None.`) and never demand unit tests for markdown or tracker files (`TODO.md`, `.plans/*.md`, `README.md`).
+`T01` and `T02` implement [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) first so the validator, pipeline, and prompts support `test_expectations: []` (`None.`) and never demand unit tests for markdown or tracker files (`TODO.md`, `.plans/*.md`, `README.md`). Next, Wave 1 (`T05` → `T04` → `T03` → `T06`) completes all phase-prompt upgrades (`src/prompts/*.rs`) so rebuilding `ejaj` gives all subsequent runtime and pipeline tasks (`T07`–`T18`) scoped Round 2+ re-reviews, no artificial red probes, and capped ticket scopes.
 
 ```text
-[T01] PROPOSAL-3a: Validator, transition_fix_ticket & ticket_kickoff optional test_expectations
-  │
-  ▼
-[T02] PROPOSAL-3b: Source-code-only test rules across Plan, Spec, Tickets & Review prompts
-  ├──► [T04] 03 + PROPOSAL-4 + PROPOSAL-9: CODE_TDD_DISCIPLINE upgrades (src/prompts/code.rs)
-  ├──► [T05] 03 + PROPOSAL-8: REVIEW_SYSTEM_PROMPT upgrades (src/prompts/review.rs)
-  ├──► [T03] 01: PLAN_SYSTEM_PROMPT & SPEC_SYSTEM_PROMPT upgrades (src/prompts/{plan,spec}.rs)
-  │      │
-  │      ▼
-  │    [T06] 02 + PROPOSAL-9: TICKETS_SYSTEM_PROMPT scope cap & contracts (src/prompts/tickets.rs)
-  │      │
-  │      ▼
-  │    [T07] PROPOSAL-1a + 02: TriageState::Done model & TRIAGE_SYSTEM_PROMPT (src/triage.rs, src/prompts/triage.rs)
-  │      │
-  │      ▼
-  │    [T08] PROPOSAL-1b: Pipeline pre-completion & unblocking for Done tickets (src/pipeline.rs)
-  │      │
-  │      ▼
-  │    [T09] PROPOSAL-5: Forward Triage notes & AgentBrief to Code kickoff (src/{triage,orchestrator,pipeline}.rs)
-  │      │
-  │      ▼
-  │    [T10] PROPOSAL-7: Gate failure excerpts in queue-report.md (src/{orchestrator,pipeline}.rs)
-  │      │
-  │      └──────────────────────────┐
-  ├──► [T12] 09: CRLF tools.replace & grep line cap (src/script.rs)
-  ├──► [T11] 05: Shell process-group kill & timeout spill (src/tools.rs) ──────────────┐
-  ├──► [T13] 12: HTTP 408, permanent 429 fast-fail & retry-after hints (src/retry.rs) ─┼──┐
-  └──► [T14] 07a: Output-token truncation detection across providers (src/api.rs, llm) │  │
-         │                                                                             │  │
-         ▼                                                                             │  │
-       [T15] 07b: In-loop missing-tool/truncation recovery & loop guard (agent.rs)     │  │
-         ├──────────────────────────┐                                                  │  │
-         ▼                          ▼                                                  │  │
-       [T16] PROPOSAL-2:          [T17] 11: Compaction retry, Tier-1 soft fallback     │  │
-         Outer retry for            & HTTP 400/413/422 overflow recovery (agent.rs) ◄──┼──┘
-         unattended passes          │                                                  │
-         (src/pipeline.rs)          ▼                                                  │
-                                  [T18] 08: Conversation trajectory persistence ◄──────┘
-                                    (.traj.json in src/loops/agent.rs, src/tools.rs)
+[x] [T01] PROPOSAL-3a: Validator, transition_fix_ticket & ticket_kickoff optional test_expectations
+      │
+      ▼
+[ ] [T02] PROPOSAL-3b: Source-code-only test rules across Plan, Spec, Tickets & Review prompts
+      │
+      ▼
+[ ] [T05] 03 + PROPOSAL-8: REVIEW_SYSTEM_PROMPT upgrades — scoped Round 2+ re-review & pub(crate) exports (src/prompts/review.rs)
+      │
+      ▼
+[ ] [T04] 03 + PROPOSAL-4 + PROPOSAL-9: CODE_TDD_DISCIPLINE upgrades — no artificial red probes & tracker edits last (src/prompts/code.rs)
+      │
+      ▼
+[ ] [T03] 01: PLAN_SYSTEM_PROMPT & SPEC_SYSTEM_PROMPT upgrades (src/prompts/{plan,spec}.rs)
+      │
+      ▼
+[ ] [T06] 02 + PROPOSAL-9: TICKETS_SYSTEM_PROMPT scope cap & contracts (src/prompts/tickets.rs)
+      ├──► [T07] PROPOSAL-1a + 02: TriageState::Done model & TRIAGE_SYSTEM_PROMPT (src/triage.rs, src/prompts/triage.rs)
+      │      │
+      │      ▼
+      │    [T08] PROPOSAL-1b: Pipeline pre-completion & unblocking for Done tickets (src/pipeline.rs)
+      │      │
+      │      ▼
+      │    [T09] PROPOSAL-5: Forward Triage notes & AgentBrief to Code kickoff (src/{triage,orchestrator,pipeline}.rs)
+      │      │
+      │      ▼
+      │    [T10] PROPOSAL-7: Gate failure excerpts in queue-report.md (src/{orchestrator,pipeline}.rs)
+      │      │
+      │      └──────────────────────────┐
+      ├──► [T11] 05: Shell process-group kill & timeout spill (src/tools.rs) ──────────────┐
+      ├──► [T12] 09: CRLF tools.replace & grep line cap (src/script.rs)                    │
+      ├──► [T13] 12: HTTP 408, permanent 429 fast-fail & retry-after hints (src/retry.rs) ─┼──┐
+      └──► [T14] 07a: Output-token truncation detection across providers (src/api.rs, llm) │  │
+             │                                                                             │  │
+             ▼                                                                             │  │
+           [T15] 07b: In-loop missing-tool/truncation recovery & loop guard (agent.rs)     │  │
+             ├──────────────────────────┐                                                  │  │
+             ▼                          ▼                                                  │  │
+           [T16] PROPOSAL-2:          [T17] 11: Compaction retry, Tier-1 soft fallback     │  │
+             Outer retry for            & HTTP 400/413/422 overflow recovery (agent.rs) ◄──┼──┘
+             unattended passes          │                                                  │
+             (src/pipeline.rs)          ▼                                                  │
+                                      [T18] 08: Conversation trajectory persistence ◄──────┘
+                                        (.traj.json in src/loops/agent.rs, src/tools.rs)
 ```
 
 ---
@@ -86,7 +90,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 ### Wave 0: Root Foundation (`PROPOSAL-3-non-code-test-expectations.md`)
 
-- [ ] **`T01` — Optional `test_expectations` in Validator, `transition_fix_ticket`, & `ticket_kickoff`**
+- [x] **`T01` — Optional `test_expectations` in Validator, `transition_fix_ticket`, & `ticket_kickoff`**
   - `blocked_by`: `[]`
   - `blocks`: `["T02"]`
   - `plans`: [`.plans/PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md)
@@ -99,7 +103,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 - [ ] **`T02` — Enforce Executable Source-Code-Only Testing Across Phase Prompts**
   - `blocked_by`: `["T01"]`
-  - `blocks`: `["T03", "T04", "T05", "T11", "T12", "T13", "T14"]`
+  - `blocks`: `["T05"]`
   - `plans`: [`.plans/PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md)
   - `files`: `src/prompts/plan.rs`, `src/prompts/spec.rs`, `src/prompts/tickets.rs`, `src/prompts/review.rs`
   - `tasks`:
@@ -111,31 +115,11 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 ---
 
-### Wave 1: Prompt Upgrades & Independent Runtime Improvements
-
-- [ ] **`T03` — Plan & Spec Prompt Upgrades (First-Turn Reconnaissance, Deep Modules, & Cross-Module Signatures)**
-  - `blocked_by`: `["T02"]`
-  - `blocks`: `["T06"]`
-  - `plans`: [`.plans/01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md)
-  - `files`: `src/prompts/plan.rs`, `src/prompts/spec.rs`
-  - `tasks`:
-    - In `PLAN_SYSTEM_PROMPT` (`src/prompts/plan.rs`, preserving `PLAN_MARKER` and the 4 `##` template headings): enforce prerequisite ordering across rounds, require first-turn `execute_script` reconnaissance + a 1–3 sentence summary of goal/current code/constraints before `Q1`, read `AGENTS.md` and `README.md` (following links), check for existing modules/redundancy before proposing new design options, and keep self-contained decision records without option letters.
-    - In `SPEC_SYSTEM_PROMPT` (`src/prompts/spec.rs`, preserving all `## 1`..`## 7` and `###` headings): require reading `AGENTS.md` and `README.md` in Step 1, enforce deep module design with small public interfaces and real collaborators (edge-only mocking) in Step 2, and require exact cross-module function/type signatures in Step 3.
-  - `verification_gate`: `cargo test --lib prompts::plan && cargo test --lib prompts::spec && cargo test --test pipeline && cargo clippy --all-targets -- -D warnings`
-
-- [ ] **`T04` — `CODE_TDD_DISCIPLINE` Upgrades (Vertical Slices, No Artificial Red Probes, & Tracker Edits Last)**
-  - `blocked_by`: `["T02"]`
-  - `blocks`: `[]`
-  - `plans`: [`.plans/03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md), [`.plans/PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md), [`.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md)
-  - `files`: `src/prompts/code.rs`
-  - `tasks`:
-    - Keep `CODE_SYSTEM_PROMPT` byte-identical so `tests/fixtures/llm_wire/*.json` remain valid.
-    - Update `CODE_TDD_DISCIPLINE` in `src/prompts/code.rs`: work in vertical red-green slices at the public seam, never widen `pub` visibility on internal helpers solely for tests, replace obsolete coupled unit tests when consolidating behind a deeper seam, assert against independent known literals (anti-tautology), run focused test targets while iterating, never sabotage/stash/back up production files to force an artificial red failure when a new regression/boundary test already passes (`PROPOSAL-4`), and apply `TODO.md`/`.plan/*.md` tracker edits last right before `verification_gate` (reverting them if the gate fails, `PROPOSAL-9`).
-  - `verification_gate`: `cargo test --lib prompts::code && cargo test --test llm_wire && cargo clippy --all-targets -- -D warnings`
+### Wave 1: Phase Prompt Upgrades (`T05` → `T04` → `T03` → `T06` — Rebuild `ejaj` Before Runtime Tasks)
 
 - [ ] **`T05` — `REVIEW_SYSTEM_PROMPT` Upgrades (Diff-First Inspection, Internal Exports, & Scoped Round 2+ Re-Review)**
   - `blocked_by`: `["T02"]`
-  - `blocks`: `[]`
+  - `blocks`: `["T04"]`
   - `plans`: [`.plans/03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md), [`.plans/PROPOSAL-8-internal-module-exports-in-review.md`](./.plans/PROPOSAL-8-internal-module-exports-in-review.md)
   - `files`: `src/prompts/review.rs`
   - `tasks`:
@@ -145,63 +129,39 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - Update Step 4: emit findings/fixes for blocking defects only, scope round 2+ re-reviews (`## Prior Review Rounds`) to verifying prior findings/fixes and checking the fix diff for regressions, and coalesce compatible fixes into the minimum number of fix tickets.
   - `verification_gate`: `cargo test --lib prompts::review && cargo test --test pipeline && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T11` — Shell Execution Hardening (Process-Group Isolation, Partial Timeout Output, & Non-Interactive Env)**
-  - `blocked_by`: `["T02"]`
-  - `blocks`: `["T18"]`
-  - `plans`: [`.plans/05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md)
-  - `files`: `src/tools.rs`
+- [ ] **`T04` — `CODE_TDD_DISCIPLINE` Upgrades (Vertical Slices, No Artificial Red Probes, & Tracker Edits Last)**
+  - `blocked_by`: `["T05"]`
+  - `blocks`: `["T03"]`
+  - `plans`: [`.plans/03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md), [`.plans/PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md), [`.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md)
+  - `files`: `src/prompts/code.rs`
   - `tasks`:
-    - Configure `Command::new("bash")` with `process_group(0)` on Unix and kill the entire process group (`kill -s KILL -- -<pgid>`) on timeout before reaping the child and draining stream readers (`STREAM_DRAIN_GRACE = 200ms`).
-    - Return `ShellOutcome` from `shell_output_with_timeout` carrying partial `stdout` and `stderr` captured before timeout; append non-empty partial output after the timeout header in `run_command_in` and `bash_in` (truncating command display at `BASH_FAILURE_COMMAND_BYTES` and spilling to `<session-dir>/tools-output/` when `> 16 KiB`).
-    - Set non-interactive environment defaults (`GIT_TERMINAL_PROMPT=0`, `PAGER=cat`, `GIT_PAGER=cat`, `MANPAGER=cat`, `LESS=-R`, `CARGO_TERM_PROGRESS_WHEN=never`, `PIP_PROGRESS_BAR=off`, `TQDM_DISABLE=1`).
-  - `verification_gate`: `cargo test --lib tools && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+    - Keep `CODE_SYSTEM_PROMPT` byte-identical so `tests/fixtures/llm_wire/*.json` remain valid.
+    - Update `CODE_TDD_DISCIPLINE` in `src/prompts/code.rs`: work in vertical red-green slices at the public seam, never widen `pub` visibility on internal helpers solely for tests, replace obsolete coupled unit tests when consolidating behind a deeper seam, assert against independent known literals (anti-tautology), run focused test targets while iterating, never sabotage/stash/back up production files to force an artificial red failure when a new regression/boundary test already passes (`PROPOSAL-4`), and apply `TODO.md`/`.plan/*.md` tracker edits last right before `verification_gate` (reverting them if the gate fails, `PROPOSAL-9`).
+  - `verification_gate`: `cargo test --lib prompts::code && cargo test --test llm_wire && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T12` — CRLF-Safe `tools.replace`, Multi-Match Line Numbers, & `tools.grep` Line Cap**
-  - `blocked_by`: `["T02"]`
-  - `blocks`: `[]`
-  - `plans`: [`.plans/09-file-editing-and-patch-matching.md`](./.plans/09-file-editing-and-patch-matching.md)
-  - `files`: `src/script.rs`
+- [ ] **`T03` — Plan & Spec Prompt Upgrades (First-Turn Reconnaissance, Deep Modules, & Cross-Module Signatures)**
+  - `blocked_by`: `["T04"]`
+  - `blocks`: `["T06"]`
+  - `plans`: [`.plans/01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md)
+  - `files`: `src/prompts/plan.rs`, `src/prompts/spec.rs`
   - `tasks`:
-    - Reject no-op replacements (`old_text == new_text`) in `host_replace`.
-    - Match against an LF-normalized view with Tier-1 exact matching and Tier-2 line-trimmed trailing horizontal whitespace fallback while preserving UTF-8 BOM (`\u{FEFF}`) and dominant line endings (`\r\n` vs `\n`).
-    - Include 1-based match line numbers (`(at lines ...)` / `(first 5 at lines ...)`) when `matches > 1` while preserving existing error prefixes.
-    - Cap individual matched lines in `tools.grep` at `GREP_LINE_MAX_BYTES = 2_000` on a UTF-8 character boundary.
-  - `verification_gate`: `cargo test --lib script && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
-
-- [ ] **`T13` — HTTP 408 Timeout Retry, Permanent 429 Quota Fast-Fail, & Retry-After Hints**
-  - `blocked_by`: `["T02"]`
-  - `blocks`: `["T17"]`
-  - `plans`: [`.plans/12-http-retry-and-overload-resilience.md`](./.plans/12-http-retry-and-overload-resilience.md)
-  - `files`: `src/retry.rs`
-  - `tasks`:
-    - Add HTTP `408` to retryable status codes in `should_retry`.
-    - Classify permanent quota/billing exhaustion (`is_permanent_quota_error`, keeping `token_quota_exceeded` retryable) on HTTP `429` and `200..=299` so permanent billing errors fail fast.
-    - Extract explicit retry-delay hints (`extract_retry_hint_secs`, clamped to `MAX_RATE_LIMIT_BACKOFF_SECS = 30`) from `429` messages and cap base exponential backoff at `MAX_BACKOFF_SECS = 10`.
-  - `verification_gate`: `cargo test --lib retry && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
-
-- [ ] **`T14` — Provider Output-Token Truncation Detection (`Message.truncated`)**
-  - `blocked_by`: `["T02"]`
-  - `blocks`: `["T15"]`
-  - `plans`: [`.plans/07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md)
-  - `files`: `src/api.rs`, `src/llm/chat_completions.rs`, `src/llm/responses_api.rs`, `src/llm/anthropic.rs`
-  - `tasks`:
-    - Add `#[serde(skip)] pub truncated: bool` to `Message` in `src/api.rs` (initialized to `false` in `Message::text` and `Message::tool` so wire payloads and `context_bytes` stay unchanged).
-    - Set `truncated = true` when `finish_reason == Some("length")` in `ChatProvider::decode` (`src/api.rs`, `src/llm/chat_completions.rs`), when `status == Some("incomplete")` and `incomplete_details["reason"] == Some("max_output_tokens")` in `ResponsesProvider::decode` (`src/llm/responses_api.rs`), and when `stop_reason == Some("max_tokens")` in `AnthropicProvider::decode` (`src/llm/anthropic.rs`, returning an empty `Message` with `truncated: true` when truncated before content/tool blocks arrive).
-  - `verification_gate`: `cargo test --lib api && cargo test --lib llm && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
-
----
-
-### Wave 2: Tickets/Triage Pipeline Flow & In-Loop Recovery
+    - In `PLAN_SYSTEM_PROMPT` (`src/prompts/plan.rs`, preserving `PLAN_MARKER` and the 4 `##` template headings): enforce prerequisite ordering across rounds, require first-turn `execute_script` reconnaissance + a 1–3 sentence summary of goal/current code/constraints before `Q1`, read `AGENTS.md` and `README.md` (following links), check for existing modules/redundancy before proposing new design options, and keep self-contained decision records without option letters.
+    - In `SPEC_SYSTEM_PROMPT` (`src/prompts/spec.rs`, preserving all `## 1`..`## 7` and `###` headings): require reading `AGENTS.md` and `README.md` in Step 1, enforce deep module design with small public interfaces and real collaborators (edge-only mocking) in Step 2, and require exact cross-module function/type signatures in Step 3.
+  - `verification_gate`: `cargo test --lib prompts::plan && cargo test --lib prompts::spec && cargo test --test pipeline && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T06` — `TICKETS_SYSTEM_PROMPT` Upgrades (Per-Ticket Scope Cap & Cross-Ticket Signatures)**
   - `blocked_by`: `["T03"]`
-  - `blocks`: `["T07"]`
+  - `blocks`: `["T07", "T11", "T12", "T13", "T14"]`
   - `plans`: [`.plans/02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md), [`.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md)
   - `files`: `src/prompts/tickets.rs`
   - `tasks`:
     - Update Step 2 in `TICKETS_SYSTEM_PROMPT` to cap per-ticket scope at one primary user journey / entry point with a focused set of `test_expectations` (typically 3–8 BDD test cases in one test file, `PROPOSAL-9`) and batch small same-shape edits sharing one verification gate.
     - Require `prerequisites_assumed` to name the exact module paths, type names, and function signatures consumed from `blocked_by` tickets, and require `scope_of_changes` to name the exact public types and function signatures produced for `blocks` tickets (`02`).
   - `verification_gate`: `cargo test --lib prompts::tickets && cargo test --test pipeline && cargo clippy --all-targets -- -D warnings`
+
+---
+
+### Wave 2: Triage/Pipeline Flow & Independent Runtime Hardening (`T07`–`T15`)
 
 - [ ] **`T07` — Add `TriageState::Done` Data Model & Upgrade `TRIAGE_SYSTEM_PROMPT`**
   - `blocked_by`: `["T06"]`
@@ -242,6 +202,50 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - Add `gate_failure_excerpt(output: &str) -> String` (retaining up to the last 1,200 characters of trimmed output) and carry it on `Ending::GateFailed(String)` and `Ending::RetryExhausted(String)` in `src/orchestrator.rs`.
     - Render non-empty gate failure excerpts in `Report::markdown` (`src/orchestrator.rs`) so `Phase::Summary` and `queue_failures` / `queue_retry_detail` (`src/pipeline.rs`) include diagnostic context.
   - `verification_gate`: `cargo test --lib orchestrator && cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T11` — Shell Execution Hardening (Process-Group Isolation, Partial Timeout Output, & Non-Interactive Env)**
+  - `blocked_by`: `["T06"]`
+  - `blocks`: `["T18"]`
+  - `plans`: [`.plans/05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md)
+  - `files`: `src/tools.rs`
+  - `tasks`:
+    - Configure `Command::new("bash")` with `process_group(0)` on Unix and kill the entire process group (`kill -s KILL -- -<pgid>`) on timeout before reaping the child and draining stream readers (`STREAM_DRAIN_GRACE = 200ms`).
+    - Return `ShellOutcome` from `shell_output_with_timeout` carrying partial `stdout` and `stderr` captured before timeout; append non-empty partial output after the timeout header in `run_command_in` and `bash_in` (truncating command display at `BASH_FAILURE_COMMAND_BYTES` and spilling to `<session-dir>/tools-output/` when `> 16 KiB`).
+    - Set non-interactive environment defaults (`GIT_TERMINAL_PROMPT=0`, `PAGER=cat`, `GIT_PAGER=cat`, `MANPAGER=cat`, `LESS=-R`, `CARGO_TERM_PROGRESS_WHEN=never`, `PIP_PROGRESS_BAR=off`, `TQDM_DISABLE=1`).
+  - `verification_gate`: `cargo test --lib tools && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T12` — CRLF-Safe `tools.replace`, Multi-Match Line Numbers, & `tools.grep` Line Cap**
+  - `blocked_by`: `["T06"]`
+  - `blocks`: `[]`
+  - `plans`: [`.plans/09-file-editing-and-patch-matching.md`](./.plans/09-file-editing-and-patch-matching.md)
+  - `files`: `src/script.rs`
+  - `tasks`:
+    - Reject no-op replacements (`old_text == new_text`) in `host_replace`.
+    - Match against an LF-normalized view with Tier-1 exact matching and Tier-2 line-trimmed trailing horizontal whitespace fallback while preserving UTF-8 BOM (`\u{FEFF}`) and dominant line endings (`\r\n` vs `\n`).
+    - Include 1-based match line numbers (`(at lines ...)` / `(first 5 at lines ...)`) when `matches > 1` while preserving existing error prefixes.
+    - Cap individual matched lines in `tools.grep` at `GREP_LINE_MAX_BYTES = 2_000` on a UTF-8 character boundary.
+  - `verification_gate`: `cargo test --lib script && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T13` — HTTP 408 Timeout Retry, Permanent 429 Quota Fast-Fail, & Retry-After Hints**
+  - `blocked_by`: `["T06"]`
+  - `blocks`: `["T17"]`
+  - `plans`: [`.plans/12-http-retry-and-overload-resilience.md`](./.plans/12-http-retry-and-overload-resilience.md)
+  - `files`: `src/retry.rs`
+  - `tasks`:
+    - Add HTTP `408` to retryable status codes in `should_retry`.
+    - Classify permanent quota/billing exhaustion (`is_permanent_quota_error`, keeping `token_quota_exceeded` retryable) on HTTP `429` and `200..=299` so permanent billing errors fail fast.
+    - Extract explicit retry-delay hints (`extract_retry_hint_secs`, clamped to `MAX_RATE_LIMIT_BACKOFF_SECS = 30`) from `429` messages and cap base exponential backoff at `MAX_BACKOFF_SECS = 10`.
+  - `verification_gate`: `cargo test --lib retry && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T14` — Provider Output-Token Truncation Detection (`Message.truncated`)**
+  - `blocked_by`: `["T06"]`
+  - `blocks`: `["T15"]`
+  - `plans`: [`.plans/07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md)
+  - `files`: `src/api.rs`, `src/llm/chat_completions.rs`, `src/llm/responses_api.rs`, `src/llm/anthropic.rs`
+  - `tasks`:
+    - Add `#[serde(skip)] pub truncated: bool` to `Message` in `src/api.rs` (initialized to `false` in `Message::text` and `Message::tool` so wire payloads and `context_bytes` stay unchanged).
+    - Set `truncated = true` when `finish_reason == Some("length")` in `ChatProvider::decode` (`src/api.rs`, `src/llm/chat_completions.rs`), when `status == Some("incomplete")` and `incomplete_details["reason"] == Some("max_output_tokens")` in `ResponsesProvider::decode` (`src/llm/responses_api.rs`), and when `stop_reason == Some("max_tokens")` in `AnthropicProvider::decode` (`src/llm/anthropic.rs`, returning an empty `Message` with `truncated: true` when truncated before content/tool blocks arrive).
+  - `verification_gate`: `cargo test --lib api && cargo test --lib llm && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T15` — In-Loop Missing-Tool / Truncation Recovery & Tool-Call Repetition Guard**
   - `blocked_by`: `["T14"]`

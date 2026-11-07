@@ -1135,10 +1135,9 @@ fn transition_fix_ticket(queue_round: usize, command: &str, excerpt: &str) -> Ti
         scope_of_changes: vec![format!(
             "Resolve the cross-suite regression reported by `{command}`."
         )],
-        test_expectations: vec![
-            "when_running_full_test_suite_given_completed_queue_round_then_all_repository_tests_pass"
-                .to_string(),
-        ],
+        // A transition gate excerpt carries no source-code test that could be
+        // authored from it, so the repair ticket deliberately claims none.
+        test_expectations: Vec::new(),
         verification_gate: command.to_string(),
     }
 }
@@ -1902,5 +1901,105 @@ mod tests {
         assert_eq!(transition_gate_command(&root), Some("cargo test"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Core entry-point behavior: a full-suite transition failure still yields a
+    /// repair ticket that validates and renders the canonical no-expectations
+    /// section, because no source-code test expectation can be derived from a
+    /// gate excerpt.
+    #[test]
+    fn when_creating_repair_ticket_given_full_suite_transition_failure_then_returns_valid_ticket_without_expectations()
+     {
+        let ticket = transition_fix_ticket(1, "cargo test", "assertion failed: left == right");
+        assert!(
+            ticket.test_expectations.is_empty(),
+            "the repair ticket must carry no expectations: {:?}",
+            ticket.test_expectations
+        );
+
+        let set = TicketSet {
+            tickets: vec![ticket.clone()],
+        };
+        set.validate()
+            .expect("the repair ticket must validate with an empty expectation vector");
+
+        let rendered = ticket.to_markdown();
+        assert!(
+            rendered.contains("## Test Expectations\n\nNone."),
+            "the repair ticket must render the canonical no-expectations section: {rendered}"
+        );
+    }
+
+    /// Empty/zero boundary: the repair ticket carries an empty vector and the
+    /// renderer turns it into exactly the canonical marker.
+    #[test]
+    fn when_creating_repair_ticket_given_full_suite_transition_failure_then_returns_empty_expectations()
+     {
+        let ticket = transition_fix_ticket(3, "cargo test", "boom");
+        assert_eq!(ticket.test_expectations, Vec::<String>::new());
+
+        let rendered = ticket.to_markdown();
+        let section = rendered
+            .split_once("## Test Expectations\n\n")
+            .expect("the rendered ticket must carry the test-expectations section")
+            .1
+            .split_once("\n\n## Verification Gate")
+            .expect("the test-expectations section must end before the gate")
+            .0;
+        assert_eq!(section, "None.");
+    }
+
+    /// Contract check: the empty expectation vector must not change any other
+    /// field of the transition repair ticket.
+    #[test]
+    fn when_creating_repair_ticket_given_full_suite_transition_failure_then_preserves_existing_repair_contract()
+     {
+        let excerpt = "thread 'main' panicked: expected 1, got 2";
+        let ticket = transition_fix_ticket(2, "cargo test", excerpt);
+
+        assert_eq!(ticket.id, "g2-1-fix-full-test-suite");
+        assert_eq!(ticket.blocked_by, Vec::<String>::new());
+        assert_eq!(ticket.blocks, Vec::<String>::new());
+        assert_eq!(ticket.title, "Fix full test suite regression (cargo test)");
+        assert!(
+            ticket.objective.contains("cargo test"),
+            "{}",
+            ticket.objective
+        );
+        assert_eq!(
+            ticket.acceptance_criteria,
+            vec!["The full test suite command `cargo test` exits with code 0.".to_string()]
+        );
+        assert!(ticket.prerequisites_assumed.contains("Queue round 2"));
+        assert!(ticket.prerequisites_assumed.contains(excerpt));
+        assert_eq!(
+            ticket.out_of_scope,
+            vec!["Unrelated features outside the specification.".to_string()]
+        );
+        assert_eq!(
+            ticket.scope_of_changes,
+            vec!["Resolve the cross-suite regression reported by `cargo test`.".to_string()]
+        );
+        assert_eq!(ticket.verification_gate, "cargo test");
+    }
+
+    /// Regression: the fabricated full-suite expectation must never return.
+    #[test]
+    fn when_creating_repair_ticket_given_full_suite_transition_failure_then_omits_synthetic_expectation()
+     {
+        let ticket = transition_fix_ticket(1, "cargo test", "failure");
+        let synthetic = "when_running_full_test_suite_given_completed_queue_round_then_all_repository_tests_pass";
+        assert!(
+            !ticket
+                .test_expectations
+                .iter()
+                .any(|entry| entry == synthetic),
+            "the synthetic expectation must be gone: {:?}",
+            ticket.test_expectations
+        );
+        assert!(
+            !ticket.to_markdown().contains(synthetic),
+            "the rendered repair ticket must not name the synthetic expectation"
+        );
     }
 }
