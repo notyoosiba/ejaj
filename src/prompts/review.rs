@@ -9,10 +9,16 @@ Audit the completed ticket queue against the technical specification and test de
 
 ## Workflow
 
-1. **Inspect the repository (read-only) with `execute_script`:** use `tools.diff()` to read the \
-change set, `tools.read(path, startLine?, endLine?)` to inspect the modified and added production \
-and test files, and `tools.list(glob?)` / `tools.grep(pattern, glob?)` to check existing seams. \
-Batch related reads and searches into one script call. Never write, build or test.
+1. **Inspect the repository (read-only) with `execute_script`:** start from `tools.diff()` as your \
+primary view of the change set, and use `tools.read(path, startLine?, endLine?)` to inspect the \
+changed and added production and test files (plus `AGENTS.md` and `README.md` when present). Do not \
+crawl unchanged files across the broader codebase by default: inspect linked or other unchanged files \
+outside the diff only to evaluate a concrete cross-cutting risk you can name (such as a changed \
+function or trait contract, shared state, or an existing test seam), using `tools.read(path, \
+startLine?, endLine?)`, `tools.list(glob?)`, or `tools.grep(pattern, glob?)`; never follow links or \
+read unchanged files without such a named risk, and never perform a general repository-wide \
+unchanged-file audit. Batch related reads and searches into one script call. Never write, build or \
+test during review inspection.
 2. **Complete the Pre-Flight Audit Scorecard (`scorecard`):** every field is required and non-blank:
    - `keeper_coverage`: verify coverage across the 4 Keeper Categories. Audit executable source-code behavior only; never emit findings or fix tickets that request unit tests for documentation, `README.md`, `TODO.md`, changelogs, `.plan/`/`.plans/` tracker files, or other human-facing prose:
      1. Core Entry-Point Behaviors (real caller journeys via CLI, API, or public interface).
@@ -25,7 +31,9 @@ specified instead of a single table).
      4. Regression Tests (applicable when the spec targets a bug fix).
    - `sediment_and_coupling`: confirm zero internal mocks (internal classes, services, and local \
 persistence layers are never mocked; test doubles are restricted strictly to non-deterministic \
-external boundaries), no tautologies, and no private state introspection.
+external boundaries), no tautological assertions (tests must assert against independent known literals, \
+never recomputing the production formula), no private state introspection, no `pub` visibility widened on \
+internal helpers solely for tests, and no leftover debug probes or scratch files.
    - `inferred_assumptions`: explicit log of inferred assumptions (boundaries, status codes, \
 default schemas) verified against the implementation.
    - `boundary_matrix`: evaluate the Mandatory 5-Dimension Boundary Matrix across the test suite. Evaluate the boundary matrix for executable source-code behavior only; never emit findings or fix tickets that request unit tests for documentation, `README.md`, `TODO.md`, changelogs, `.plan/`/`.plans/` tracker files, or other human-facing prose:
@@ -35,20 +43,32 @@ default schemas) verified against the implementation.
      4. Malformed / Invalid payload
      5. Boundary unauthorized / Forbidden access
    - `code_and_scope`: verify that every ticket's acceptance criteria, scope of changes, out-of-scope \
-boundaries, and verification gate were honoured without specification drift.
+boundaries, and verification gate were honoured without specification drift. Rust `pub(crate)` items \
+and TypeScript or JavaScript module exports not re-exported from the designated public entrypoint \
+are internal cross-file exports, not unauthorized public API expansion; this clarification does not \
+exempt actual public-entrypoint expansion from review.
 3. **Verify caller-intent test naming:** every authored test title must use domain-level BDD \
 language in `when_<action>_given_<context>_then_<outcome>` lowercase `snake_case`; technical \
 internal function or class names in test titles are strictly forbidden.
 4. **Decide the verdict and hand over with `finish_review`:**
-   - **When no defects remain:** pass `findings: []` and `fixes: []`. The pipeline will write \
-`review.md` and proceed to the change summary.
-   - **When defects remain:** list the highest-priority defects in `findings` and emit the ordered \
-`fixes` tickets that resolve them. When a finding from any prior review round is still unresolved, \
-or when a later fix ticket breaks behavior that an earlier finding covered, reuse that earlier \
-finding's exact `id` in `findings` (while giving the new fix ticket a fresh `r<round>-<n>-<slug>` \
-ticket `id`); assign a new `finding.id` only to a defect not reported in any prior review round. \
-Every finding must be covered in substance by at least one fix ticket, and every fix ticket must \
-satisfy all ticket rules:
+   - **Blocking defects only:** a blocking defect is one that prevents a ticket acceptance \
+criterion, the specified executable behavior or contract, or the required verification gate from \
+being satisfied. Suggestions, stylistic concerns, and other non-blocking improvements never appear \
+in `findings` or `fixes`.
+   - **Scoped re-review on round 2+:** when the review material includes `## Prior Review Rounds`, \
+limit the re-review to verifying the prior findings and their fixes, plus checking the fix diff for \
+new blocking regressions; never raise new findings based on untouched code.
+   - **When no blocking defects remain:** pass `findings: []` and `fixes: []`. The pipeline will \
+write `review.md` and proceed to the change summary.
+   - **When blocking defects remain:** list the highest-priority blocking defects in `findings` and \
+emit the ordered `fixes` tickets that resolve them. Coalesce compatible blocking fixes into the \
+minimum number of fix tickets (prefer a single consolidated fix ticket covering all compatible \
+findings rather than one fix ticket per finding). When a finding from any prior review round is \
+still unresolved, or when a later fix ticket breaks behavior that an earlier finding covered, reuse \
+that earlier finding's exact `id` in `findings` (while giving the new fix ticket a fresh \
+`r<round>-<n>-<slug>` ticket `id`); assign a new `finding.id` only to a newly discovered blocking \
+regression in the fix diff. Every finding must be covered in substance by at least one fix ticket, \
+and every fix ticket must satisfy all ticket rules:
      - `id`: a new unique ticket id (`[A-Za-z0-9._-]+`, e.g. `r1-1-<slug>`) that does not collide \
 with any ticket id already executed in this run.
      - `blocked_by` / `blocks`: may only reference other fix tickets emitted in this same `fixes` list.
@@ -550,5 +570,145 @@ mod tests {
                 "REVIEW_SYSTEM_PROMPT must contain `{needle}`"
             );
         }
+    }
+
+    /// Core entry-point behavior: inspection starts from the change set, stays
+    /// read-only, batches its reads, and only leaves the diff for a named risk.
+    #[test]
+    fn when_reviewing_changes_given_diff_first_contract_then_changed_files_are_the_primary_view() {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "start from `tools.diff()` as your primary view of the change set",
+                "changed and added production and test files",
+                "plus `AGENTS.md` and `README.md` when present",
+                "Do not crawl unchanged files across the broader codebase by default",
+                "outside the diff only to evaluate a concrete cross-cutting risk you can name",
+                "never perform a general repository-wide unchanged-file audit",
+                "Batch related reads and searches into one script call",
+                "Never write, build or test during review inspection",
+            ],
+        );
+    }
+
+    /// Contract and invariant check: linked or other unchanged files stay
+    /// inspectable only behind a concrete, named cross-cutting risk; there is
+    /// no unrestricted link-following or repository-wide unchanged-file audit.
+    #[test]
+    fn when_reviewing_changes_given_unchanged_file_inspection_then_named_risks_are_required() {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "inspect linked or other unchanged files outside the diff only to evaluate a concrete cross-cutting risk you can name",
+                "never follow links or read unchanged files without such a named risk",
+                "never perform a general repository-wide unchanged-file audit",
+            ],
+        );
+        for unrestricted in [
+            "following any links they contain to project standards or architectural decisions",
+            "follow any links they contain",
+        ] {
+            assert!(
+                !REVIEW_SYSTEM_PROMPT.contains(unrestricted),
+                "REVIEW_SYSTEM_PROMPT must not authorize unrestricted linked-file inspection: `{unrestricted}`"
+            );
+        }
+    }
+
+    /// Edge-case table across the required Keeper Categories and boundary
+    /// dimensions: every pre-existing coverage requirement stays named.
+    #[test]
+    fn when_reviewing_coverage_given_keeper_categories_and_boundary_matrix_then_all_required_dimensions_remain_present()
+     {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "keeper_coverage",
+                "Core Entry-Point Behaviors",
+                "Edge-Case Tables",
+                "Contract & Invariant Checks",
+                "Regression Tests",
+                "Audit executable source-code behavior only",
+                "boundary_matrix",
+                "Empty / Zero / Nil",
+                "Minimum valid boundary",
+                "Maximum limit / Upper boundary",
+                "Malformed / Invalid payload",
+                "Boundary unauthorized / Forbidden access",
+            ],
+        );
+    }
+
+    /// Contract and invariant check: the sediment checks and the internal
+    /// cross-file export distinction both stay in force without exempting
+    /// genuine public-entrypoint expansion.
+    #[test]
+    fn when_reviewing_quality_given_sediment_and_api_scope_checks_then_required_distinctions_remain_present()
+     {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "zero internal mocks",
+                "test doubles are restricted strictly to non-deterministic external boundaries",
+                "no tautological assertions",
+                "no `pub` visibility widened on internal helpers solely for tests",
+                "no private state introspection",
+                "no leftover debug probes or scratch files",
+                "Rust `pub(crate)` items",
+                "TypeScript or JavaScript module exports not re-exported from the designated public entrypoint",
+                "internal cross-file exports, not unauthorized public API expansion",
+                "this clarification does not exempt actual public-entrypoint expansion from review",
+            ],
+        );
+    }
+
+    /// Regression guard: blocking-only reporting, scoped prior-round re-reviews,
+    /// fix coalescing, finding-ID reuse, ticket validity, and the handoff all
+    /// remain part of the review contract.
+    #[test]
+    fn when_rechecking_prior_rounds_given_blocking_findings_then_ticket_and_handoff_contracts_remain_valid()
+     {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "a blocking defect is one that prevents a ticket acceptance criterion, the specified executable behavior or contract, or the required verification gate from being satisfied",
+                "Suggestions, stylistic concerns, and other non-blocking improvements never appear in `findings` or `fixes`",
+                "pass `findings: []` and `fixes: []`",
+                "Every finding must be covered in substance by at least one fix ticket",
+                "Coalesce compatible blocking fixes into the minimum number of fix tickets",
+                "when the review material includes `## Prior Review Rounds`",
+                "limit the re-review to verifying the prior findings and their fixes, plus checking the fix diff for new blocking regressions",
+                "never raise new findings based on untouched code",
+                "reuse that earlier finding's exact `id` in `findings`",
+                "assign a new `finding.id` only to a newly discovered blocking regression in the fix diff",
+                "`blocked_by` / `blocks`",
+                "at least one non-blank criterion",
+                "exact command exiting 0",
+                "does not collide with any ticket id already executed in this run",
+                "finish_review",
+            ],
+        );
+    }
+
+    /// Boundary matrix: all five required dimensions stay named explicitly,
+    /// without introducing application-specific boundary behavior.
+    #[test]
+    fn when_reviewing_prompt_given_boundary_dimensions_then_all_five_dimensions_remain_named() {
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "Empty / Zero / Nil",
+                "Minimum valid boundary",
+                "Maximum limit / Upper boundary",
+                "Malformed / Invalid payload",
+                "Boundary unauthorized / Forbidden access",
+            ],
+        );
     }
 }
