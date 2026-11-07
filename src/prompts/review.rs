@@ -197,6 +197,13 @@ mod tests {
         for (prompt_name, prompt, marker) in PHASE_HANDOFF_MARKERS {
             assert_contains_all(prompt_name, prompt, &[marker]);
         }
+        assert_contains_all(
+            "REVIEW_SYSTEM_PROMPT",
+            REVIEW_SYSTEM_PROMPT,
+            &[
+                "Audit the completed ticket queue against the technical specification and test design blueprint",
+            ],
+        );
     }
 
     #[test]
@@ -631,8 +638,12 @@ mod tests {
                 "Edge-Case Tables",
                 "Contract & Invariant Checks",
                 "Regression Tests",
+                "a consolidated parameterized table when boundary cases share the same input/assertion shape",
+                "the explicit per-dimension boundary tests named in the executed tickets' `test_expectations`",
+                "never reject a suite solely for using the explicit per-dimension",
                 "Audit executable source-code behavior only",
                 "boundary_matrix",
+                "Evaluate the boundary matrix for executable source-code behavior only",
                 "Empty / Zero / Nil",
                 "Minimum valid boundary",
                 "Maximum limit / Upper boundary",
@@ -708,7 +719,21 @@ mod tests {
                 "Maximum limit / Upper boundary",
                 "Malformed / Invalid payload",
                 "Boundary unauthorized / Forbidden access",
+                "never emit findings or fix tickets that request unit tests for documentation, `README.md`, `TODO.md`, changelogs, `.plan/`/`.plans/` tracker files, or other human-facing prose",
             ],
         );
+        for invented in [
+            "HTTP 401",
+            "HTTP 403",
+            "payload validation rule",
+            "access-control rule",
+            "numeric limit",
+            "maximum number of test expectations",
+        ] {
+            assert!(
+                !REVIEW_SYSTEM_PROMPT.contains(invented),
+                "REVIEW_SYSTEM_PROMPT must not invent a runtime boundary or prose-test rule: `{invented}`"
+            );
+        }
     }
 }

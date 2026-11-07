@@ -9,8 +9,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | Plan / Proposal | Status | Mapped DAG Tasks | Target Modules |
 | --- | --- | --- | --- |
 | [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) | [x] Complete (T01, T02 done) | `T01`, `T02` | `src/tickets.rs`, `src/pipeline.rs`, `src/prompts/{plan,spec,tickets,code,review}.rs` |
-| [`03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md) | `[ ]` Pending | `T02`, `T05`, `T04` | `src/prompts/review.rs`, `src/prompts/code.rs` |
-| [`PROPOSAL-8-internal-module-exports-in-review.md`](./.plans/PROPOSAL-8-internal-module-exports-in-review.md) | `[ ]` Pending | `T05` | `src/prompts/review.rs` |
+| [`03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md) | `[ ]` Pending (T05 done; T04 pending) | `T02`, `T05`, `T04` | `src/prompts/review.rs`, `src/prompts/code.rs` |
+| [`PROPOSAL-8-internal-module-exports-in-review.md`](./.plans/PROPOSAL-8-internal-module-exports-in-review.md) | [x] Complete (T05 done) | `T05` | `src/prompts/review.rs` |
 | [`PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md) | `[ ]` Pending | `T04` | `src/prompts/code.rs` |
 | [`01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md) | `[ ]` Pending | `T02`, `T03` | `src/prompts/plan.rs`, `src/prompts/spec.rs` |
 | [`PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md) | `[ ]` Pending | `T04`, `T06` | `src/prompts/code.rs`, `src/prompts/tickets.rs` |
@@ -45,7 +45,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 [x] [T02] PROPOSAL-3b: Source-code-only test rules across Plan, Spec, Tickets & Review prompts
       │
       ▼
-[ ] [T05] 03 + PROPOSAL-8: REVIEW_SYSTEM_PROMPT upgrades — scoped Round 2+ re-review & pub(crate) exports (src/prompts/review.rs)
+[x] [T05] 03 + PROPOSAL-8: REVIEW_SYSTEM_PROMPT upgrades — scoped Round 2+ re-review & pub(crate) exports (src/prompts/review.rs)
       │
       ▼
 [ ] [T04] 03 + PROPOSAL-4 + PROPOSAL-9: CODE_TDD_DISCIPLINE upgrades — no artificial red probes & tracker edits last (src/prompts/code.rs)
@@ -117,7 +117,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 ### Wave 1: Phase Prompt Upgrades (`T05` → `T04` → `T03` → `T06` — Rebuild `ejaj` Before Runtime Tasks)
 
-- [ ] **`T05` — `REVIEW_SYSTEM_PROMPT` Upgrades (Diff-First Inspection, Internal Exports, & Scoped Round 2+ Re-Review)**
+- [x] **`T05` — `REVIEW_SYSTEM_PROMPT` Upgrades (Diff-First Inspection, Internal Exports, & Scoped Round 2+ Re-Review)**
   - `depends_on`: `[]` (`T02` complete)
   - `unblocks`: `["T04"]`
   - `plans`: [`.plans/03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md), [`.plans/PROPOSAL-8-internal-module-exports-in-review.md`](./.plans/PROPOSAL-8-internal-module-exports-in-review.md)
