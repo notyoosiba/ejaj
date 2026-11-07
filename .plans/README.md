@@ -1,0 +1,33 @@
+# ejaj Upgrades and Proposals
+
+This directory contains standalone specifications and targeted proposals for upgrading `ejaj`.
+Completed items (`PROPOSAL-10`, `PROPOSAL-11`, `PROPOSAL-12`), duplicate proposals (`PROPOSAL-6`, `PROPOSAL-13`), and low-value/misaligned items (`04`, `06`, `10`) have been removed or consolidated.
+
+## Upgrade Documents
+
+1. **[`01-plan-and-spec-prompts.md`](./01-plan-and-spec-prompts.md)**: Upgrade `src/prompts/plan.rs` and `src/prompts/spec.rs` (first-turn reconnaissance, prerequisite ordering across interview rounds, redundancy check, deep modules, exact cross-module signatures, and executable source-code-only test seams).
+2. **[`02-tickets-and-triage-prompts.md`](./02-tickets-and-triage-prompts.md)**: Upgrade `src/prompts/tickets.rs` and `src/prompts/triage.rs` (right-sized vertical slices, cross-ticket producer/consumer contracts, pairwise triage signature audit, and executable source-code-only `test_expectations`).
+3. **[`03-code-and-review-prompts.md`](./03-code-and-review-prompts.md)**: Upgrade `src/prompts/code.rs` (`CODE_TDD_DISCIPLINE`) and `src/prompts/review.rs` (`REVIEW_SYSTEM_PROMPT`) while keeping `CODE_SYSTEM_PROMPT` untouched so `llm_wire` fixtures remain valid.
+4. **[`05-shell-execution-hardening.md`](./05-shell-execution-hardening.md)**: Harden `bash` subprocess execution in `src/tools.rs` (process-group isolation, whole-group kill on timeout, partial timeout output with spill-to-disk, and non-interactive env defaults).
+5. **[`07-in-loop-truncation-and-tool-recovery.md`](./07-in-loop-truncation-and-tool-recovery.md)**: Detect output truncation across providers, recover in-loop when an unattended turn omits a tool call or truncates, and guard against repeated identical tool-call loops in `src/llm/` and `src/loops/agent.rs`.
+6. **[`08-conversation-trajectory-persistence.md`](./08-conversation-trajectory-persistence.md)**: Save per-loop conversation trajectories (`.traj.json`) under `.ejaj/<timestamp>/trajectories/` in `src/loops/agent.rs`.
+7. **[`09-file-editing-and-patch-matching.md`](./09-file-editing-and-patch-matching.md)**: Add CRLF normalization, UTF-8 BOM preservation, line-trimmed trailing whitespace fallback, no-op edit rejection, multi-match line numbers, and `tools.grep` per-line byte caps in `src/script.rs`.
+8. **[`11-context-compaction-and-overflow-recovery.md`](./11-context-compaction-and-overflow-recovery.md)**: Add transient retry on `request_handover_summary`, prior-summary consolidation, Tier-1 fallback on soft label validation, and reactive overflow compaction on HTTP `400`/`413`/`422` in `src/loops/agent.rs`.
+9. **[`12-http-retry-and-overload-resilience.md`](./12-http-retry-and-overload-resilience.md)**: Retry HTTP `408`, fast-fail permanent `429` quota/billing exhaustion, honor explicit `429` `retry-after` hints, and cap base backoff at 10s in `src/retry.rs`.
+
+## Detailed Proposals
+
+1. **[`PROPOSAL-1-triage-done-state.md`](./PROPOSAL-1-triage-done-state.md)**: Add `done` state (`TriageState::Done`) to Triage for already-implemented tickets so downstream `ready-for-agent` tickets are unblocked (`src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs`).
+2. **[`PROPOSAL-2-review-pass-retry.md`](./PROPOSAL-2-review-pass-retry.md)**: Retry unattended structured-handoff passes (`review_round`, `spec_pass`, `tickets_pass`, `triage_pass`) once in a fresh session on `TurnEnd`, `Malformed`, `StepLimit`, or `ContextGuard` (`src/pipeline.rs`).
+3. **[`PROPOSAL-3-non-code-test-expectations.md`](./PROPOSAL-3-non-code-test-expectations.md)**: Restrict automated testing across Plan, Spec, Tickets, Code, and Review to executable source code only; allow `test_expectations: []` (`None.`) in `TicketSet::validate` and skip `CODE_TDD_DISCIPLINE` when `## Test Expectations` is `None.` (`src/prompts/`, `src/tickets.rs`, `src/pipeline.rs`).
+4. **[`PROPOSAL-4-no-artificial-red-probes.md`](./PROPOSAL-4-no-artificial-red-probes.md)**: Stop artificial red-probe sabotage in `CODE_TDD_DISCIPLINE` when newly added regression or boundary tests already pass (`src/prompts/code.rs`).
+5. **[`PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./PROPOSAL-5-forward-triage-brief-to-code-agent.md)**: Forward Triage `notes` and `AgentBrief` to the Code agent kickoff (`src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs`).
+6. **[`PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./PROPOSAL-7-gate-failure-excerpt-in-queue-report.md)**: Include bounded failing verification gate excerpts in `queue-report.md` and retry handovers (`src/orchestrator.rs`, `src/pipeline.rs`).
+7. **[`PROPOSAL-8-internal-module-exports-in-review.md`](./PROPOSAL-8-internal-module-exports-in-review.md)**: Distinguish internal cross-file module exports from public API surface in `REVIEW_SYSTEM_PROMPT` (`src/prompts/review.rs`).
+8. **[`PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md)**: Cap monolithic ticket scope in `TICKETS_SYSTEM_PROMPT` and order tracker edits last before `verification_gate` in `CODE_TDD_DISCIPLINE` (`src/prompts/tickets.rs`, `src/prompts/code.rs`).
+
+## Recommended Implementation Order (See [`TODO.md`](../TODO.md) for the Full Task DAG)
+
+1. **Root Foundation (`T01` -> `T02`):** `PROPOSAL-3` (optional `test_expectations` in validator, `transition_fix_ticket`, and `ticket_kickoff`, plus executable source-code-only testing rules across Plan, Spec, Tickets, and Review).
+2. **Prompts, Tickets, & Triage Flow (`T03` -> `T06` -> `T07` -> `T08` -> `T09` -> `T10` & `T04`, `T05`):** `01` (Plan & Spec prompts), `03` + `PROPOSAL-4` + `PROPOSAL-8` + `PROPOSAL-9` (Code & Review prompts), `02` + `PROPOSAL-9` (Tickets prompt), `PROPOSAL-1` + `02` (`TriageState::Done` & Triage prompt), `PROPOSAL-5` (forward Triage brief/notes to Code agent), and `PROPOSAL-7` (gate failure excerpt in `queue-report.md`).
+3. **Shell, Script, Retry, & Loop Reliability (`T11`..`T18`):** `05` (shell process-group kill & partial timeout output), `09` (CRLF `tools.replace` & `GREP_LINE_MAX_BYTES`), `12` (HTTP 408, permanent 429 quota fast-fail, and retry hints), `07` (provider truncation detection, in-loop missing-tool/truncation recovery, & tool repetition guard), `PROPOSAL-2` (outer retry on unattended passes), `11` (summary retry, Tier-1 soft fallback, and 400/413/422 overflow compaction), and `08` (trajectory `.traj.json` persistence).

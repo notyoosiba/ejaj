@@ -1,60 +1,290 @@
-# Anthropic Retry Fixes (`TODO.md`)
+# TODO — `.plans/` Implementation Status & Task DAG
 
-This document defines the fixes for three retry bugs in `ejaj`.
-
----
-
-## Bug Descriptions
-
-### Bug 1: `should_retry` does not retry HTTP `529` (Anthropic Overloaded)
-- **File:** `src/retry.rs` (line 40)
-- **Problem:** `should_retry` retries only HTTP status codes `429`, `500`, `502`, `503`, and `504`. Anthropic returns HTTP `529` when its servers are overloaded. `should_retry` returns `None` for `529`, and the request fails on the first attempt.
-- **Fix:** Add `529` to the retryable status match in `should_retry`.
-
-### Bug 2: `should_retry` does not retry an `error` object inside a `2xx` response body
-- **Files:** `src/retry.rs` (line 40), `src/llm/anthropic.rs` (lines 130–134)
-- **Problem:** A provider can send HTTP `200 OK` headers and then return an overload error inside the JSON body (`{"type":"error","error":{"message":"overloaded"}}`). `AnthropicProvider::decode` (as well as `ChatProvider::decode` and `ResponsesProvider::decode`) maps this to `CallError::Api { status: 200, message }`. Because `status` is `200`, `should_retry` returns `None` and does not retry.
-- **Fix:** Add `200..=299` to the retryable `CallError::Api` status match in `should_retry`. A `CallError::Api` only has a `200..=299` status when the `2xx` response body carried an embedded `error` object.
-
-### Bug 3 (Option A): `should_retry` does not retry an unusable / thinking-only Anthropic response
-- **Files:** `src/retry.rs` (line 41), `src/llm/anthropic.rs` (lines 173–175, 363–387, 1303–1305, 1765)
-- **Problem:** In `Phase::Summary`, `AnthropicProvider` sends `"output_config": { "effort": "high" }`. If the model returns only `thinking` or `redacted_thinking` blocks and no `text` or `tool_use` block, `AnthropicProvider::decode` returns `CallError::Malformed("the response carried no usable content ...")`. Because `should_retry` returns `false` for all `CallError::Malformed` values, the turn fails immediately without a retry.
-- **Fix (Option A):** In `should_retry` (`src/retry.rs`), retry `CallError::Malformed(detail)` when `detail.starts_with("the response carried no usable content")`. Keep all other `CallError::Malformed` values (such as `"the response content was not an array"`) non-retryable. Update the affected unit tests in `src/retry.rs` and `src/llm/anthropic.rs`.
+Tracks the implementation status of all specifications and proposals in [`.plans/`](./.plans/README.md) as an ordered Directed Acyclic Graph (DAG) of implementation tasks.
 
 ---
 
-## Proposed Code Change (`src/retry.rs`)
+## 1. `.plans/` Document Status Matrix
 
-```rust
-pub fn should_retry(error: &CallError, attempt: u32) -> Option<Duration> {
-    if attempt >= MAX_ATTEMPTS {
-        return None;
-    }
-    let transient = match error {
-        CallError::Transport(_) => true,
-        CallError::Api { status, .. } => {
-            matches!(status, 200..=299 | 429 | 500 | 502 | 503 | 504 | 529)
-        }
-        CallError::Malformed(detail) => {
-            detail.starts_with("the response carried no usable content")
-        }
-    };
-    transient.then(|| backoff(attempt))
-}
+| Plan / Proposal | Status | Mapped DAG Tasks | Target Modules |
+| --- | --- | --- | --- |
+| [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) | `[ ]` Pending (Root) | `T01`, `T02` | `src/tickets.rs`, `src/pipeline.rs`, `src/prompts/{plan,spec,tickets,code,review}.rs` |
+| [`01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md) | `[ ]` Pending | `T02`, `T03` | `src/prompts/plan.rs`, `src/prompts/spec.rs` |
+| [`03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md) | `[ ]` Pending | `T02`, `T04`, `T05` | `src/prompts/code.rs`, `src/prompts/review.rs` |
+| [`PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md) | `[ ]` Pending | `T04` | `src/prompts/code.rs` |
+| [`PROPOSAL-8-internal-module-exports-in-review.md`](./.plans/PROPOSAL-8-internal-module-exports-in-review.md) | `[ ]` Pending | `T05` | `src/prompts/review.rs` |
+| [`PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md) | `[ ]` Pending | `T04`, `T06` | `src/prompts/code.rs`, `src/prompts/tickets.rs` |
+| [`02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md) | `[ ]` Pending | `T02`, `T06`, `T07` | `src/prompts/tickets.rs`, `src/prompts/triage.rs` |
+| [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | `[ ]` Pending | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
+| [`PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md) | `[ ]` Pending | `T09` | `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs` |
+| [`PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md) | `[ ]` Pending | `T10` | `src/orchestrator.rs`, `src/pipeline.rs` |
+| [`05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md) | `[ ]` Pending | `T11` | `src/tools.rs` |
+| [`09-file-editing-and-patch-matching.md`](./.plans/09-file-editing-and-patch-matching.md) | `[ ]` Pending | `T12` | `src/script.rs` |
+| [`12-http-retry-and-overload-resilience.md`](./.plans/12-http-retry-and-overload-resilience.md) | `[ ]` Pending | `T13` | `src/retry.rs` |
+| [`07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md) | `[ ]` Pending | `T14`, `T15` | `src/api.rs`, `src/llm/`, `src/loops/agent.rs` |
+| [`PROPOSAL-2-review-pass-retry.md`](./.plans/PROPOSAL-2-review-pass-retry.md) | `[ ]` Pending | `T16` | `src/pipeline.rs` |
+| [`11-context-compaction-and-overflow-recovery.md`](./.plans/11-context-compaction-and-overflow-recovery.md) | `[ ]` Pending | `T17` | `src/loops/agent.rs` |
+| [`08-conversation-trajectory-persistence.md`](./.plans/08-conversation-trajectory-persistence.md) | `[ ]` Pending | `T18` | `src/loops/agent.rs`, `src/tools.rs` |
+
+### Completed Baseline Proposals (Already in `git` History)
+
+- [x] **`PROPOSAL-10` — Stagnant Finding Circuit Breaker & 10-Round Review Cap (`5b4699a`)** (`src/pipeline.rs`, `src/review.rs`)
+- [x] **`PROPOSAL-11` — Full-Suite Transition Gate Before Review (`5b4699a`)** (`src/pipeline.rs`, `src/specification.rs`)
+- [x] **`PROPOSAL-12` — HTTP 529, Embedded 2xx Error, & Empty-Content Retry (`92e35ef`)** (`src/retry.rs`, `src/llm/anthropic.rs`)
+
+---
+
+## 2. Task Dependency Graph (DAG)
+
+`T01` and `T02` implement [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) first so the validator, pipeline, and prompts support `test_expectations: []` (`None.`) and never demand unit tests for markdown or tracker files (`TODO.md`, `.plans/*.md`, `README.md`).
+
+```text
+[T01] PROPOSAL-3a: Validator, transition_fix_ticket & ticket_kickoff optional test_expectations
+  │
+  ▼
+[T02] PROPOSAL-3b: Source-code-only test rules across Plan, Spec, Tickets & Review prompts
+  ├──► [T04] 03 + PROPOSAL-4 + PROPOSAL-9: CODE_TDD_DISCIPLINE upgrades (src/prompts/code.rs)
+  ├──► [T05] 03 + PROPOSAL-8: REVIEW_SYSTEM_PROMPT upgrades (src/prompts/review.rs)
+  ├──► [T03] 01: PLAN_SYSTEM_PROMPT & SPEC_SYSTEM_PROMPT upgrades (src/prompts/{plan,spec}.rs)
+  │      │
+  │      ▼
+  │    [T06] 02 + PROPOSAL-9: TICKETS_SYSTEM_PROMPT scope cap & contracts (src/prompts/tickets.rs)
+  │      │
+  │      ▼
+  │    [T07] PROPOSAL-1a + 02: TriageState::Done model & TRIAGE_SYSTEM_PROMPT (src/triage.rs, src/prompts/triage.rs)
+  │      │
+  │      ▼
+  │    [T08] PROPOSAL-1b: Pipeline pre-completion & unblocking for Done tickets (src/pipeline.rs)
+  │      │
+  │      ▼
+  │    [T09] PROPOSAL-5: Forward Triage notes & AgentBrief to Code kickoff (src/{triage,orchestrator,pipeline}.rs)
+  │      │
+  │      ▼
+  │    [T10] PROPOSAL-7: Gate failure excerpts in queue-report.md (src/{orchestrator,pipeline}.rs)
+  │      │
+  │      └──────────────────────────┐
+  ├──► [T12] 09: CRLF tools.replace & grep line cap (src/script.rs)
+  ├──► [T11] 05: Shell process-group kill & timeout spill (src/tools.rs) ──────────────┐
+  ├──► [T13] 12: HTTP 408, permanent 429 fast-fail & retry-after hints (src/retry.rs) ─┼──┐
+  └──► [T14] 07a: Output-token truncation detection across providers (src/api.rs, llm) │  │
+         │                                                                             │  │
+         ▼                                                                             │  │
+       [T15] 07b: In-loop missing-tool/truncation recovery & loop guard (agent.rs)     │  │
+         ├──────────────────────────┐                                                  │  │
+         ▼                          ▼                                                  │  │
+       [T16] PROPOSAL-2:          [T17] 11: Compaction retry, Tier-1 soft fallback     │  │
+         Outer retry for            & HTTP 400/413/422 overflow recovery (agent.rs) ◄──┼──┘
+         unattended passes          │                                                  │
+         (src/pipeline.rs)          ▼                                                  │
+                                  [T18] 08: Conversation trajectory persistence ◄──────┘
+                                    (.traj.json in src/loops/agent.rs, src/tools.rs)
 ```
 
 ---
 
-## Tasks
+## 3. Ordered Task Backlog
 
-- [x] **T01 — Retry HTTP `529`, `2xx` embedded API errors, and unusable-content responses in `src/retry.rs` and `src/llm/anthropic.rs`**
-  - `depends_on`: `[]`
-  - `files`: `src/retry.rs`, `src/llm/anthropic.rs`, `TODO.md`
-  - `goal`: Make `retry::should_retry` retry HTTP `529` overload responses, `200..=299` embedded API error responses, and `CallError::Malformed` responses whose detail starts with `"the response carried no usable content"`.
-  - `scope`:
-    1. In `src/retry.rs`, update `should_retry` so `CallError::Api { status, .. }` matches `200..=299 | 429 | 500 | 502 | 503 | 504 | 529`.
-    2. In `src/retry.rs`, update `should_retry` so `CallError::Malformed(detail)` returns `true` when `detail.starts_with("the response carried no usable content")` and `false` for all other malformed details.
-    3. In `src/retry.rs` unit tests, verify that statuses `200`, `299`, `429`, `500`, `502`, `503`, `504`, and `529` are retried, permanent statuses (`400`, `401`, `403`, `404`, `422`) are not retried, `"the response carried no usable content..."` is retried, and other malformed errors (`"bad json"`, `"the response content was not an array"`) are not retried.
-    4. In `src/llm/anthropic.rs` unit tests (`when_decoding_given_anthropic_api_errors_then_preserves_status_message_and_retry_policy` and `when_decoding_given_sensitive_unusable_content_then_excludes_private_payload`), update the `should_retry` assertions for embedded `200` errors, status `529`, and `"the response carried no usable content"` errors to match the new retry contract.
-    5. Mark `T01` as `- [x]` in `TODO.md`.
-  - `verify`: `git grep -Fq -e '- [x] **T01 ' -- TODO.md && cargo test --lib retry && cargo test --lib llm::anthropic && cargo clippy --all-targets -- -D warnings`
+### Wave 0: Root Foundation (`PROPOSAL-3-non-code-test-expectations.md`)
+
+- [ ] **`T01` — Optional `test_expectations` in Validator, `transition_fix_ticket`, & `ticket_kickoff`**
+  - `blocked_by`: `[]`
+  - `blocks`: `["T02"]`
+  - `plans`: [`.plans/PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md)
+  - `files`: `src/tickets.rs`, `src/pipeline.rs`, `src/prompts/code.rs`
+  - `tasks`:
+    - In `TicketSet::validate` (`src/tickets.rs`), allow empty or `["None."]` `test_expectations` (preserving `Ticket::has_content`) while requiring `has_bdd_test_name(entry)` on every non-blank, non-`None.` entry.
+    - In `transition_fix_ticket` (`src/pipeline.rs`), replace the synthetic placeholder `when_running_full_test_suite_...` with `test_expectations: Vec::new()`.
+    - In `ticket_kickoff` (`src/prompts/code.rs`), skip prepending `CODE_TDD_DISCIPLINE` when the rendered ticket contains `## Test Expectations\n\nNone.\n`.
+  - `verification_gate`: `cargo test --lib tickets && cargo test --lib prompts::code && cargo test --lib pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T02` — Enforce Executable Source-Code-Only Testing Across Phase Prompts**
+  - `blocked_by`: `["T01"]`
+  - `blocks`: `["T03", "T04", "T05", "T11", "T12", "T13", "T14"]`
+  - `plans`: [`.plans/PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md)
+  - `files`: `src/prompts/plan.rs`, `src/prompts/spec.rs`, `src/prompts/tickets.rs`, `src/prompts/review.rs`
+  - `tasks`:
+    - In `PLAN_SYSTEM_PROMPT` (`src/prompts/plan.rs`), add the rule under `Rules for the document:` stating that automated tests apply exclusively to executable source code (never to documentation, `README.md`, `TODO.md`, `.plan/` files, or changelogs) and that obsolete non-code snapshot assertions should be removed rather than refreshed.
+    - In `SPEC_SYSTEM_PROMPT` (`src/prompts/spec.rs`), scope Step 2 and `## 5. Testing Decisions & Seams` to executable source code only, instructing the agent to write `None.` under `### Test Seams`, `### Coverage Strategy`, and `### Prior Art` when a specification modifies only human-facing prose.
+    - In `TICKETS_SYSTEM_PROMPT` (`src/prompts/tickets.rs`), fold documentation/`README.md`/`TODO.md`/`.plan/` updates into the accompanying behavioral ticket and allow `test_expectations: []` (`None.`) when a ticket modifies only documentation or markdown files.
+    - In `REVIEW_SYSTEM_PROMPT` (`src/prompts/review.rs`), clarify that `keeper_coverage` and `boundary_matrix` audit executable source code only, forbid findings or fix tickets requesting unit tests for documentation/`README.md`/`TODO.md`/`.plan/` files, and allow `test_expectations: []` on fix tickets that add no new test cases.
+  - `verification_gate`: `cargo test --lib prompts && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+---
+
+### Wave 1: Prompt Upgrades & Independent Runtime Improvements
+
+- [ ] **`T03` — Plan & Spec Prompt Upgrades (First-Turn Reconnaissance, Deep Modules, & Cross-Module Signatures)**
+  - `blocked_by`: `["T02"]`
+  - `blocks`: `["T06"]`
+  - `plans`: [`.plans/01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md)
+  - `files`: `src/prompts/plan.rs`, `src/prompts/spec.rs`
+  - `tasks`:
+    - In `PLAN_SYSTEM_PROMPT` (`src/prompts/plan.rs`, preserving `PLAN_MARKER` and the 4 `##` template headings): enforce prerequisite ordering across rounds, require first-turn `execute_script` reconnaissance + a 1–3 sentence summary of goal/current code/constraints before `Q1`, read `AGENTS.md` and `README.md` (following links), check for existing modules/redundancy before proposing new design options, and keep self-contained decision records without option letters.
+    - In `SPEC_SYSTEM_PROMPT` (`src/prompts/spec.rs`, preserving all `## 1`..`## 7` and `###` headings): require reading `AGENTS.md` and `README.md` in Step 1, enforce deep module design with small public interfaces and real collaborators (edge-only mocking) in Step 2, and require exact cross-module function/type signatures in Step 3.
+  - `verification_gate`: `cargo test --lib prompts::plan && cargo test --lib prompts::spec && cargo test --test pipeline && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T04` — `CODE_TDD_DISCIPLINE` Upgrades (Vertical Slices, No Artificial Red Probes, & Tracker Edits Last)**
+  - `blocked_by`: `["T02"]`
+  - `blocks`: `[]`
+  - `plans`: [`.plans/03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md), [`.plans/PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md), [`.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md)
+  - `files`: `src/prompts/code.rs`
+  - `tasks`:
+    - Keep `CODE_SYSTEM_PROMPT` byte-identical so `tests/fixtures/llm_wire/*.json` remain valid.
+    - Update `CODE_TDD_DISCIPLINE` in `src/prompts/code.rs`: work in vertical red-green slices at the public seam, never widen `pub` visibility on internal helpers solely for tests, replace obsolete coupled unit tests when consolidating behind a deeper seam, assert against independent known literals (anti-tautology), run focused test targets while iterating, never sabotage/stash/back up production files to force an artificial red failure when a new regression/boundary test already passes (`PROPOSAL-4`), and apply `TODO.md`/`.plan/*.md` tracker edits last right before `verification_gate` (reverting them if the gate fails, `PROPOSAL-9`).
+  - `verification_gate`: `cargo test --lib prompts::code && cargo test --test llm_wire && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T05` — `REVIEW_SYSTEM_PROMPT` Upgrades (Diff-First Inspection, Internal Exports, & Scoped Round 2+ Re-Review)**
+  - `blocked_by`: `["T02"]`
+  - `blocks`: `[]`
+  - `plans`: [`.plans/03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md), [`.plans/PROPOSAL-8-internal-module-exports-in-review.md`](./.plans/PROPOSAL-8-internal-module-exports-in-review.md)
+  - `files`: `src/prompts/review.rs`
+  - `tasks`:
+    - Preserve `REVIEW_MARKER` and all existing unit-test needles in `src/prompts/review.rs`.
+    - Update Step 1 to start from `tools.diff()`, inspect modified/added files plus `AGENTS.md`/`README.md`, and inspect unchanged files outside the diff only for a named cross-cutting risk.
+    - Update Step 2 (`sediment_and_coupling` and `code_and_scope`): check for tautological assertions, widened `pub` visibility for tests, and leftover debug probes/scratch files; clarify that internal cross-file exports (`pub(crate)` in Rust or non-entrypoint module `export`s in TS/JS not re-exported from the designated public entrypoint) are not unauthorized public API expansion (`PROPOSAL-8`).
+    - Update Step 4: emit findings/fixes for blocking defects only, scope round 2+ re-reviews (`## Prior Review Rounds`) to verifying prior findings/fixes and checking the fix diff for regressions, and coalesce compatible fixes into the minimum number of fix tickets.
+  - `verification_gate`: `cargo test --lib prompts::review && cargo test --test pipeline && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T11` — Shell Execution Hardening (Process-Group Isolation, Partial Timeout Output, & Non-Interactive Env)**
+  - `blocked_by`: `["T02"]`
+  - `blocks`: `["T18"]`
+  - `plans`: [`.plans/05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md)
+  - `files`: `src/tools.rs`
+  - `tasks`:
+    - Configure `Command::new("bash")` with `process_group(0)` on Unix and kill the entire process group (`kill -s KILL -- -<pgid>`) on timeout before reaping the child and draining stream readers (`STREAM_DRAIN_GRACE = 200ms`).
+    - Return `ShellOutcome` from `shell_output_with_timeout` carrying partial `stdout` and `stderr` captured before timeout; append non-empty partial output after the timeout header in `run_command_in` and `bash_in` (truncating command display at `BASH_FAILURE_COMMAND_BYTES` and spilling to `<session-dir>/tools-output/` when `> 16 KiB`).
+    - Set non-interactive environment defaults (`GIT_TERMINAL_PROMPT=0`, `PAGER=cat`, `GIT_PAGER=cat`, `MANPAGER=cat`, `LESS=-R`, `CARGO_TERM_PROGRESS_WHEN=never`, `PIP_PROGRESS_BAR=off`, `TQDM_DISABLE=1`).
+  - `verification_gate`: `cargo test --lib tools && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T12` — CRLF-Safe `tools.replace`, Multi-Match Line Numbers, & `tools.grep` Line Cap**
+  - `blocked_by`: `["T02"]`
+  - `blocks`: `[]`
+  - `plans`: [`.plans/09-file-editing-and-patch-matching.md`](./.plans/09-file-editing-and-patch-matching.md)
+  - `files`: `src/script.rs`
+  - `tasks`:
+    - Reject no-op replacements (`old_text == new_text`) in `host_replace`.
+    - Match against an LF-normalized view with Tier-1 exact matching and Tier-2 line-trimmed trailing horizontal whitespace fallback while preserving UTF-8 BOM (`\u{FEFF}`) and dominant line endings (`\r\n` vs `\n`).
+    - Include 1-based match line numbers (`(at lines ...)` / `(first 5 at lines ...)`) when `matches > 1` while preserving existing error prefixes.
+    - Cap individual matched lines in `tools.grep` at `GREP_LINE_MAX_BYTES = 2_000` on a UTF-8 character boundary.
+  - `verification_gate`: `cargo test --lib script && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T13` — HTTP 408 Timeout Retry, Permanent 429 Quota Fast-Fail, & Retry-After Hints**
+  - `blocked_by`: `["T02"]`
+  - `blocks`: `["T17"]`
+  - `plans`: [`.plans/12-http-retry-and-overload-resilience.md`](./.plans/12-http-retry-and-overload-resilience.md)
+  - `files`: `src/retry.rs`
+  - `tasks`:
+    - Add HTTP `408` to retryable status codes in `should_retry`.
+    - Classify permanent quota/billing exhaustion (`is_permanent_quota_error`, keeping `token_quota_exceeded` retryable) on HTTP `429` and `200..=299` so permanent billing errors fail fast.
+    - Extract explicit retry-delay hints (`extract_retry_hint_secs`, clamped to `MAX_RATE_LIMIT_BACKOFF_SECS = 30`) from `429` messages and cap base exponential backoff at `MAX_BACKOFF_SECS = 10`.
+  - `verification_gate`: `cargo test --lib retry && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T14` — Provider Output-Token Truncation Detection (`Message.truncated`)**
+  - `blocked_by`: `["T02"]`
+  - `blocks`: `["T15"]`
+  - `plans`: [`.plans/07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md)
+  - `files`: `src/api.rs`, `src/llm/chat_completions.rs`, `src/llm/responses_api.rs`, `src/llm/anthropic.rs`
+  - `tasks`:
+    - Add `#[serde(skip)] pub truncated: bool` to `Message` in `src/api.rs` (initialized to `false` in `Message::text` and `Message::tool` so wire payloads and `context_bytes` stay unchanged).
+    - Set `truncated = true` when `finish_reason == Some("length")` in `ChatProvider::decode` (`src/api.rs`, `src/llm/chat_completions.rs`), when `status == Some("incomplete")` and `incomplete_details["reason"] == Some("max_output_tokens")` in `ResponsesProvider::decode` (`src/llm/responses_api.rs`), and when `stop_reason == Some("max_tokens")` in `AnthropicProvider::decode` (`src/llm/anthropic.rs`, returning an empty `Message` with `truncated: true` when truncated before content/tool blocks arrive).
+  - `verification_gate`: `cargo test --lib api && cargo test --lib llm && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+---
+
+### Wave 2: Tickets/Triage Pipeline Flow & In-Loop Recovery
+
+- [ ] **`T06` — `TICKETS_SYSTEM_PROMPT` Upgrades (Per-Ticket Scope Cap & Cross-Ticket Signatures)**
+  - `blocked_by`: `["T03"]`
+  - `blocks`: `["T07"]`
+  - `plans`: [`.plans/02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md), [`.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md)
+  - `files`: `src/prompts/tickets.rs`
+  - `tasks`:
+    - Update Step 2 in `TICKETS_SYSTEM_PROMPT` to cap per-ticket scope at one primary user journey / entry point with a focused set of `test_expectations` (typically 3–8 BDD test cases in one test file, `PROPOSAL-9`) and batch small same-shape edits sharing one verification gate.
+    - Require `prerequisites_assumed` to name the exact module paths, type names, and function signatures consumed from `blocked_by` tickets, and require `scope_of_changes` to name the exact public types and function signatures produced for `blocks` tickets (`02`).
+  - `verification_gate`: `cargo test --lib prompts::tickets && cargo test --test pipeline && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T07` — Add `TriageState::Done` Data Model & Upgrade `TRIAGE_SYSTEM_PROMPT`**
+  - `blocked_by`: `["T06"]`
+  - `blocks`: `["T08"]`
+  - `plans`: [`.plans/PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md), [`.plans/02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md)
+  - `files`: `src/triage.rs`, `src/prompts/triage.rs`, `src/tools.rs`
+  - `tasks`:
+    - Add `TriageState::Done` (wire `"done"`) in `src/triage.rs`, update `TriageState::ALL` to 5 states, add `pub fn authorizes_queue(self) -> bool` (`ReadyForAgent | Done`), and keep `is_ready(self)` true only for `ReadyForAgent` so `Done` carries audit `notes` and `blocker_explanation` without an `AgentBrief`.
+    - Update `TRIAGE_SYSTEM_PROMPT` (`src/prompts/triage.rs`, preserving all existing test needles): add pairwise producer/consumer signature and self-consistency checks in Step 2 (`02`), require deterministic bug reproduction at the public seam under `bug` (`02`), and document `done` separately from `wontfix` under `## States` and `## Output rules` (`PROPOSAL-1`).
+  - `verification_gate`: `cargo test --lib triage && cargo test --lib prompts::triage && cargo test --lib tools && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T08` — Pipeline Queue Authorization & Pre-Completion for `TriageState::Done` Tickets**
+  - `blocked_by`: `["T07"]`
+  - `blocks`: `["T09"]`
+  - `plans`: [`.plans/PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md)
+  - `files`: `src/pipeline.rs`, `tests/pipeline.rs`
+  - `tasks`:
+    - Update `authorizes_queue` and `triage_blockers` in `src/pipeline.rs` to check `classification.state.authorizes_queue()`.
+    - Partition `TriageState::Done` tickets into `progress.prior_completed` before `queue_and_review`, strip `Done` ticket IDs from remaining `ReadyForAgent` tickets' `blocked_by` lists, and when all draft tickets are `Done`, write `queue-status.json` and `queue-report.md` and proceed directly to `transition_gate` -> `review_round` -> `summary_pass`.
+  - `verification_gate`: `cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T09` — Forward Triage `notes` and `AgentBrief` to Code Agent Kickoff**
+  - `blocked_by`: `["T08"]`
+  - `blocks`: `["T10"]`
+  - `plans`: [`.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md)
+  - `files`: `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs`, `tests/pipeline.rs`
+  - `tasks`:
+    - Add `TriageReport::agent_context_for(&self, ticket_id: &str) -> Option<String>` in `src/triage.rs` to render `# Triage Audit` (`## Audit Notes` and `## Agent Brief`) for `ready-for-agent` tickets.
+    - Store `triage: Option<TriageReport>` on `ReviewProgress` in `src/pipeline.rs`, pass `Option<&TriageReport>` into `Production` in `src/orchestrator.rs`, and append the triage audit block to the kickoff prompt in `Production::work` while keeping on-disk `tickets/<id>.md` unchanged.
+  - `verification_gate`: `cargo test --lib triage && cargo test --lib orchestrator && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T10` — Include Verification Gate Failure Excerpts in `queue-report.md` and Retry Handovers**
+  - `blocked_by`: `["T09"]`
+  - `blocks`: `["T16"]`
+  - `plans`: [`.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md)
+  - `files`: `src/orchestrator.rs`, `src/pipeline.rs`, `tests/pipeline.rs`
+  - `tasks`:
+    - Add `gate_failure_excerpt(output: &str) -> String` (retaining up to the last 1,200 characters of trimmed output) and carry it on `Ending::GateFailed(String)` and `Ending::RetryExhausted(String)` in `src/orchestrator.rs`.
+    - Render non-empty gate failure excerpts in `Report::markdown` (`src/orchestrator.rs`) so `Phase::Summary` and `queue_failures` / `queue_retry_detail` (`src/pipeline.rs`) include diagnostic context.
+  - `verification_gate`: `cargo test --lib orchestrator && cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T15` — In-Loop Missing-Tool / Truncation Recovery & Tool-Call Repetition Guard**
+  - `blocked_by`: `["T14"]`
+  - `blocks`: `["T16", "T17"]`
+  - `plans`: [`.plans/07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md)
+  - `files`: `src/loops/agent.rs`
+  - `tasks`:
+    - In `run_agent_loop_capturing` (`src/loops/agent.rs`), prompt up to `MAX_CONSECUTIVE_FORMAT_RECOVERIES = 2` times in-loop when an unattended phase omits a required tool call or when `assistant.truncated` is `true` before returning `Stop::TurnEnd` (preserving normal tool-free turns for non-truncated `Phase::Plan` and `Phase::Summary`).
+    - Canonicalize tool calls per turn, append a loop-redirect notice (with canonical arguments preview capped at 500 UTF-8 bytes) to the last `Role::Tool` message at `TOOL_LOOP_WARN_THRESHOLD = 3` consecutive identical turns, and abort with `Stop::Failed(FailureKind::StepLimit)` at `TOOL_LOOP_ABORT_THRESHOLD = 5`.
+  - `verification_gate`: `cargo test --lib loops::agent && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+---
+
+### Wave 3: Outer Pass Retries, Compaction Recovery, & Trajectory Persistence
+
+- [ ] **`T16` — Outer Single-Pass Retry for Unattended Handoff Passes (`spec_pass`, `tickets_pass`, `triage_pass`, `review_round`)**
+  - `blocked_by`: `["T10", "T15"]`
+  - `blocks`: `[]`
+  - `plans`: [`.plans/PROPOSAL-2-review-pass-retry.md`](./.plans/PROPOSAL-2-review-pass-retry.md)
+  - `files`: `src/pipeline.rs`, `tests/pipeline.rs`
+  - `tasks`:
+    - Add `retries_after_unattended_stop(kind: Option<FailureKind>) -> bool` in `src/pipeline.rs` (`true` for `None` / `TurnEnd` and `Some(Malformed | StepLimit | ContextGuard)`, `false` for `Api | Transport`).
+    - Retry `spec_pass`, `tickets_pass`, `triage_pass`, and `review_round` once in a fresh session (logging a `[WARN]` line via `status::shared().stderr_log`) before returning `RunTermination::ReviewIncomplete` or `self.downstream_retry(...)`.
+  - `verification_gate`: `cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T17` — Context Compaction Resilience, Tier-1 Soft Fallback, & HTTP 400/413/422 Overflow Recovery**
+  - `blocked_by`: `["T13", "T15"]`
+  - `blocks`: `["T18"]`
+  - `plans`: [`.plans/11-context-compaction-and-overflow-recovery.md`](./.plans/11-context-compaction-and-overflow-recovery.md)
+  - `files`: `src/loops/agent.rs`
+  - `tasks`:
+    - Retry transient failures during `request_handover_summary` via `send_summary_with_retry` (`retry::should_retry`).
+    - Instruct `HANDOVER_SUMMARY_INSTRUCTION` to merge any earlier `[HANDOVER SUMMARY]` checkpoint into a single consolidated summary.
+    - Split `SummaryError::SoftValidation` from `SummaryError::Fatal` in `prepare_for_send`, falling back to the Tier-1 compacted transcript when it fits within `CONTEXT_GUARD_BYTES` (4 MiB).
+    - Detect context-overflow errors (`is_context_overflow_error` on HTTP `413` or HTTP `400`/`422` with overflow markers) below the 400 KiB watermark, compact once via `force_compact_on_overflow`, and retry the turn.
+  - `verification_gate`: `cargo test --lib loops::agent && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T18` — Per-Loop Conversation Trajectory Persistence (`.traj.json`)**
+  - `blocked_by`: `["T11", "T17"]`
+  - `blocks`: `[]`
+  - `plans`: [`.plans/08-conversation-trajectory-persistence.md`](./.plans/08-conversation-trajectory-persistence.md)
+  - `files`: `src/loops/agent.rs`, `src/tools.rs`
+  - `tasks`:
+    - Define `TrajectorySnapshot` (`phase`, `role`, `model`, `steps_taken`, `exit_status`, `messages`) and `Stop::exit_status_label` in `src/loops/agent.rs`.
+    - When `invocation.session_dir` is `Some`, persist `<phase>.traj.json` (with `<phase>-<N>.traj.json` collision suffixes `1..10_000`) under `<session-dir>/trajectories/` on every loop exit path, calling `crate::tools::ignore_run_artifacts` and logging `[WARN]` on I/O errors without altering the returned `Stop`.
+  - `verification_gate`: `cargo test --lib loops::agent && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`

@@ -152,6 +152,113 @@ answer the plan interview. Ctrl-C abandons the current input line. Ctrl-D exits.
 A run needs a Git repository with a clean working tree before the agents start.
 Ignored files, such as files under `.ejaj/`, do not stop the run.
 
+### Workflow
+
+The diagram below shows the pipeline phases, the retry paths to `plan>>`, and
+the fatal error paths that stop the process with exit status 1:
+
+```text
+plan>> -> Plan -> Spec -> Tickets -> Triage -> Queue <-> Review -> Summary -> Git
+  ^        |       |         |         |         |         |         |         |
+  +--------+-------+---------+---------+---------+---------+         v         v
+                      (retry: returns to plan>>)                 [exit 1]  [exit 0]
+```
+
+#### Pipeline flow
+
+```text
+               [ Startup: read .env and validate Config ]
+                                   |
+                                   +--> Invalid config / key ----> [ exit 1 ]
+                                   v
+                    [ Git preflight: clean working tree ]
+                                   |
+                                   +--> Dirty tree / Git error --> [ exit 1 ]
+                                   v
+      +----------------> [ 1. Plan interview (plan>>) ]
+      |                            |
+      |   Needs user answer        +--> Write plan.md
+      +<---------------------------+
+      |                            v
+      |                  [ 2. Specification pass ]
+      |                            |
+      |   Stopped early            +--> Write spec.md
+      +<---------------------------+
+      |                            v
+      |                  [ 3. Tickets pass ]
+      |                            |
+      |   Stopped early            +--> Write tickets/*.md
+      +<---------------------------+
+      |                            v
+      |                  [ 4. Triage pass (read-only) ]
+      |                            |
+      |   Blocked / stopped        +--> Write ticket-triage.md
+      +<---------------------------+
+      |                            v  (all tickets ready-for-agent)
+      |                  [ 5. Ticket queue + 6. Review ] <---------+
+      |                            |                               |
+      |                            +--> Review emits fix tickets --+
+      |                            |    (or test suite gate fails)
+      |                            v
+      |                  [ 7. Summary pass (Smoll) ]
+      |                            |
+      |                            +--> Summary fails (4 tries) -> [ exit 1 ]
+      |                            +--> Write change-summary.md
+      |                            |
+      |   Queue or review          |
+      |   incomplete               |
+      +<---------------------------+
+                                   v  (queue resolved + review passed)
+                     [ 8. Git commit (and push if default) ]
+                                   |
+                                   +--> Git operation fails -----> [ exit 1 ]
+                                   v
+                              [ exit 0 ]
+```
+
+If the pipeline cannot write an artifact to `.ejaj/<timestamp>/`, the
+application stops with exit status 1.
+
+#### Ticket queue and review loop
+
+```text
+  [ Draft or Fix Tickets ]
+             |
+             v
+  +--> [ Pick next ready ticket ]
+  |          |
+  |          v
+  |    [ Code agent (Attempt 1) ] --> [ Verification gate ]
+  |          |                                  |
+  |          | Stopped early                    | Gate fails
+  |          +----------------+-----------------+
+  |                           | (Pass -> mark completed)
+  |                           v
+  |          [ Code agent (Attempt 2 + diff/gate handover) ]
+  |                           |
+  |                           v
+  |                 [ Verification gate ]
+  |                     /           \
+  |              Pass  /             \  Fail
+  |                   v               v
+  |          [ Mark completed ]  [ Mark failed (block dependents) ]
+  |                   \               /
+  +--------------------+-------------+  (while ready tickets remain)
+                       |
+                       v  (all tickets completed)
+           [ Full test suite gate ] (cargo test / npm test)
+                  /          \
+           Pass  /            \  Fail (< 3x)
+                v              +--> [ Queue repair ticket ] --+
+        [ Review agent ]                                      |
+           /        \                                         |
+    Pass  /          \  Findings (< 10 rounds, not stalled)   |
+         v            +----------> [ Queue fix tickets ] -----+
+  [ Summary pass ]                                            |
+                                                              |
+  (Loops back to Ticket Queue) <------------------------------+
+```
+
 ### Handoff artifacts
 
 Each handoff writes its artifacts under `.ejaj/<timestamp>/`. The pipeline
