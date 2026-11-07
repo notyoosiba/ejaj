@@ -9,11 +9,11 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | Plan / Proposal | Status | Mapped DAG Tasks | Target Modules |
 | --- | --- | --- | --- |
 | [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) | [x] Complete (T01, T02 done) | `T01`, `T02` | `src/tickets.rs`, `src/pipeline.rs`, `src/prompts/{plan,spec,tickets,code,review}.rs` |
-| [`03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md) | `[ ]` Pending (T05 done; T04 pending) | `T02`, `T05`, `T04` | `src/prompts/review.rs`, `src/prompts/code.rs` |
+| [`03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md) | [x] Complete (T02, T05, T04 done) | `T02`, `T05`, `T04` | `src/prompts/review.rs`, `src/prompts/code.rs` |
 | [`PROPOSAL-8-internal-module-exports-in-review.md`](./.plans/PROPOSAL-8-internal-module-exports-in-review.md) | [x] Complete (T05 done) | `T05` | `src/prompts/review.rs` |
-| [`PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md) | `[ ]` Pending | `T04` | `src/prompts/code.rs` |
+| [`PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md) | [x] Complete (T04 done) | `T04` | `src/prompts/code.rs` |
 | [`01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md) | `[ ]` Pending | `T02`, `T03` | `src/prompts/plan.rs`, `src/prompts/spec.rs` |
-| [`PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md) | `[ ]` Pending | `T04`, `T06` | `src/prompts/code.rs`, `src/prompts/tickets.rs` |
+| [`PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md) | `[ ]` Pending (T04 done; T06 pending) | `T04`, `T06` | `src/prompts/code.rs`, `src/prompts/tickets.rs` |
 | [`02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md) | `[ ]` Pending | `T02`, `T06`, `T07` | `src/prompts/tickets.rs`, `src/prompts/triage.rs` |
 | [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | `[ ]` Pending | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md) | `[ ]` Pending | `T09` | `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs` |
@@ -48,7 +48,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 [x] [T05] 03 + PROPOSAL-8: REVIEW_SYSTEM_PROMPT upgrades — scoped Round 2+ re-review & pub(crate) exports (src/prompts/review.rs)
       │
       ▼
-[ ] [T04] 03 + PROPOSAL-4 + PROPOSAL-9: CODE_TDD_DISCIPLINE upgrades — no artificial red probes & tracker edits last (src/prompts/code.rs)
+[x] [T04] 03 + PROPOSAL-4 + PROPOSAL-9: CODE_TDD_DISCIPLINE upgrades — no artificial red probes & tracker edits last (src/prompts/code.rs)
       │
       ▼
 [ ] [T03] 01: PLAN_SYSTEM_PROMPT & SPEC_SYSTEM_PROMPT upgrades (src/prompts/{plan,spec}.rs)
@@ -129,7 +129,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - Update Step 4: emit findings/fixes for blocking defects only, scope round 2+ re-reviews (`## Prior Review Rounds`) to verifying prior findings/fixes and checking the fix diff for regressions, and coalesce compatible fixes into the minimum number of fix tickets.
   - `verification_gate`: `cargo test --lib prompts::review && cargo test --test pipeline && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T04` — `CODE_TDD_DISCIPLINE` Upgrades (Vertical Slices, No Artificial Red Probes, & Tracker Edits Last)**
+- [x] **`T04` — `CODE_TDD_DISCIPLINE` Upgrades (Vertical Slices, No Artificial Red Probes, & Tracker Edits Last)**
   - `depends_on`: `["T05"]`
   - `unblocks`: `["T03"]`
   - `plans`: [`.plans/03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md), [`.plans/PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md), [`.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md)
