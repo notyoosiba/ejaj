@@ -12,9 +12,9 @@ Convert the upstream plan into a technical specification without prompting the u
    types, schemas and test harnesses before deciding anything. Read `AGENTS.md` and `README.md` when present
    and follow the relevant repository links they contain before deciding the design. Use `tools.list(glob?)`,
    `tools.grep(pattern, glob?)` and `tools.read(path, startLine?, endLine?)` (1-based inclusive line
-   numbers). Prefer one script that gathers multiple facts over many separate tool calls. Never
-   write, build or test.
-2. **Choose deep modules and the testing seams by policy:** prefer deep modules with small public interfaces over shallow wrappers, and
+   numbers). Prefer one script that gathers multiple facts over many separate tool calls.
+   Never write, build, test, prompt the user, or pause for an intermediate confirmation.
+2. **Choose deep modules and the testing seams by policy:** prefer deep modules with small public interfaces over shallow wrappers, avoid shallow pass-through wrappers, and
    keep internal implementation details private. Require testable boundaries around external I/O: inject external boundary dependencies
    instead of constructing network, clock, randomness or OS access inside domain logic. Exercise in-process and locally substitutable collaborators directly with real collaborators or local stand-ins, including local filesystems and persistence. Use test doubles only at non-deterministic external boundaries
    (network or RPC, the system clock, randomness, and the OS), and never mock internal classes, services, or local persistence layers.

@@ -12,7 +12,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`03-code-and-review-prompts.md`](./.plans/03-code-and-review-prompts.md) | [x] Complete (T02, T05, T04 done) | `T02`, `T05`, `T04` | `src/prompts/review.rs`, `src/prompts/code.rs` |
 | [`PROPOSAL-8-internal-module-exports-in-review.md`](./.plans/PROPOSAL-8-internal-module-exports-in-review.md) | [x] Complete (T05 done) | `T05` | `src/prompts/review.rs` |
 | [`PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md) | [x] Complete (T04 done) | `T04` | `src/prompts/code.rs` |
-| [`01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md) | `[ ]` Pending | `T02`, `T03` | `src/prompts/plan.rs`, `src/prompts/spec.rs` |
+| [`01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md) | [x] Complete (T02, T03 done) | `T02`, `T03` | `src/prompts/plan.rs`, `src/prompts/spec.rs` |
 | [`PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md) | `[ ]` Pending (T04 done; T06 pending) | `T04`, `T06` | `src/prompts/code.rs`, `src/prompts/tickets.rs` |
 | [`02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md) | `[ ]` Pending | `T02`, `T06`, `T07` | `src/prompts/tickets.rs`, `src/prompts/triage.rs` |
 | [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | `[ ]` Pending | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
@@ -51,7 +51,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 [x] [T04] 03 + PROPOSAL-4 + PROPOSAL-9: CODE_TDD_DISCIPLINE upgrades — no artificial red probes & tracker edits last (src/prompts/code.rs)
       │
       ▼
-[ ] [T03] 01: PLAN_SYSTEM_PROMPT & SPEC_SYSTEM_PROMPT upgrades (src/prompts/{plan,spec}.rs)
+[x] [T03] 01: PLAN_SYSTEM_PROMPT & SPEC_SYSTEM_PROMPT upgrades (src/prompts/{plan,spec}.rs)
       │
       ▼
 [ ] [T06] 02 + PROPOSAL-9: TICKETS_SYSTEM_PROMPT scope cap & contracts (src/prompts/tickets.rs)
@@ -139,7 +139,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - Update `CODE_TDD_DISCIPLINE` in `src/prompts/code.rs`: work in vertical red-green slices at the public seam, never widen `pub` visibility on internal helpers solely for tests, replace obsolete coupled unit tests when consolidating behind a deeper seam, assert against independent known literals (anti-tautology), run focused test targets while iterating, never sabotage/stash/back up production files to force an artificial red failure when a new regression/boundary test already passes (`PROPOSAL-4`), and apply `TODO.md`/`.plan/*.md` tracker edits last right before `verification_gate` (reverting them if the gate fails, `PROPOSAL-9`).
   - `verification_gate`: `cargo test --lib prompts::code && cargo test --test llm_wire && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T03` — Plan & Spec Prompt Upgrades (First-Turn Reconnaissance, Deep Modules, & Cross-Module Signatures)**
+- [x] **`T03` — Plan & Spec Prompt Upgrades (First-Turn Reconnaissance, Deep Modules, & Cross-Module Signatures)**
   - `depends_on`: `["T04"]`
   - `unblocks`: `["T06"]`
   - `plans`: [`.plans/01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md)

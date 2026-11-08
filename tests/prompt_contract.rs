@@ -104,6 +104,20 @@ fn when_handing_off_given_settled_plan_choices_then_prompt_requires_substantive_
     assert_template_headings_in_order();
 }
 
+/// Contract and invariant check: before offering design options the plan
+/// prompt checks whether the requested behaviour or a close equivalent already
+/// exists, and when it does, the first round cites the existing module and its
+/// path and asks whether to reuse, extend or replace it.
+#[test]
+fn when_proposing_given_existing_behavior_then_plan_prompt_requires_reuse_extend_or_replace() {
+    assert_plan_prompt_contains(&[
+        "Before you offer design options",
+        "check whether the requested behaviour or a close equivalent already exists in the repository",
+        "cite the existing module and its path",
+        "ask whether to reuse it, extend it or replace it",
+    ]);
+}
+
 /// Regression: the existing opening marker, focused-round mechanics, terminal
 /// handoff, and ordered template headings remain intact.
 #[test]
@@ -265,6 +279,8 @@ fn when_specifying_given_repository_context_then_prompt_requires_guidance_and_de
         "follow the relevant repository links they contain before deciding the design",
         "prefer deep modules with small public interfaces over shallow wrappers",
         "keep internal implementation details private",
+        "avoid shallow pass-through wrappers",
+        "Never write, build, test, prompt the user, or pause for an intermediate confirmation",
     ]);
 }
 
