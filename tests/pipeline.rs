@@ -2351,7 +2351,465 @@ fn when_triaging_tickets_given_multi_ticket_report_then_preserves_every_decision
     let _ = fs::remove_dir_all(&dir);
 }
 
+// -- Done classifications --------------------------------------------------
+
+/// The three-ticket fixture decoded into the typed set.
+fn multi_ticket_set() -> TicketSet {
+    let value: serde_json::Value =
+        serde_json::from_str(common::multi_tickets_json()).expect("the ticket fixture is JSON");
+    serde_json::from_value(value["tickets"].clone())
+        .expect("the ticket fixture carries a ticket set")
+}
+
+fn queue_status(dir: &Path) -> serde_json::Value {
+    let text = fs::read_to_string(dir.join("tickets/queue-status.json"))
+        .unwrap_or_else(|e| common::failed("the queue status artifact", &e.to_string()));
+    serde_json::from_str(&text).expect("the queue status is JSON")
+}
+
+fn queue_report(dir: &Path) -> String {
+    fs::read_to_string(dir.join("queue-report.md"))
+        .unwrap_or_else(|e| common::failed("the queue report artifact", &e.to_string()))
+}
+
+fn request_containing(transport: &common::ScriptedTransport, needle: &str) -> String {
+    transport
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| body.to_string().contains(needle))
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The one plan handover that carries a downstream retry, with the plan itself
+/// dropped so an assertion sees only the retry outcome.
+fn downstream_outcome(transport: &common::ScriptedTransport) -> String {
+    let requests = transport.requests.lock().unwrap();
+    for body in requests.iter() {
+        for message in body["messages"].as_array().into_iter().flatten() {
+            let Some(text) = message["content"].as_str() else {
+                continue;
+            };
+            if let Some(start) = text.find("[DOWNSTREAM RETRY]") {
+                return text[start..].to_string();
+            }
+        }
+    }
+    panic!("no plan handover carried a downstream retry");
+}
+
+#[test]
+fn when_running_the_pipeline_given_one_done_ticket_then_records_completion_and_reviews() {
+    let (step, dir, transport) = triage_run(common::TriageScript::AllDone);
+    assert!(
+        matches!(step, Step::Complete),
+        "an all-done draft still completes through review: {step:?}"
+    );
+
+    let status = queue_status(&dir);
+    assert_eq!(status.as_object().map(serde_json::Map::len), Some(1));
+    assert_eq!(status["1-verify-command-output"], "completed");
+
+    let report = queue_report(&dir);
+    assert!(
+        report.contains("1 ticket: 1 completed, 0 failed, 0 blocked."),
+        "the completed-only report states its one-ticket count: {report}"
+    );
+    assert!(
+        report.contains("## 1-verify-command-output\n"),
+        "the completed ticket has its own section: {report}"
+    );
+    assert!(
+        report.contains("- Ended: declared"),
+        "the done ticket ends as declared: {report}"
+    );
+
+    assert!(
+        code_payloads(&transport).is_empty(),
+        "no code-agent request is sent for an all-done set"
+    );
+    assert!(dir.join("review.md").is_file(), "review still runs");
+    assert_eq!(
+        summary_artifact(&dir),
+        common::SCRIPTED_SUMMARY,
+        "the existing summary path writes the canonical summary"
+    );
+    assert_eq!(
+        transport.requests.lock().unwrap().len(),
+        6,
+        "plan, spec, tickets, triage, review and summary only"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_triaging_tickets_given_done_dependency_then_runs_ready_dependent() {
+    let (step, dir, transport) = multi_triage_run(common::TriageScript::DoneAt(1));
+    assert!(
+        matches!(step, Step::Complete),
+        "the ready tickets complete without the done ticket's work: {step:?}"
+    );
+
+    let payloads = code_payloads(&transport);
+    assert!(
+        payloads
+            .iter()
+            .any(|payload| payload.contains("1-verify-command-output")),
+        "the first ready ticket runs: {payloads:?}"
+    );
+    assert!(
+        payloads
+            .iter()
+            .any(|payload| payload.contains("3-verify-command-empty")),
+        "the dependent ready ticket runs: {payloads:?}"
+    );
+    assert!(
+        payloads
+            .iter()
+            .all(|payload| !payload.contains("Verify the command failure boundary")),
+        "the done ticket's own payload is never handed to the code agent: {payloads:?}"
+    );
+
+    let dependent = payloads
+        .iter()
+        .find(|payload| payload.contains("3-verify-command-empty"))
+        .expect("the dependent ticket ran");
+    assert!(
+        dependent.contains("blocked_by: []"),
+        "the in-memory dependent has its done blocker removed: {dependent}"
+    );
+
+    let status = queue_status(&dir);
+    assert_eq!(status.as_object().map(serde_json::Map::len), Some(3));
+    for id in [
+        "1-verify-command-output",
+        "2-verify-command-failure",
+        "3-verify-command-empty",
+    ] {
+        assert_eq!(status[id], "completed", "ticket {id} did not complete");
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_running_the_pipeline_given_three_done_tickets_then_records_completion_and_reviews() {
+    let (step, dir, transport) = multi_triage_run(common::TriageScript::AllDone);
+    assert!(
+        matches!(step, Step::Complete),
+        "a three-ticket all-done draft completes through review: {step:?}"
+    );
+
+    let status = queue_status(&dir);
+    assert_eq!(status.as_object().map(serde_json::Map::len), Some(3));
+    for id in [
+        "1-verify-command-output",
+        "2-verify-command-failure",
+        "3-verify-command-empty",
+    ] {
+        assert_eq!(status[id], "completed");
+    }
+
+    let report = queue_report(&dir);
+    assert!(
+        report.contains("3 tickets: 3 completed, 0 failed, 0 blocked."),
+        "the completed-only report states its three-ticket count: {report}"
+    );
+    for id in [
+        "1-verify-command-output",
+        "2-verify-command-failure",
+        "3-verify-command-empty",
+    ] {
+        assert_eq!(
+            report.matches(&format!("## {id}\n")).count(),
+            1,
+            "ticket {id} has exactly one completed section: {report}"
+        );
+    }
+
+    assert!(
+        code_payloads(&transport).is_empty(),
+        "no code-agent request is sent for a three-ticket all-done set"
+    );
+    assert!(dir.join("review.md").is_file());
+    assert_eq!(summary_artifact(&dir), common::SCRIPTED_SUMMARY);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_triaging_tickets_given_done_dependency_then_preserves_original_artifacts_and_records_each_id_once() {
+    let (step, dir, _transport) = multi_triage_run(common::TriageScript::DoneAt(1));
+    assert!(matches!(step, Step::Complete), "{step:?}");
+
+    let set = multi_ticket_set();
+    for ticket in &set.tickets {
+        let persisted = fs::read_to_string(dir.join("tickets").join(ticket.file_name()))
+            .unwrap_or_else(|e| common::failed("the original ticket artifact", &e.to_string()));
+        assert_eq!(
+            persisted,
+            ticket.to_markdown(),
+            "the original ticket markdown is untouched for {}",
+            ticket.id
+        );
+    }
+
+    let triage = triage_artifact(&dir);
+    let first = triage
+        .find("## 1-verify-command-output: ")
+        .expect("the first ticket renders");
+    let second = triage
+        .find("## 2-verify-command-failure: ")
+        .expect("the done ticket renders");
+    let third = triage
+        .find("## 3-verify-command-empty: ")
+        .expect("the dependent renders");
+    assert!(
+        first < second && second < third,
+        "the triage report keeps draft order: {triage}"
+    );
+    assert!(
+        triage.contains(common::DONE_MARKER),
+        "the done classification retains its explanation: {triage}"
+    );
+    assert!(
+        triage.contains("**Blocked by:** `2-verify-command-failure`"),
+        "the triage report retains the dependent's original dependency: {triage}"
+    );
+
+    let status = queue_status(&dir);
+    assert_eq!(status.as_object().map(serde_json::Map::len), Some(3));
+    let report = queue_report(&dir);
+    for id in [
+        "1-verify-command-output",
+        "2-verify-command-failure",
+        "3-verify-command-empty",
+    ] {
+        assert_eq!(status[id], "completed", "ticket {id} is not completed");
+        assert_eq!(
+            report.matches(&format!("## {id}\n")).count(),
+            1,
+            "ticket {id} appears exactly once in the cumulative report"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_triaging_tickets_given_each_non_authorizing_state_beside_done_and_ready_then_retries_without_execution() {
+    for state in [
+        TriageState::ReadyForHuman,
+        TriageState::NeedsInfo,
+        TriageState::Wontfix,
+    ] {
+        let transport = Arc::new(
+            common::ScriptedTransport::new()
+                .with_tickets(multi_ticket_set())
+                .with_triage(common::TriageScript::DoneAndBlocked(state))
+                .with_repeating_handoffs(),
+        );
+        let config = common::scripted_pipeline_with_transport(transport.clone());
+        let dir = scratch_dir();
+        fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+        let repository = common::TempRepo::at(dir.join("repo"));
+        repository.commit_baseline();
+        let artifacts = dir.join("artifacts");
+        fs::create_dir_all(&artifacts).expect("the artifact directory is creatable");
+        let mut pipeline = Pipeline::new(&config, common::scope(), repository.path());
+
+        assert!(
+            matches!(pipeline.ask("first request", &artifacts), Step::Retry),
+            "a {state:?} classification blocks the whole set"
+        );
+        assert_no_queue(&artifacts, &transport);
+        assert!(
+            matches!(pipeline.ask("second request", &artifacts), Step::Retry),
+            "the resumed run is blocked again"
+        );
+
+        // The triage artifact renders every classification in draft order.
+        let triage = fs::read_to_string(artifacts.join("ticket-triage.md"))
+            .unwrap_or_else(|e| common::failed("the triage artifact", &e.to_string()));
+        let first = triage
+            .find("## 1-verify-command-output: ")
+            .expect("the done ticket renders");
+        let second = triage
+            .find("## 2-verify-command-failure: ")
+            .expect("the blocked ticket renders");
+        let third = triage
+            .find("## 3-verify-command-empty: ")
+            .expect("the ready ticket renders");
+        assert!(first < second && second < third, "{triage}");
+        assert!(triage.contains("- **State:** done"), "{triage}");
+        assert!(
+            triage.contains(&format!("- **State:** {}", state.wire())),
+            "{triage}"
+        );
+        assert!(triage.contains("- **State:** ready-for-agent"), "{triage}");
+
+        let outcome = downstream_outcome(&transport);
+        assert!(outcome.contains("phase: triage"), "{outcome}");
+        assert!(
+            outcome.contains(&format!(
+                "2-verify-command-failure ({}):",
+                state.wire()
+            )),
+            "the blocker detail names the non-authorizing ticket: {outcome}"
+        );
+        assert!(
+            outcome.contains("The draft ticket is not ready for an agent"),
+            "the blocker detail keeps the explanation: {outcome}"
+        );
+        assert!(
+            !outcome.contains("1-verify-command-output"),
+            "the done ticket is absent from the blocker detail: {outcome}"
+        );
+        assert!(
+            !outcome.contains(common::DONE_MARKER) && !outcome.contains("(done):"),
+            "no done explanation leaks into the blocker detail: {outcome}"
+        );
+
+        drop(repository);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn when_recording_done_tickets_given_status_write_failure_then_skips_review_and_summarizes_generated_report() {
+    let (step, dir, transport) = triage_run_prepared(common::TriageScript::AllDone, |dir| {
+        fs::create_dir_all(dir.join("tickets/queue-status.json"))
+            .expect("the status path can be planted as a directory");
+    });
+    assert!(
+        matches!(step, Step::Retry),
+        "a completed-only status write failure stops the queue: {step:?}"
+    );
+
+    assert!(
+        !dir.join("review.md").exists(),
+        "review does not start after the queue stopped"
+    );
+    let report = queue_report(&dir);
+    assert!(
+        report.contains("1 ticket: 1 completed, 0 failed, 0 blocked."),
+        "the generated completed-only report survives the status failure: {report}"
+    );
+
+    let summary_request = request_containing(&transport, common::SUMMARY_MARKER);
+    assert!(
+        summary_request.contains("1 ticket: 1 completed, 0 failed, 0 blocked."),
+        "summary receives the generated report content: {summary_request}"
+    );
+    assert!(
+        summary_request.contains("## 1-verify-command-output"),
+        "summary receives the completed ticket's section: {summary_request}"
+    );
+    assert_eq!(summary_artifact(&dir), common::SCRIPTED_SUMMARY);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_recording_done_tickets_given_report_write_failure_then_reviews_and_summarizes_generated_report() {
+    let (step, dir, transport) = triage_run_prepared(common::TriageScript::AllDone, |dir| {
+        fs::create_dir_all(dir.join("queue-report.md"))
+            .expect("the report path can be planted as a directory");
+    });
+    assert!(
+        matches!(step, Step::Complete),
+        "a failed report write changes nothing about completion: {step:?}"
+    );
+
+    assert!(dir.join("review.md").is_file(), "review still runs");
+    let report_line = "1 ticket: 1 completed, 0 failed, 0 blocked.";
+    let seen = transport
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| body.to_string().contains(report_line))
+        .count();
+    assert!(
+        seen >= 2,
+        "both review and summary receive the generated report text"
+    );
+    assert_eq!(summary_artifact(&dir), common::SCRIPTED_SUMMARY);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_running_the_pipeline_given_all_ready_tickets_then_preserves_queue_review_and_summary_flow() {
+    let (step, dir, transport) = multi_triage_run(common::TriageScript::AllReady);
+    assert!(matches!(step, Step::Complete), "{step:?}");
+
+    let payloads = code_payloads(&transport);
+    for id in [
+        "1-verify-command-output",
+        "2-verify-command-failure",
+        "3-verify-command-empty",
+    ] {
+        assert!(
+            payloads.iter().any(|payload| payload.contains(id)),
+            "ticket {id} still reaches the code agent"
+        );
+    }
+    let status = queue_status(&dir);
+    assert_eq!(status.as_object().map(serde_json::Map::len), Some(3));
+    for id in [
+        "1-verify-command-output",
+        "2-verify-command-failure",
+        "3-verify-command-empty",
+    ] {
+        assert_eq!(status[id], "completed");
+    }
+    let report = queue_report(&dir);
+    assert!(
+        report.contains("3 tickets: 3 completed, 0 failed, 0 blocked."),
+        "{report}"
+    );
+    assert!(dir.join("review.md").is_file());
+    assert_eq!(summary_artifact(&dir), common::SCRIPTED_SUMMARY);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // -- Malformed/Invalid payload ---------------------------------------------
+
+#[test]
+fn when_triaging_tickets_given_empty_classification_list_then_blocks_queue() {
+    let (step, dir, transport) = triage_run(common::TriageScript::Empty);
+    assert!(
+        matches!(step, Step::Retry),
+        "an empty report authorizes nothing: {step:?}"
+    );
+    assert!(!dir.join("ticket-triage.md").exists());
+    assert_no_queue(&dir, &transport);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_triaging_tickets_given_missing_handoff_then_retries_without_queue_artifacts() {
+    let (step, dir, transport) = triage_run(common::TriageScript::TurnEnd);
+    assert!(matches!(step, Step::Retry), "{step:?}");
+    assert!(!dir.join("ticket-triage.md").exists());
+    assert_no_queue(&dir, &transport);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_triaging_tickets_given_rejected_handoff_then_retries_without_queue_artifacts() {
+    let (step, dir, transport) = triage_run(common::TriageScript::AlwaysRejected);
+    assert!(matches!(step, Step::Retry), "{step:?}");
+    assert!(!dir.join("ticket-triage.md").exists());
+    assert_no_queue(&dir, &transport);
+    let _ = fs::remove_dir_all(&dir);
+}
 
 #[test]
 fn when_triaging_tickets_given_rejected_handoff_then_corrects_or_retries_without_queue() {

@@ -675,6 +675,17 @@ pub const PLAN_MARKER: &str = "Interview the user to align on core architectural
 pub enum TriageScript {
     /// Every draft ticket is classified `ready-for-agent`, so the queue runs.
     AllReady,
+    /// Every draft ticket is classified `done`, so the queue records completion
+    /// without running a ticket.
+    AllDone,
+    /// The ticket at the given index is classified `done`; every other ticket
+    /// is ready.
+    DoneAt(usize),
+    /// The first ticket is classified `done`, the second carries the given
+    /// non-authorizing state, and every other ticket is ready.
+    DoneAndBlocked(TriageState),
+    /// The report carries no classifications at all.
+    Empty,
     /// Every classification carries the given non-ready state and a blocker
     /// explanation, so the whole set is gated.
     Blocked(TriageState),
@@ -742,6 +753,32 @@ fn blocked_classification(ticket: &Ticket, state: TriageState) -> TriageTicket {
         blocker_explanation: Some(format!(
             "The draft ticket is not ready for an agent ({}) and needs a human decision.",
             state.wire()
+        )),
+        agent_brief: None,
+    }
+}
+
+/// The marker a done classification carries in its blocker explanation. A done
+/// ticket records the existing implementation; the marker lets a test prove the
+/// explanation never appears in the plan handover's blocker detail.
+pub const DONE_MARKER: &str = "ALREADY-IMPLEMENTED-COVERED";
+
+/// One `done` classification for `ticket`: it retains the ticket's id and
+/// title, records its audit note and the existing implementation as its blocker
+/// explanation, and carries no Agent Brief.
+fn done_classification(ticket: &Ticket) -> TriageTicket {
+    TriageTicket {
+        ticket_id: ticket.id.trim().to_string(),
+        ticket_title: ticket.title.trim().to_string(),
+        category: TriageCategory::Enhancement,
+        state: TriageState::Done,
+        notes: vec![format!(
+            "Audited `{}` against the repository.",
+            ticket.id.trim()
+        )],
+        blocker_explanation: Some(format!(
+            "{DONE_MARKER}: {} is already implemented and covered by existing tests.",
+            ticket.id.trim()
         )),
         agent_brief: None,
     }
@@ -1152,12 +1189,21 @@ impl ScriptedTransport {
     /// classification, so the boundary refuses it exactly as it refuses a
     /// model-authored omission.
     fn triage_report(&self, reject: bool) -> TriageReport {
+        if matches!(self.triage, TriageScript::Empty) {
+            return TriageReport { tickets: Vec::new() };
+        }
         let mut tickets: Vec<TriageTicket> = self
             .tickets
             .tickets
             .iter()
             .enumerate()
             .map(|(index, ticket)| match self.triage {
+                TriageScript::AllDone => done_classification(ticket),
+                TriageScript::DoneAt(done) if index == done => done_classification(ticket),
+                TriageScript::DoneAndBlocked(_) if index == 0 => done_classification(ticket),
+                TriageScript::DoneAndBlocked(state) if index == 1 => {
+                    blocked_classification(ticket, state)
+                }
                 TriageScript::Blocked(state) => blocked_classification(ticket, state),
                 TriageScript::OneBlocked(state) if index == one_blocked_index(&self.tickets) => {
                     blocked_classification(ticket, state)

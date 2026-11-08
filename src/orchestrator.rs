@@ -409,6 +409,72 @@ pub fn run_with_prior_in(
     run_queue_with_prior(&mut lifecycle, prior_completed, set)
 }
 
+/// Record an initial set whose every ticket the validated triage report already
+/// classified as done: no ticket work, gate or code session runs.
+///
+/// The snapshot marks every prior-completed ticket [TicketStatus::Completed]
+/// and is persisted before the report, exactly like the ready path. The report
+/// is the ordinary cumulative format, with every ticket ending as declared, so
+/// the review and summary phases receive the same generated markdown a queue
+/// round would have produced. A failed status write returns the queue's existing
+/// stopped outcome; a failed report write still returns the generated markdown.
+pub(crate) fn record_precompleted(
+    prior_completed: &[Ticket],
+    status_path: &Path,
+    report_path: &Path,
+) -> QueueResult {
+    let mut snapshot = QueueSnapshot::new(prior_completed.iter().map(|ticket| ticket.id.trim()));
+    for ticket in prior_completed {
+        snapshot.set(ticket.id.trim(), TicketStatus::Completed);
+    }
+    let outcome = match snapshot.write(status_path) {
+        Ok(()) => Outcome::Resolved,
+        Err(error) => stopped_on_persistence(String::new(), &error),
+    };
+    let mut lifecycle = CompletedOnly { report_path };
+    finish(
+        &mut lifecycle,
+        prior_completed,
+        &TicketSet { tickets: Vec::new() },
+        &[],
+        outcome,
+    )
+}
+
+/// The completed-only lifecycle: no ticket work, gate or working-tree diff is
+/// reachable because the initial ready set is empty. It writes only the report.
+struct CompletedOnly<'a> {
+    report_path: &'a Path,
+}
+
+impl Lifecycle for CompletedOnly<'_> {
+    fn work(
+        &mut self,
+        _ticket: &Ticket,
+        _handover: Option<&str>,
+        _contributions: Option<&mut QueueContributions>,
+    ) -> code::Attempt {
+        unreachable!("a completed-only queue runs no ticket work")
+    }
+
+    fn verify(&mut self, _ticket: &Ticket) -> Result<(), String> {
+        unreachable!("a completed-only queue runs no verification gate")
+    }
+
+    fn work_tree_diff(&mut self) -> Result<String, String> {
+        unreachable!("a completed-only queue collects no working-tree diff")
+    }
+
+    fn persist(&mut self, _snapshot: &QueueSnapshot) -> io::Result<()> {
+        unreachable!("a completed-only queue persists its snapshot before this lifecycle is used")
+    }
+
+    fn report(&mut self, markdown: &str) -> io::Result<PathBuf> {
+        fs::write(self.report_path, markdown)?;
+        Ok(self.report_path.to_path_buf())
+    }
+}
+
 /// The queue's accumulator-aware invocation path: the same run as
 /// [`run_with_prior`], with every already-measured contribution -- the model
 /// attempts and executed commands from the production ticket work, and each

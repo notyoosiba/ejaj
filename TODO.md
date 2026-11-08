@@ -16,7 +16,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md) | [x] Complete (T04, T06 done) | `T04`, `T06` | `src/prompts/code.rs`, `src/prompts/tickets.rs` |
 | [`02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md) | [x] Complete (T02, T06, T07 done) | `T02`, `T06`, `T07` | `src/prompts/tickets.rs`, `src/prompts/triage.rs` |
 | [`PROPOSAL-14-pre-planned-task-fast-track.md`](./.plans/PROPOSAL-14-pre-planned-task-fast-track.md) | [x] Complete (T19 done) | `T19` | `src/prompts/plan.rs`, `tests/prompt_contract.rs` |
-| [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | `[ ]` Pending (T07 done; T08 pending) | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
+| [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | [x] Complete (T07, T08 done) | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md) | `[ ]` Pending | `T09` | `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md) | `[ ]` Pending | `T10` | `src/orchestrator.rs`, `src/pipeline.rs` |
 | [`05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md) | `[ ]` Pending | `T11` | `src/tools.rs` |
@@ -62,7 +62,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
       │        [x] [T19] PROPOSAL-14: Fast-track pre-planned & tracker tasks in PLAN_SYSTEM_PROMPT (src/prompts/plan.rs, tests/prompt_contract.rs)
       │          │
       │          ▼
-      │        [ ] [T08] PROPOSAL-1b: Pipeline pre-completion & unblocking for Done tickets (src/pipeline.rs)
+      │        [x] [T08] PROPOSAL-1b: Pipeline pre-completion & unblocking for Done tickets (src/pipeline.rs)
       │          │
       │          ▼
       │        [ ] [T09] PROPOSAL-5: Forward Triage notes & AgentBrief to Code kickoff (src/{triage,orchestrator,pipeline}.rs)
@@ -190,7 +190,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `TODO.md`, mark `T19` complete (`[x]`) in the DAG and ordered backlog and mark `PROPOSAL-14-pre-planned-task-fast-track.md` `[x] Complete (T19 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib prompts && cargo test --test prompt_contract && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T08` — Pipeline Queue Authorization & Pre-Completion for `TriageState::Done` Tickets**
+- [x] **`T08` — Pipeline Queue Authorization & Pre-Completion for `TriageState::Done` Tickets**
   - `depends_on`: `["T07", "T19"]`
   - `unblocks`: `["T09"]`
   - `plans`: [`.plans/PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md)

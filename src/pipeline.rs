@@ -36,7 +36,8 @@ use crate::review::{ReviewReport, render_reviews};
 use crate::specification::Specification;
 use crate::status::{self, OutputCoordinator, OutputKind, OutputSink};
 use crate::tickets::{Ticket, TicketSet};
-use crate::triage::{TRIAGE_ARTIFACT, TriageReport};
+use crate::triage::{TRIAGE_ARTIFACT, TriageReport, TriageState};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -202,11 +203,12 @@ impl Pipeline {
             return step;
         }
 
-        if let Err(step) = self.triage_pass(&plan, &specification, &set, dir) {
-            return step;
-        }
+        let report = match self.triage_pass(&plan, &specification, &set, dir) {
+            Ok(report) => report,
+            Err(step) => return step,
+        };
 
-        let run = match self.queue_and_review(&specification, set, &tickets_dir, dir) {
+        let run = match self.queue_and_review(&specification, set, &report, &tickets_dir, dir) {
             Ok(run) => run,
             Err(step) => return step,
         };
@@ -464,6 +466,7 @@ impl Pipeline {
         &mut self,
         specification: &Specification,
         set: TicketSet,
+        triage: &TriageReport,
         tickets_dir: &Path,
         dir: &Path,
     ) -> Result<RunReview, Step> {
@@ -471,11 +474,15 @@ impl Pipeline {
         // The report sits beside the plan and the specification: the `tickets`
         // directory holds one markdown file per ticket id and nothing else.
         let report_path = dir.join("queue-report.md");
-        let mut progress = ReviewProgress::new(set);
+        let mut progress = ReviewProgress::new(set, triage);
 
         loop {
             progress.queue_round += 1;
-            let result = self.run_queue_round(&progress, dir, &status_path, &report_path);
+            let result = if progress.current_set.tickets.is_empty() {
+                self.record_precompleted_round(&progress, &status_path, &report_path)
+            } else {
+                self.run_queue_round(&progress, dir, &status_path, &report_path)
+            };
 
             match &result.outcome {
                 orchestrator::Outcome::Resolved => {}
@@ -540,6 +547,19 @@ impl Pipeline {
                 }
             }
         }
+    }
+
+    /// Record an initial set whose every draft ticket was triaged done: no
+    /// ticket, gate or code-agent request runs, but the cumulative status and
+    /// report are still generated for the review and summary phases.
+    fn record_precompleted_round(
+        &self,
+        progress: &ReviewProgress,
+        status_path: &Path,
+        report_path: &Path,
+    ) -> orchestrator::QueueResult {
+        let _ = status::shared().stdout_log("\n=== Ticket queue ===\n");
+        orchestrator::record_precompleted(&progress.prior_completed, status_path, report_path)
     }
 
     /// Invoke one queue round and report its total and residual elapsed lines.
@@ -862,7 +882,7 @@ fn triage_blockers(report: &TriageReport) -> String {
     let blockers: Vec<String> = report
         .tickets
         .iter()
-        .filter(|classification| !classification.state.is_ready())
+        .filter(|classification| !classification.state.authorizes_queue())
         .map(|classification| {
             let explanation = classification
                 .blocker_explanation
@@ -951,18 +971,20 @@ fn flush_queue_failure(
 }
 
 /// Whether the validated triage report authorizes the queue: every draft ticket
-/// classified, and every classification `ready-for-agent`.
+/// classified, and every classification authorizes queue progress.
 ///
 /// The report is the only authority. The check reads the typed report and never
 /// the model's markdown or narration, so no prose can authorize a run the
-/// boundary refused, and a single non-ready classification -- a ticket needing a
-/// human answer, or a `wontfix` -- blocks the whole set.
+/// boundary refused, and a single non-authorizing classification -- a ticket
+/// needing a human answer, a missing answer, or a `wontfix` -- blocks the whole
+/// set. A `done` classification authorizes progress and is recorded as already
+/// completed work.
 fn authorizes_queue(report: &TriageReport) -> bool {
     !report.tickets.is_empty()
         && report
             .tickets
             .iter()
-            .all(|classification| classification.state.is_ready())
+            .all(|classification| classification.state.authorizes_queue())
 }
 
 /// How the bounded queue-and-review loop ended.
@@ -1013,14 +1035,43 @@ struct ReviewProgress {
 }
 
 impl ReviewProgress {
-    /// Seed the loop from the original draft set, keeping all executed tickets
-    /// for the summary's generated-id gate.
-    fn new(set: TicketSet) -> ReviewProgress {
+    /// Partition the original draft set against the validated triage report,
+    /// keeping draft order. Done tickets seed the prior-completed list; ready
+    /// tickets form the initial queue set with only Done ids removed from their
+    /// in-memory blockers. Every original ticket is retained for review and the
+    /// summary's generated-id gate.
+    fn new(set: TicketSet, triage: &TriageReport) -> ReviewProgress {
         let all_tickets = set.tickets.clone();
+        let states: HashMap<&str, TriageState> = triage
+            .tickets
+            .iter()
+            .map(|classification| (classification.ticket_id.trim(), classification.state))
+            .collect();
+        let done: HashSet<&str> = triage
+            .tickets
+            .iter()
+            .filter(|classification| classification.state == TriageState::Done)
+            .map(|classification| classification.ticket_id.trim())
+            .collect();
+        let mut prior_completed = Vec::new();
+        let mut current = Vec::new();
+        for ticket in set.tickets {
+            match states.get(ticket.id.trim()) {
+                Some(TriageState::Done) => prior_completed.push(ticket),
+                Some(TriageState::ReadyForAgent) => {
+                    let mut ticket = ticket;
+                    ticket.blocked_by.retain(|id| !done.contains(id.trim()));
+                    current.push(ticket);
+                }
+                // The validated report authorizes only these two states before
+                // the loop starts, so no other state can reach the queue.
+                Some(_) | None => {}
+            }
+        }
         ReviewProgress {
-            prior_completed: Vec::new(),
+            prior_completed,
             all_tickets,
-            current_set: set,
+            current_set: TicketSet { tickets: current },
             reviews: Vec::new(),
             review_markdown: String::new(),
             review_round: 0,
