@@ -19,7 +19,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | [x] Complete (T07, T08 done) | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md) | [x] Complete (T09 done) | `T09` | `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md) | `[x]` Complete (T10 done) | `T10` | `src/orchestrator.rs`, `src/pipeline.rs` |
-| [`05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md) | `[ ]` Pending | `T11` | `src/tools.rs` |
+| [`05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md) | `[x]` Complete (T11 done) | `T11` | `src/tools.rs` |
 | [`09-file-editing-and-patch-matching.md`](./.plans/09-file-editing-and-patch-matching.md) | `[ ]` Pending | `T12` | `src/script.rs` |
 | [`12-http-retry-and-overload-resilience.md`](./.plans/12-http-retry-and-overload-resilience.md) | `[ ]` Pending | `T13` | `src/retry.rs` |
 | [`07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md) | `[ ]` Pending | `T14`, `T15` | `src/api.rs`, `src/llm/`, `src/loops/agent.rs` |
@@ -71,7 +71,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
       │        [x] [T10] PROPOSAL-7: Gate failure excerpts in queue-report.md (src/{orchestrator,pipeline}.rs)
       │          │
       │          └──────────────────────────┐
-      ├──► [ ] [T11] 05: Shell process-group kill & timeout spill (src/tools.rs) ──────────────┐
+      ├──► [x] [T11] 05: Shell process-group kill & timeout spill (src/tools.rs) ──────────────┐
       ├──► [ ] [T12] 09: CRLF tools.replace & grep line cap (src/script.rs)                    │
       ├──► [ ] [T13] 12: HTTP 408, permanent 429 fast-fail & retry-after hints (src/retry.rs) ─┼──┐
       └──► [ ] [T14] 07a: Output-token truncation detection across providers (src/api.rs, llm) │  │
@@ -223,7 +223,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `TODO.md`, mark `T10` complete (`[x]`) in the DAG and ordered backlog and mark `PROPOSAL-7-gate-failure-excerpt-in-queue-report.md` `[x] Complete (T10 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib orchestrator && cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T11` — Shell Execution Hardening (Process-Group Isolation, Partial Timeout Output, & Non-Interactive Env)**
+- [x] **`T11` — Shell Execution Hardening (Process-Group Isolation, Partial Timeout Output, & Non-Interactive Env)**
   - `depends_on`: `["T06"]`
   - `unblocks`: `["T18"]`
   - `plans`: [`.plans/05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md)

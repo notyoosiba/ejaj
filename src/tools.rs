@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -62,6 +62,24 @@ pub const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 /// The fixed pause between `try_wait` checks: short enough to notice a finished
 /// command promptly, long enough not to spin a core.
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// The longest any unresolved stream reader may take to report after a timed-out
+/// process group has been terminated. Each stream gets this grace independently.
+const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(200);
+
+/// The non-interactive environment every spawned Bash command receives. The
+/// values are forced, so an inherited value can never re-enable a prompt, a
+/// pager, or a progress display.
+const NON_INTERACTIVE_ENV: [(&str, &str); 8] = [
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("LESS", "-R"),
+    ("CARGO_TERM_PROGRESS_WHEN", "never"),
+    ("PIP_PROGRESS_BAR", "off"),
+    ("TQDM_DISABLE", "1"),
+];
 
 /// The public identity of one dispatch through the agent loop: the one-based
 /// model step and the one-based index of this Bash call within that step. The
@@ -758,19 +776,60 @@ impl Tool {
 /// error shape -- and the two paths cannot diverge. The gate's complete output is returned: it is
 /// not a model result, so the delivery cap and the spill area do not apply to it.
 pub fn run_command_in(root: &Path, command: &str) -> Result<String, String> {
-    let output = shell_output_in(root, command)?;
+    render_verification_outcome(command, shell_output_in(root, command)?)
+}
 
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
+/// Run one verification command with an explicit deadline. This private seam
+/// keeps the short-deadline real-process tests on exactly the rendering path
+/// the production gate uses, so it only exists for those tests.
+#[cfg(test)]
+fn run_command_with_timeout_in(
+    root: &Path,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    render_verification_outcome(command, shell_output_with_timeout(root, command, timeout)?)
+}
 
-    if output.status.success() {
-        Ok(text)
-    } else {
-        let code = output.status.code().unwrap_or(-1);
-        Err(format!(
-            "[ERROR: exit code {} for `{}`]\n{}",
-            code, command, text
-        ))
+/// Run one verification command whose real Bash child has already exited
+/// before the initial poll. This private seam keeps the zero-deadline
+/// acceptance test deterministic without granting production a polling window.
+#[cfg(test)]
+fn run_command_with_zero_deadline_after_exit_in(
+    root: &Path,
+    command: &str,
+) -> Result<String, String> {
+    render_verification_outcome(
+        command,
+        shell_output_with_timeout_after_exit(root, command, Duration::ZERO)?,
+    )
+}
+
+/// Render one shared-runner outcome the way the verification gate reports it:
+/// successful output is stdout followed by stderr, an ordinary failure keeps
+/// its actual exit code, and a timeout keeps its established full-command
+/// header with any partial output appended on a new line.
+fn render_verification_outcome(command: &str, outcome: ShellOutcome) -> Result<String, String> {
+    let mut text = String::from_utf8_lossy(&outcome.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&outcome.stderr));
+
+    match outcome.status {
+        Some(status) if status.success() => Ok(text),
+        Some(status) => {
+            let code = status.code().unwrap_or(-1);
+            Err(format!(
+                "[ERROR: exit code {} for `{}`]\n{}",
+                code, command, text
+            ))
+        }
+        None => {
+            let header = shell_timeout(command, outcome.timeout);
+            if text.is_empty() {
+                Err(header)
+            } else {
+                Err(format!("{header}\n{text}"))
+            }
+        }
     }
 }
 
@@ -791,43 +850,177 @@ fn no_args(arguments: &str) -> bool {
     trimmed.is_empty() || trimmed == "null" || trimmed == "{}"
 }
 
+/// The structured result of one shell execution: `Some(status)` when Bash was
+/// observed to exit within the deadline, `None` when the deadline expired (or a
+/// descendant kept a pipe open), plus the configured deadline and the captured
+/// stdout-then-stderr bytes.
+#[derive(Debug)]
+struct ShellOutcome {
+    status: Option<ExitStatus>,
+    timeout: Duration,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 /// Run `command` through `bash -c` in `root` with the shared deadline,
-/// capturing stdout, stderr and the exit code. Both the model's `bash` tool and
-/// the verification gate enter here, so neither can wait indefinitely and the
-/// two paths cannot diverge.
-fn shell_output_in(root: &Path, command: &str) -> Result<Output, String> {
+/// capturing stdout, stderr and the exit status. The verification gate and any
+/// caller that wants the shared deadline enter here; the model's `bash` tool
+/// supplies its own deadline through the same `shell_output_with_timeout`
+/// runner, so neither path can wait indefinitely and the two cannot diverge.
+fn shell_output_in(root: &Path, command: &str) -> Result<ShellOutcome, String> {
     shell_output_with_timeout(root, command, SHELL_TIMEOUT)
 }
 
 /// Run `command` through `bash -c` in `root`, capturing stdout, stderr and the
-/// exit code while bounding the wait to `timeout`.
+/// exit status while bounding the wait to `timeout`.
 ///
 /// Stdin is explicitly closed so a command that reads it observes end-of-file
 /// instead of waiting for the caller's terminal. Both streams are piped and
 /// drained on their own threads, so a command that writes more than a pipe
-/// buffer to either stream cannot deadlock against the poll loop. A command
-/// still running when the deadline passes is killed and reaped, and the caller
-/// receives the established `exit code -1` error shape describing the timeout.
-/// A failed spawn keeps that same prefix followed by its cause.
+/// buffer to either stream cannot deadlock against the poll loop.
+///
+/// On Unix the Bash child leads its own process group. When the deadline
+/// expires -- or a descendant keeps an output pipe open after Bash exits -- the
+/// whole group is killed before the readers are drained, so no orphaned
+/// descendant outlives the command. Each unresolved reader then gets a bounded
+/// grace to report the bytes it captured before the pipe closed.
 fn shell_output_with_timeout(
     root: &Path,
     command: &str,
     timeout: Duration,
-) -> Result<Output, String> {
-    let mut child = Command::new("bash")
-        .arg("-c")
-        .arg(command)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| shell_failure(command, error))?;
+) -> Result<ShellOutcome, String> {
+    let mut child = spawn_shell(root, command)?;
 
     // The deadline starts at a successful spawn, so a slow spawn is never
     // charged to the command's own budget.
     let started = Instant::now();
 
+    collect_shell_output(&mut child, command, timeout, started)
+}
+
+/// Spawn one Bash command with the shared invocation settings.
+fn spawn_shell(root: &Path, command: &str) -> Result<Child, String> {
+    shell_command(root, command)
+        .spawn()
+        .map_err(|error| shell_failure(command, error))
+}
+
+/// Collect a spawned child's status and captured streams under `timeout`.
+///
+/// The status is observed before any polling sleep, so a zero deadline either
+/// accepts an exit the initial poll sees or times out a running child without
+/// granting it a grace window. An observed exit is a success only when both
+/// readers have completed by the deadline; either unresolved reader makes the
+/// outcome a timeout. A reader observation waits only for what remains of the
+/// shared deadline; once that expires the process group is terminated before
+/// the child is killed/reaped and each unresolved reader is drained.
+fn collect_shell_output(
+    child: &mut Child,
+    command: &str,
+    timeout: Duration,
+    started: Instant,
+) -> Result<ShellOutcome, String> {
+    let stdout = child
+        .stdout
+        .take()
+        .expect("piped stdout should be available after spawn");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("piped stderr should be available after spawn");
+    collect_shell_output_with_readers(
+        child,
+        command,
+        timeout,
+        started,
+        Some(spawn_stream_reader(stdout)),
+        Some(spawn_stream_reader(stderr)),
+    )
+}
+
+/// Collect a child's status and already-started stream readers under `timeout`.
+fn collect_shell_output_with_readers(
+    child: &mut Child,
+    command: &str,
+    timeout: Duration,
+    started: Instant,
+    mut stdout_reader: Option<Receiver<std::io::Result<Vec<u8>>>>,
+    mut stderr_reader: Option<Receiver<std::io::Result<Vec<u8>>>>,
+) -> Result<ShellOutcome, String> {
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(error) => {
+                terminate_process_tree(child);
+                return Err(shell_failure(command, error));
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            break None;
+        }
+
+        std::thread::sleep(SHELL_POLL_INTERVAL);
+    };
+
+    // A still-running child at the deadline is already the timeout, so its
+    // process group is terminated before the readers are drained. An observed
+    // exit stays a success only when both readers have already reported; a zero
+    // deadline therefore accepts a child whose readers completed while Bash was
+    // exiting, but a descendant-held pipe that leaves a reader unresolved turns
+    // the same observation into a timeout.
+    let mut timed_out = status.is_none();
+
+    if timed_out {
+        terminate_process_tree(child);
+    }
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if status.is_some() {
+        let wait = remaining_deadline(started, timeout);
+        if observe_stream(&mut stdout_reader, &mut stdout, command, wait)? {
+            timed_out = true;
+            terminate_process_tree(child);
+        } else {
+            let wait = remaining_deadline(started, timeout);
+            if observe_stream(&mut stderr_reader, &mut stderr, command, wait)? {
+                timed_out = true;
+                terminate_process_tree(child);
+            }
+        }
+    }
+
+    // A reader that reported already supplied its bytes above; the remaining
+    // entries are exactly the unresolved readers, each of which gets one
+    // bounded post-kill grace.
+    if let Some(reader) = stdout_reader.take() {
+        stdout = drain_stream_on_timeout(reader);
+    }
+    if let Some(reader) = stderr_reader.take() {
+        stderr = drain_stream_on_timeout(reader);
+    }
+
+    Ok(ShellOutcome {
+        status: if timed_out { None } else { status },
+        timeout,
+        stdout,
+        stderr,
+    })
+}
+
+/// Run one command whose real Bash child has already exited before the initial
+/// poll, so the zero-deadline acceptance path can be exercised without granting
+/// production a polling window. Test-only.
+#[cfg(test)]
+fn shell_output_with_timeout_after_exit(
+    root: &Path,
+    command: &str,
+    timeout: Duration,
+) -> Result<ShellOutcome, String> {
+    let mut child = spawn_shell(root, command)?;
+    let started = Instant::now();
     let stdout = child
         .stdout
         .take()
@@ -838,45 +1031,74 @@ fn shell_output_with_timeout(
         .expect("piped stderr should be available after spawn");
     let stdout_reader = spawn_stream_reader(stdout);
     let stderr_reader = spawn_stream_reader(stderr);
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(shell_failure(command, error));
-            }
-        }
-
-        // A zero deadline therefore permits no polling wait: an already-exited
-        // child was observed above, and a running one is terminated here.
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(shell_timeout(command, timeout));
-        }
-
-        std::thread::sleep(SHELL_POLL_INTERVAL);
-    };
-
-    // The child's exit status is not enough: a descendant can keep an output
-    // pipe open after Bash itself has exited. Waiting for the readers under the
-    // same overall deadline keeps that case bounded instead of blocking forever
-    // in a thread join.
-    let stdout = collect_stream(stdout_reader, command, started, timeout)?;
-    let stderr = collect_stream(stderr_reader, command, started, timeout)?;
-
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
+    // Let the real child reach its exit without reaping it while its readers
+    // run exactly as they do in production. The collector's initial `try_wait`
+    // then observes `Some` with readers that have already completed.
+    std::thread::sleep(Duration::from_millis(50));
+    collect_shell_output_with_readers(
+        &mut child,
+        command,
+        timeout,
+        started,
+        Some(stdout_reader),
+        Some(stderr_reader),
+    )
 }
 
-/// The failure shape a run that never produced an exit status reports. A spawn
-/// failure and a timeout share it, and the cause follows the prefix.
+/// Build one Bash invocation with the shared working directory, closed stdin,
+/// piped output, non-interactive environment and, on Unix, its own process
+/// group.
+fn shell_command(root: &Path, command: &str) -> Command {
+    let mut shell = Command::new("bash");
+    shell
+        .arg("-c")
+        .arg(command)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in NON_INTERACTIVE_ENV {
+        shell.env(key, value);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        shell.process_group(0);
+    }
+    shell
+}
+
+/// Terminate the shell process tree and reap Bash. On Unix the child leads its
+/// own group, so the group is signalled first; other platforms retain the
+/// child-only kill.
+fn terminate_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    kill_process_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Signal the process group led by `id` to terminate on Unix.
+#[cfg(unix)]
+fn kill_process_group(id: u32) {
+    const SIGKILL: i32 = 9;
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let Ok(pgid) = i32::try_from(id) else {
+        return;
+    };
+    // SAFETY: `kill` is the POSIX signal primitive. A negative pid addresses
+    // the process group whose id is its absolute value, which is exactly the
+    // group `process_group(0)` made Bash lead. The call has no memory-safety
+    // preconditions and its result is intentionally ignored.
+    unsafe {
+        let _ = kill(-pgid, SIGKILL);
+    }
+}
+
+/// The failure shape a spawn, read or process error reports. The cause follows
+/// the established prefix.
 fn shell_failure(command: &str, cause: impl std::fmt::Display) -> String {
     format!("[ERROR: exit code -1 for `{command}`]\n{cause}")
 }
@@ -907,26 +1129,50 @@ fn spawn_stream_reader(
     receiver
 }
 
-/// Wait for one stream reader's outcome until the shell's overall deadline.
-///
-/// A reader that finishes promptly yields its complete bytes. A read error or a
-/// reader thread that disappears before reporting yields the established
-/// failure prefix, and a read still blocked at the deadline yields the exact
-/// timeout error rather than partial bytes.
-fn collect_stream(
-    reader: Receiver<std::io::Result<Vec<u8>>>,
+/// The wait one stream observation gets: only what remains of the command's
+/// shared deadline. The post-timeout drain grace is granted separately, after
+/// the process group has been terminated.
+fn remaining_deadline(started: Instant, timeout: Duration) -> Duration {
+    timeout.saturating_sub(started.elapsed())
+}
+
+/// Observe one stream reader. A prompt report yields its complete bytes; a read
+/// error or a vanished reader yields the established failure shape. Returns
+/// `true` when the reader is still unresolved, leaving it in `slot` for the
+/// post-kill drain.
+fn observe_stream(
+    slot: &mut Option<Receiver<std::io::Result<Vec<u8>>>>,
+    bytes: &mut Vec<u8>,
     command: &str,
-    started: Instant,
-    timeout: Duration,
-) -> Result<Vec<u8>, String> {
-    match reader.recv_timeout(timeout.saturating_sub(started.elapsed())) {
-        Ok(Ok(bytes)) => Ok(bytes),
+    wait: Duration,
+) -> Result<bool, String> {
+    let Some(reader) = slot.take() else {
+        return Ok(false);
+    };
+    match reader.recv_timeout(wait) {
+        Ok(Ok(captured)) => {
+            *bytes = captured;
+            Ok(false)
+        }
         Ok(Err(error)) => Err(shell_failure(command, error)),
-        Err(RecvTimeoutError::Timeout) => Err(shell_timeout(command, timeout)),
+        Err(RecvTimeoutError::Timeout) => {
+            *slot = Some(reader);
+            Ok(true)
+        }
         Err(RecvTimeoutError::Disconnected) => Err(shell_failure(
             command,
             "the output stream reader stopped before reporting",
         )),
+    }
+}
+
+/// Give one unresolved reader the bounded post-kill grace and keep whatever
+/// bytes it reported. A reader that does not report within the grace
+/// contributes no bytes.
+fn drain_stream_on_timeout(reader: Receiver<std::io::Result<Vec<u8>>>) -> Vec<u8> {
+    match reader.recv_timeout(STREAM_DRAIN_GRACE) {
+        Ok(Ok(bytes)) => bytes,
+        _ => Vec::new(),
     }
 }
 
@@ -945,16 +1191,46 @@ fn bash_in(
     context: ToolContext,
     session_dir: Option<&Path>,
 ) -> Result<String, String> {
-    let output = shell_output_in(root, &args.command)?;
+    bash_in_with_timeout(root, args, context, session_dir, SHELL_TIMEOUT)
+}
 
-    let mut raw = Vec::with_capacity(output.stdout.len() + output.stderr.len());
-    raw.extend_from_slice(&output.stdout);
-    raw.extend_from_slice(&output.stderr);
+/// Run one model-issued Bash command under an explicit deadline, bounding what
+/// the model receives.
+///
+/// Successful and ordinarily failing commands keep the existing rendering and
+/// spill contract. A timeout keeps the bounded command display followed by the
+/// captured partial output when the complete response fits the delivery cap;
+/// otherwise the complete raw stdout-then-stderr bytes are spilled to the
+/// explicitly supplied session and the model gets a digest bounded by the room
+/// the header and its separator leave.
+fn bash_in_with_timeout(
+    root: &Path,
+    args: &BashArgs,
+    context: ToolContext,
+    session_dir: Option<&Path>,
+    timeout: Duration,
+) -> Result<String, String> {
+    let outcome = shell_output_with_timeout(root, &args.command, timeout)?;
+
+    let mut raw = Vec::with_capacity(outcome.stdout.len() + outcome.stderr.len());
+    raw.extend_from_slice(&outcome.stdout);
+    raw.extend_from_slice(&outcome.stderr);
 
     let oversized = raw.len() > TOOL_OUTPUT_LIMIT_BYTES;
     let rendered = (!oversized).then(|| String::from_utf8_lossy(&raw).into_owned());
 
-    if output.status.success() {
+    let Some(status) = outcome.status else {
+        return Err(render_bash_timeout(
+            root,
+            &args.command,
+            context,
+            session_dir,
+            outcome.timeout,
+            &raw,
+        ));
+    };
+
+    if status.success() {
         return Ok(match rendered {
             Some(text) => text,
             None => spill_and_digest(
@@ -968,7 +1244,7 @@ fn bash_in(
         });
     }
 
-    let code = output.status.code().unwrap_or(-1);
+    let code = status.code().unwrap_or(-1);
     let prefix = bash_failure_prefix(code, &args.command);
     let text = match rendered {
         Some(text) => text,
@@ -980,6 +1256,50 @@ fn bash_in(
         }
     };
     Err(format!("{prefix}{text}"))
+}
+
+/// Render the model-facing result of a timed-out Bash command.
+///
+/// The header keeps the established shape and the same bounded command display
+/// an ordinary failure uses. Empty partial output adds no separator and writes
+/// no spill. Non-empty output follows the header on a new line when both its
+/// raw bytes and its lossy rendering fit the delivery cap; otherwise the
+/// complete raw bytes are spilled and the digest is bounded by what the header
+/// and separator leave.
+fn render_bash_timeout(
+    root: &Path,
+    command: &str,
+    context: ToolContext,
+    session_dir: Option<&Path>,
+    timeout: Duration,
+    raw: &[u8],
+) -> String {
+    let header = bash_timeout_header(command, timeout);
+    if raw.is_empty() {
+        return header;
+    }
+
+    let rendered = String::from_utf8_lossy(raw);
+    let fixed = header.len() + 1;
+    if raw.len() <= TOOL_OUTPUT_LIMIT_BYTES && fixed + rendered.len() <= TOOL_OUTPUT_LIMIT_BYTES {
+        return format!("{header}\n{rendered}");
+    }
+
+    let budget = TOOL_OUTPUT_LIMIT_BYTES.saturating_sub(fixed);
+    let digest = spill_and_digest(root, raw, command, context, session_dir, budget);
+    format!("{header}\n{digest}")
+}
+
+/// The exact timeout header a model-facing Bash result carries. The quoted
+/// command shares the ordinary failure display's UTF-8-safe 512-byte limit so a
+/// long timed-out command cannot push the header past the delivery cap; the
+/// complete command stays in any spill file.
+fn bash_timeout_header(command: &str, timeout: Duration) -> String {
+    format!(
+        "{}command timed out after {}s",
+        bash_failure_prefix(-1, command),
+        timeout.as_secs()
+    )
 }
 
 /// The command failure information a Bash tool error begins with. The quoted
@@ -1862,6 +2182,33 @@ mod tests {
         )
     }
 
+    /// Run one real Bash command through the model-facing entry point with an
+    /// explicit sub-second deadline, so timeout rendering and spilling are
+    /// exercised exactly as the caller sees them.
+    fn run_bash_tool_with_timeout(
+        root: &std::path::Path,
+        session: Option<&std::path::Path>,
+        command: &str,
+        step: usize,
+        call_index: usize,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        bash_in_with_timeout(
+            root,
+            &BashArgs {
+                command: command.to_string(),
+            },
+            ToolContext { step, call_index },
+            session,
+            timeout,
+        )
+    }
+
+    /// The established timeout header with an untruncated command display.
+    fn timeout_header(command: &str, seconds: u64) -> String {
+        format!("[ERROR: exit code -1 for `{command}`]\ncommand timed out after {seconds}s")
+    }
+
     /// The one-line command that prints exactly the requested number of bytes.
     fn repeat_command(byte: char, bytes: usize) -> String {
         format!("printf '%{bytes}s' '' | tr ' ' '{byte}'")
@@ -2499,7 +2846,7 @@ mod tests {
     /// Authorisation boundary: a read-only pass never gains the Bash tool, no
     /// matter that a session spill area now exists beside it.
     #[test]
-    fn when_bash_is_requested_given_read_only_phase_then_remains_forbidden() {
+    fn when_requesting_bash_given_read_only_phase_then_rejects_before_execution() {
         for phase in [
             Phase::Plan,
             Phase::Spec,
@@ -2555,6 +2902,432 @@ mod tests {
         assert!(
             raw.starts_with(format!("Command:\n{command}\n\nOutput:\n").as_bytes()),
             "the long command must not be truncated in the preamble"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Core entry-point behavior; minimum valid boundary: a real model-facing
+    /// Bash timeout preserves partial stdout and stderr while the process-group
+    /// kill keeps a background descendant from writing after the deadline.
+    #[test]
+    fn when_running_bash_given_background_descendant_and_timeout_then_kills_process_group_and_returns_partial_output()
+     {
+        let root = scratch_dir("bash-timeout-descendant");
+        let session = session_at(&root, "run");
+        let marker = root.join("late-marker");
+        let command = format!(
+            "( sleep 1; printf 'LATE' > '{}' ) &\nprintf 'PARTIAL-OUT\\n'\nprintf 'PARTIAL-ERR\\n' >&2\nexec sleep 5",
+            marker.display()
+        );
+        let timeout = std::time::Duration::from_millis(100);
+
+        let started = std::time::Instant::now();
+        let result = run_bash_tool_with_timeout(&root, Some(&session), &command, 1, 1, timeout);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "{}\nPARTIAL-OUT\nPARTIAL-ERR\n",
+                timeout_header(&command, 0)
+            )),
+            "the timeout must keep its header and append partial stdout then stderr"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the timeout and reader drain must stay bounded, took {elapsed:?}"
+        );
+        assert!(
+            !session.exists(),
+            "in-cap partial output must not create a spill"
+        );
+
+        #[cfg(unix)]
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1_200));
+            assert!(
+                !marker.exists(),
+                "a background descendant must not survive the process-group kill"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Core entry-point behavior; maximum limit boundary: an oversized partial
+    /// timeout result spills the exact raw stdout-then-stderr bytes under the
+    /// explicitly supplied session and returns a bounded digest.
+    #[test]
+    fn when_running_bash_given_oversized_partial_output_before_timeout_then_spills_and_returns_bounded_digest()
+     {
+        let root = scratch_dir("bash-timeout-oversized");
+        let session = session_at(&root, "run-77");
+        let command = "printf 'HEAD-MARK\\n'; printf '[ERROR] demo failure\\n'; printf 'x%.0s' {1..20000}; printf '\\nTAIL-MARK\\n'; printf 'STDERR-MARK\\n' >&2; exec sleep 5";
+
+        let result = run_bash_tool_with_timeout(
+            &root,
+            Some(&session),
+            command,
+            77,
+            2,
+            std::time::Duration::from_millis(100),
+        )
+        .expect_err("a timed-out command must report a tool error");
+
+        assert!(
+            result.starts_with(&format!("{}\n", timeout_header(command, 0))),
+            "the timeout header must precede the digest: {result:?}"
+        );
+        assert!(
+            result.len() <= TOOL_OUTPUT_LIMIT_BYTES,
+            "the timeout result is {} bytes, over the delivery cap",
+            result.len()
+        );
+        assert!(
+            result.contains(".ejaj/run-77/tools-output/step-77-call-2.log"),
+            "the digest must name the explicit session spill path: {result:?}"
+        );
+        assert!(
+            result.contains("HEAD-MARK") && result.contains("TAIL-MARK"),
+            "the digest must keep a UTF-8-safe head and tail: {result:?}"
+        );
+        assert!(
+            result.contains("[ERROR] demo failure"),
+            "the digest must keep the extracted diagnostics: {result:?}"
+        );
+        assert!(
+            result.contains("STDERR-MARK"),
+            "the digest must account for both captured streams: {result:?}"
+        );
+
+        let expected_output = format!(
+            "HEAD-MARK\n[ERROR] demo failure\n{}\nTAIL-MARK\nSTDERR-MARK\n",
+            "x".repeat(20_000)
+        );
+        let spill = session_output(&session).join("step-77-call-2.log");
+        assert_eq!(
+            std::fs::read(&spill).expect("the spill file must exist"),
+            spilled_bytes(command, expected_output.as_bytes()),
+            "the spill must carry the exact command and raw stdout-then-stderr bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Edge-case table; empty boundary: a timeout with no captured bytes adds
+    /// no separator and creates no spill file.
+    #[test]
+    fn when_running_bash_given_empty_partial_output_and_timeout_then_returns_header_without_separator_or_spill()
+     {
+        let root = scratch_dir("bash-timeout-empty");
+        let session = session_at(&root, "run");
+        let command = "exec sleep 5";
+
+        let result = run_bash_tool_with_timeout(
+            &root,
+            Some(&session),
+            command,
+            1,
+            1,
+            std::time::Duration::from_millis(50),
+        )
+        .expect_err("a timed-out command must report a tool error");
+
+        assert_eq!(
+            result,
+            timeout_header(command, 0),
+            "empty partial output must leave the header alone"
+        );
+        assert!(
+            !result.ends_with('\n'),
+            "empty partial output must add no separator: {result:?}"
+        );
+        assert!(
+            !session.exists(),
+            "empty partial output must create no session or spill"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Edge-case table; minimum valid boundary: a positive sub-second deadline
+    /// preserves the single captured byte after the header.
+    #[test]
+    fn when_running_bash_given_one_byte_partial_output_and_positive_timeout_then_preserves_the_byte()
+     {
+        let root = scratch_dir("bash-timeout-one-byte");
+        let session = session_at(&root, "run");
+        let command = "printf 'Z'; exec sleep 5";
+
+        let result = run_bash_tool_with_timeout(
+            &root,
+            Some(&session),
+            command,
+            2,
+            1,
+            std::time::Duration::from_millis(50),
+        )
+        .expect_err("a timed-out command must report a tool error");
+
+        assert_eq!(
+            result,
+            format!("{}\nZ", timeout_header(command, 0)),
+            "the one captured byte must follow the header on a new line"
+        );
+        assert!(!session.exists(), "in-cap output must not spill");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Edge-case table; maximum limit boundary: output of exactly the raw cap,
+    /// one byte over it, and a command past the display limit all spill so the
+    /// header plus the result stay within the delivery cap.
+    #[test]
+    fn when_running_bash_given_exact_limit_partial_output_and_timeout_header_then_spills_to_fit_result_cap()
+     {
+        let limit = TOOL_OUTPUT_LIMIT_BYTES;
+        let timeout = std::time::Duration::from_millis(100);
+
+        let exact_root = scratch_dir("bash-timeout-exact-limit");
+        let exact_session = session_at(&exact_root, "exact");
+        let exact_command = format!("{}; exec sleep 5", repeat_command('a', limit));
+        let result = run_bash_tool_with_timeout(
+            &exact_root,
+            Some(&exact_session),
+            &exact_command,
+            3,
+            4,
+            timeout,
+        )
+        .expect_err("a timed-out command must report a tool error");
+
+        assert!(
+            result.starts_with(&format!("{}\n", timeout_header(&exact_command, 0))),
+            "the exact-limit timeout must keep its header: {result:?}"
+        );
+        assert!(
+            result.len() <= limit,
+            "the exact-limit result is {} bytes",
+            result.len()
+        );
+        assert!(
+            result.contains(".ejaj/exact/tools-output/step-3-call-4.log"),
+            "the exact-limit digest must name the session spill: {result:?}"
+        );
+        let exact_spill = session_output(&exact_session).join("step-3-call-4.log");
+        assert_eq!(
+            std::fs::read(&exact_spill).expect("the exact-limit spill must exist"),
+            spilled_bytes(&exact_command, "a".repeat(limit).as_bytes()),
+            "the exact-limit spill must carry the complete raw bytes"
+        );
+        let _ = std::fs::remove_dir_all(&exact_root);
+
+        let over_root = scratch_dir("bash-timeout-one-over");
+        let over_session = session_at(&over_root, "over");
+        let over_command = format!("{}; exec sleep 5", repeat_command('b', limit + 1));
+        let result = run_bash_tool_with_timeout(
+            &over_root,
+            Some(&over_session),
+            &over_command,
+            3,
+            4,
+            timeout,
+        )
+        .expect_err("a timed-out command must report a tool error");
+
+        assert!(
+            result.starts_with(&format!("{}\n", timeout_header(&over_command, 0))),
+            "the one-byte-over timeout must keep its header: {result:?}"
+        );
+        assert!(
+            result.len() <= limit,
+            "the one-byte-over result is {} bytes",
+            result.len()
+        );
+        let over_spill = session_output(&over_session).join("step-3-call-4.log");
+        assert_eq!(
+            std::fs::read(&over_spill).expect("the one-byte-over spill must exist"),
+            spilled_bytes(&over_command, "b".repeat(limit + 1).as_bytes()),
+            "the one-byte-over spill must carry the complete raw bytes"
+        );
+        let _ = std::fs::remove_dir_all(&over_root);
+
+        let long_root = scratch_dir("bash-timeout-long-command");
+        let long_session = session_at(&long_root, "long");
+        let filler = "x".repeat(600);
+        let long_command = format!(
+            ": '{}'; {}; exec sleep 5",
+            filler,
+            repeat_command('c', limit)
+        );
+        assert!(long_command.len() > BASH_FAILURE_COMMAND_BYTES);
+        let result = run_bash_tool_with_timeout(
+            &long_root,
+            Some(&long_session),
+            &long_command,
+            3,
+            4,
+            timeout,
+        )
+        .expect_err("a timed-out command must report a tool error");
+
+        let shown = format!(": '{}...", "x".repeat(509));
+        let expected_header =
+            format!("[ERROR: exit code -1 for `{shown}`]\ncommand timed out after 0s");
+        assert!(
+            result.starts_with(&format!("{expected_header}\n")),
+            "a long command display must be truncated at 512 UTF-8 bytes with an ellipsis: {result:?}"
+        );
+        assert!(
+            !result.contains(&filler),
+            "the bounded header must not carry the whole long command: {result:?}"
+        );
+        assert!(
+            result.len() <= limit,
+            "the long-command result is {} bytes",
+            result.len()
+        );
+        let long_spill = session_output(&long_session).join("step-3-call-4.log");
+        let spill_bytes = std::fs::read(&long_spill).expect("the long-command spill must exist");
+        assert_eq!(
+            spill_bytes,
+            spilled_bytes(&long_command, "c".repeat(limit).as_bytes()),
+            "the spill must carry the untruncated command and complete raw bytes"
+        );
+        assert!(
+            spill_bytes.starts_with(format!("Command:\n{long_command}\n\nOutput:\n").as_bytes()),
+            "the spill must preserve the complete command"
+        );
+        let _ = std::fs::remove_dir_all(&long_root);
+    }
+
+    /// Contract and invariant; malformed payload boundary: invalid UTF-8 output
+    /// bytes are spilled verbatim while the returned text stays valid and
+    /// bounded.
+    #[test]
+    fn when_running_bash_given_invalid_utf8_partial_output_and_timeout_then_spills_original_bytes_and_returns_valid_bounded_text()
+     {
+        let root = scratch_dir("bash-timeout-invalid-utf8");
+        let session = session_at(&root, "invalid");
+        let command = "head -c 20000 /dev/zero | tr '\\0' '\\377'; exec sleep 5";
+
+        let result = run_bash_tool_with_timeout(
+            &root,
+            Some(&session),
+            command,
+            8,
+            1,
+            std::time::Duration::from_millis(100),
+        )
+        .expect_err("a timed-out command must report a tool error");
+
+        assert!(
+            result.starts_with(&format!("{}\n", timeout_header(command, 0))),
+            "the invalid-byte timeout must keep its header: {result:?}"
+        );
+        assert!(
+            result.len() <= TOOL_OUTPUT_LIMIT_BYTES,
+            "the lossy rendering is {} bytes, over the delivery cap",
+            result.len()
+        );
+        assert!(
+            result.contains('\u{FFFD}'),
+            "the returned text must be a valid lossy rendering of the invalid bytes"
+        );
+        let expected = vec![0xffu8; 20_000];
+        let spill = session_output(&session).join("step-8-call-1.log");
+        assert_eq!(
+            std::fs::read(&spill).expect("the invalid-byte spill must exist"),
+            spilled_bytes(command, &expected),
+            "the spill must preserve the original invalid bytes"
+        );
+
+        // Fewer raw bytes than the cap can still render past it: 6,000
+        // invalid bytes become 18,000 lossy replacement bytes, so the
+        // rendered length alone must force a spill.
+        let rendered_session = session_at(&root, "invalid-rendered");
+        let rendered_command = "head -c 6000 /dev/zero | tr '\\0' '\\377'; exec sleep 5";
+        let result = run_bash_tool_with_timeout(
+            &root,
+            Some(&rendered_session),
+            rendered_command,
+            9,
+            1,
+            std::time::Duration::from_millis(100),
+        )
+        .expect_err("a timed-out command must report a tool error");
+        assert!(
+            result.starts_with(&format!("{}\n", timeout_header(rendered_command, 0))),
+            "the lossy rendering timeout must keep its header: {result:?}"
+        );
+        assert!(
+            result.len() <= TOOL_OUTPUT_LIMIT_BYTES,
+            "the lossy rendering result is {} bytes, over the delivery cap",
+            result.len()
+        );
+        assert!(
+            result.contains(".ejaj/invalid-rendered/tools-output/step-9-call-1.log"),
+            "an over-limit rendering must spill even when the raw bytes fit: {result:?}"
+        );
+        let rendered_expected = vec![0xffu8; 6_000];
+        let rendered_spill = session_output(&rendered_session).join("step-9-call-1.log");
+        assert_eq!(
+            std::fs::read(&rendered_spill).expect("the rendering spill must exist"),
+            spilled_bytes(rendered_command, &rendered_expected),
+            "the rendering spill must preserve the original invalid bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression; forbidden/failure boundary: an oversized timeout without an
+    /// explicit session reports a bounded save failure and never falls back to
+    /// a global spill location.
+    #[test]
+    fn when_running_bash_given_oversized_partial_output_without_session_then_returns_bounded_save_failure_without_global_spill()
+     {
+        let root = scratch_dir("bash-timeout-no-session");
+        let command = format!(
+            "{}; exec sleep 5",
+            repeat_command('n', TOOL_OUTPUT_LIMIT_BYTES + 1)
+        );
+
+        let result = run_bash_tool_with_timeout(
+            &root,
+            None,
+            &command,
+            6,
+            1,
+            std::time::Duration::from_millis(100),
+        )
+        .expect_err("a timed-out command must report a tool error");
+
+        assert!(
+            result.starts_with(&format!("{}\n", timeout_header(&command, 0))),
+            "the save failure must still carry the timeout header: {result:?}"
+        );
+        assert!(
+            result.len() <= TOOL_OUTPUT_LIMIT_BYTES,
+            "the save failure digest is {} bytes, over the delivery cap",
+            result.len()
+        );
+        let lowered = result.to_lowercase();
+        assert!(
+            lowered.contains("could not save") || lowered.contains("no spill file"),
+            "the digest must report the save failure explicitly: {result:?}"
+        );
+        assert!(
+            !result.contains("saved to"),
+            "a failed spill must not claim a saved path: {result:?}"
+        );
+        assert!(
+            !root.join("tools-output").exists(),
+            "no session must not write to a project-root tools-output directory"
+        );
+        assert!(
+            !root.join(".ejaj").exists(),
+            "no session must not fall back to a global spill location"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -5309,6 +6082,201 @@ None.
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Core entry-point behavior; minimum valid boundary: the verification
+    /// caller renders a timeout with its established full-command header and
+    /// appends the partial stdout-then-stderr bytes on a new line.
+    #[test]
+    fn when_running_verification_command_given_partial_output_and_timeout_then_returns_timeout_header_and_partial_output()
+     {
+        let root = scratch_dir("verification-partial-timeout");
+        let command = "printf 'PARTIAL-OUT\\n'; printf 'PARTIAL-ERR\\n' >&2; exec sleep 5";
+        let timeout = std::time::Duration::from_millis(50);
+
+        let result = run_command_with_timeout_in(&root, command, timeout);
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "[ERROR: exit code -1 for `{command}`]\ncommand timed out after 0s\nPARTIAL-OUT\nPARTIAL-ERR\n"
+            )),
+            "the verification timeout must keep its header and append the partial output on a new line"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Edge-case table; zero boundary: a zero deadline accepts a real child
+    /// that has already exited before the initial observation, keeping its
+    /// captured output.
+    #[test]
+    fn when_running_verification_command_given_zero_timeout_and_exited_child_then_accepts_the_observed_exit()
+     {
+        let root = scratch_dir("verification-zero-timeout-exit");
+        let command = "printf 'ZERO-EXIT'";
+
+        let result = run_command_with_zero_deadline_after_exit_in(&root, command);
+
+        assert_eq!(
+            result,
+            Ok("ZERO-EXIT".to_string()),
+            "an already-exited child must keep its observed status and captured output"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Edge-case table; zero boundary: a zero deadline grants a still-running
+    /// child no polling window, so a command that would exit after a short
+    /// delay is terminated instead of being accepted.
+    #[test]
+    fn when_running_verification_command_given_zero_deadline_and_running_child_then_times_out_without_polling_sleep()
+     {
+        let root = scratch_dir("verification-zero-timeout-running");
+        let marker = root.join("late-exit-marker");
+        let command = format!("sleep 0.05; printf 'LATE' > '{}'", marker.display());
+
+        let started = std::time::Instant::now();
+        let result = run_command_with_timeout_in(&root, &command, std::time::Duration::ZERO);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "[ERROR: exit code -1 for `{command}`]\ncommand timed out after 0s"
+            )),
+            "a still-running child at a zero deadline must time out"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "a zero deadline must not wait for the child, took {elapsed:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a zero deadline must not grant the child a polling window"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Edge-case table; zero boundary: an already-exited Bash child whose
+    /// descendant keeps an output pipe open becomes the timeout rather than the
+    /// observed success, while the bytes Bash already wrote are preserved.
+    #[cfg(unix)]
+    #[test]
+    fn when_running_verification_command_given_zero_deadline_and_descendant_held_pipe_then_reports_timeout()
+     {
+        let root = scratch_dir("verification-zero-descendant-pipe");
+        let marker = root.join("zero-deadline-delayed-marker");
+        let command = format!(
+            "( sleep 1; printf 'LATE' > '{}' ) &\nprintf 'BASH-EXITED\\n'",
+            marker.display()
+        );
+
+        let started = std::time::Instant::now();
+        let result = run_command_with_zero_deadline_after_exit_in(&root, &command);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "[ERROR: exit code -1 for `{command}`]\ncommand timed out after 0s\nBASH-EXITED\n"
+            )),
+            "an exited Bash whose descendant holds the pipe must still report a timeout"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the zero-deadline drain must stay bounded, took {elapsed:?}"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        assert!(
+            !marker.exists(),
+            "the descendant-held pipe must terminate the Unix process group"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Edge-case table; non-Unix boundary: only the child is terminated, so a
+    /// descendant that keeps an output pipe open survives while the caller
+    /// still receives the timeout without the bytes the descendant withheld.
+    #[cfg(not(unix))]
+    #[test]
+    fn when_running_verification_command_given_non_unix_descendant_held_pipe_then_preserves_child_only_behavior()
+     {
+        let root = scratch_dir("verification-non-unix-descendant-pipe");
+        let marker = root.join("non-unix-delayed-marker");
+        let command = format!(
+            "( sleep 1; printf 'LATE' > '{}' ) &\nprintf 'BASH-EXITED\\n'",
+            marker.display()
+        );
+
+        let started = std::time::Instant::now();
+        let result = run_command_with_zero_deadline_after_exit_in(&root, &command);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "[ERROR: exit code -1 for `{command}`]\ncommand timed out after 0s"
+            )),
+            "a non-Unix descendant-held pipe must still time out the verification command"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the non-Unix drain must stay bounded, took {elapsed:?}"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        assert!(
+            marker.exists(),
+            "the non-Unix path must terminate only the child, leaving the descendant alive"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Edge-case table; minimum valid boundary, Unix process-group contract: a
+    /// descendant that keeps an output pipe open is killed at the deadline,
+    /// before its delayed marker write, while the bytes Bash wrote first are
+    /// preserved.
+    #[cfg(unix)]
+    #[test]
+    fn when_running_verification_command_given_descendant_held_pipe_and_deadline_then_kills_group_before_delayed_marker_write()
+     {
+        let root = scratch_dir("verification-descendant-pipe");
+        let marker = root.join("delayed-marker");
+        let command = format!(
+            "( sleep 1; printf 'LATE' > '{}' ) &\nprintf 'BASH-EXITED\\n'",
+            marker.display()
+        );
+        let timeout = std::time::Duration::from_millis(50);
+
+        let started = std::time::Instant::now();
+        let result = run_command_with_timeout_in(&root, &command, timeout);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "[ERROR: exit code -1 for `{command}`]\ncommand timed out after 0s\nBASH-EXITED\n"
+            )),
+            "a descendant-held pipe must time out with the bytes captured before the group was killed"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the reader wait must end at the deadline instead of the descendant, took {elapsed:?}"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        assert!(
+            !marker.exists(),
+            "the process group must be terminated before the descendant's delayed marker write"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Edge-case boundary: a command that reads stdin observes immediate EOF
     /// through both the Bash and verification entry points.
     #[test]
@@ -5395,7 +6363,8 @@ None.
     /// Failure boundary: a nonzero command preserves both the exit code and the
     /// complete stdout-then-stderr payload.
     #[test]
-    fn when_shell_command_given_nonzero_exit_then_preserves_exit_code_and_output() {
+    fn when_running_verification_command_given_nonzero_exit_then_returns_actual_status_and_captured_output()
+     {
         let root = scratch_dir("shell-nonzero");
         let command = "printf 'OUT-LINE\\n'; printf 'ERR-LINE\\n' >&2; exit 4";
         let expected = format!("[ERROR: exit code 4 for `{command}`]\nOUT-LINE\nERR-LINE\n");
@@ -5409,6 +6378,33 @@ None.
             run_bash_tool_in(&root, command),
             Err(expected),
             "Bash dispatch must preserve the same nonzero-exit shape"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Contract and invariant; malformed payload boundary: invalid shell syntax
+    /// completes with its ordinary nonzero status, never the timeout shape.
+    #[test]
+    fn when_running_verification_command_given_invalid_shell_syntax_then_preserves_ordinary_nonzero_failure()
+     {
+        let root = scratch_dir("verification-invalid-syntax");
+        let command = "if true; then";
+
+        let error = run_command_in(&root, command)
+            .expect_err("invalid shell syntax must surface as an ordinary failure");
+
+        assert!(
+            error.starts_with(&format!("[ERROR: exit code 2 for `{command}`]\n")),
+            "invalid shell syntax must keep a real nonzero exit status: {error}"
+        );
+        assert!(
+            error.contains("syntax error"),
+            "the stderr diagnostic must survive: {error}"
+        );
+        assert!(
+            !error.contains("command timed out"),
+            "invalid shell syntax must not be reported as a timeout: {error}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -5475,7 +6471,13 @@ None.
 
         let output = shell_output_in(&root, "true").expect("`true` should succeed");
 
-        assert!(output.status.success(), "`true` should report success");
+        assert!(
+            output
+                .status
+                .expect("a completed command must report an exit status")
+                .success(),
+            "`true` should report success"
+        );
         assert!(
             output.stdout.is_empty(),
             "a silent command must capture no stdout bytes: {:?}",
@@ -5499,7 +6501,13 @@ None.
         let output = shell_output_in(&root, "printf 'SHORT-OUT'")
             .expect("a short command should complete successfully");
 
-        assert!(output.status.success(), "the short command should succeed");
+        assert!(
+            output
+                .status
+                .expect("a completed command must report an exit status")
+                .success(),
+            "the short command should succeed"
+        );
         assert_eq!(
             output.stdout,
             b"SHORT-OUT".to_vec(),
@@ -5523,12 +6531,14 @@ None.
         let output = shell_output_in(&root, "if true; then")
             .expect("a completed invalid command is still a captured result");
 
+        let status = output
+            .status
+            .expect("a completed invalid command must report an exit status");
         assert!(
-            !output.status.success(),
+            !status.success(),
             "invalid shell syntax must report a failing status"
         );
-        let code = output
-            .status
+        let code = status
             .code()
             .expect("a completed command must report an exit code");
         assert_ne!(code, 0, "invalid shell syntax must not report success");
@@ -5556,7 +6566,10 @@ None.
             .expect("a command far inside the default deadline should complete");
 
         assert!(
-            output.status.success(),
+            output
+                .status
+                .expect("a completed command must report an exit status")
+                .success(),
             "the bounded command should report success"
         );
         assert_eq!(
@@ -5569,7 +6582,8 @@ None.
     }
 
     /// Core entry-point behavior: a command still running at the supplied
-    /// deadline is killed, reaped, and reported in the established error shape.
+    /// deadline is killed, reaped, and reported with the established header and
+    /// no appended output when nothing was captured.
     #[test]
     fn when_shell_command_given_expired_deadline_then_returns_timeout_error() {
         let root = scratch_dir("shell-timeout");
@@ -5577,14 +6591,14 @@ None.
         let timeout = std::time::Duration::from_millis(50);
 
         let started = std::time::Instant::now();
-        let error = shell_output_with_timeout(&root, command, timeout)
+        let error = run_command_with_timeout_in(&root, command, timeout)
             .expect_err("a still-running command must not be awaited indefinitely");
         let elapsed = started.elapsed();
 
         assert_eq!(
             error,
             format!("[ERROR: exit code -1 for `{command}`]\ncommand timed out after 0s"),
-            "the timeout must keep the established error shape and whole seconds"
+            "an empty timeout must keep the established header and append no output"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(2),
@@ -5594,8 +6608,9 @@ None.
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Zero boundary: a zero deadline permits no polling wait, so whichever
-    /// first-poll outcome occurs is the one reported and never a longer wait.
+    /// Zero boundary: a still-running child is reported as a timeout without
+    /// waiting for it, while a child that has already exited keeps its status
+    /// and captured bytes.
     #[test]
     fn when_shell_command_given_zero_duration_deadline_then_returns_first_poll_outcome() {
         let root = scratch_dir("shell-zero-timeout");
@@ -5603,12 +6618,19 @@ None.
 
         let running = "exec sleep 5";
         let started = std::time::Instant::now();
+        let outcome = shell_output_with_timeout(&root, running, timeout)
+            .expect("a timed-out command is still a structured outcome");
+        assert!(
+            outcome.status.is_none(),
+            "a command still running at a zero deadline must report no exit status"
+        );
         assert_eq!(
-            shell_output_with_timeout(&root, running, timeout),
-            Err(format!(
-                "[ERROR: exit code -1 for `{running}`]\ncommand timed out after 0s"
-            )),
-            "a command still running at a zero deadline must be killed and reported"
+            outcome.timeout, timeout,
+            "the outcome must carry the configured deadline"
+        );
+        assert!(
+            outcome.stdout.is_empty() && outcome.stderr.is_empty(),
+            "a promptly killed command must capture no output"
         );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
@@ -5616,32 +6638,23 @@ None.
         );
 
         let fast = "printf 'FIRST-POLL'";
-        let started = std::time::Instant::now();
-        match shell_output_with_timeout(&root, fast, timeout) {
-            Ok(output) => {
-                assert!(
-                    output.status.success(),
-                    "an already-exited first poll must keep its normal status"
-                );
-                assert_eq!(
-                    output.stdout,
-                    b"FIRST-POLL".to_vec(),
-                    "an already-exited first poll must keep its captured stdout"
-                );
-                assert!(
-                    output.stderr.is_empty(),
-                    "an already-exited first poll must keep its captured stderr"
-                );
-            }
-            Err(error) => assert_eq!(
-                error,
-                format!("[ERROR: exit code -1 for `{fast}`]\ncommand timed out after 0s"),
-                "a still-running first poll must report the zero-deadline timeout"
-            ),
-        }
+        let outcome = shell_output_with_timeout_after_exit(&root, fast, timeout)
+            .expect("an already-exited child must keep its captured result");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "a zero deadline must never wait for a command"
+            outcome
+                .status
+                .expect("an already-exited child must report an exit status")
+                .success(),
+            "an already-exited first poll must keep its normal status"
+        );
+        assert_eq!(
+            outcome.stdout,
+            b"FIRST-POLL".to_vec(),
+            "an already-exited first poll must keep its captured stdout"
+        );
+        assert!(
+            outcome.stderr.is_empty(),
+            "an already-exited first poll must keep its captured stderr"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -5661,7 +6674,10 @@ None.
             .expect("a command that fills both pipes must complete instead of deadlocking");
 
         assert!(
-            output.status.success(),
+            output
+                .status
+                .expect("a completed command must report an exit status")
+                .success(),
             "the large-output command should succeed"
         );
         assert_eq!(
@@ -5698,18 +6714,137 @@ None.
         let timeout = std::time::Duration::from_millis(50);
 
         let started = std::time::Instant::now();
-        let error = shell_output_with_timeout(&root, command, timeout)
-            .expect_err("a descendant holding the pipe must not outlive the deadline");
+        let outcome = shell_output_with_timeout(&root, command, timeout)
+            .expect("a descendant-held pipe must expire into a structured timeout");
         let elapsed = started.elapsed();
 
+        assert!(
+            outcome.status.is_none(),
+            "a descendant-held pipe must report no exit status even though Bash exited"
+        );
         assert_eq!(
-            error,
-            format!("[ERROR: exit code -1 for `{command}`]\ncommand timed out after 0s"),
-            "a descendant-held pipe must expire into the established timeout shape"
+            outcome.timeout, timeout,
+            "the timeout outcome must carry the configured deadline"
+        );
+        assert_eq!(
+            outcome.stdout,
+            b"BASH-EXITED\n".to_vec(),
+            "bytes captured before the descendant was killed must be preserved"
+        );
+        assert!(
+            outcome.stderr.is_empty(),
+            "the descendant held no stderr bytes in this case"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(1),
             "the reader wait must respect the deadline instead of the descendant, took {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Maximum limit/upper boundary: every Bash invocation overrides inherited
+    /// interactive and progress settings with the forced non-interactive
+    /// defaults.
+    #[test]
+    fn when_running_bash_given_default_environment_then_sets_non_interactive_pager_and_progress_vars()
+     {
+        const CHILD_MARKER: &str = "EJAJ_DEFAULT_ENV_CHILD";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let root = scratch_dir("bash-default-env-child");
+            let command = "echo GIT_TERMINAL_PROMPT=$GIT_TERMINAL_PROMPT; echo PAGER=$PAGER; echo GIT_PAGER=$GIT_PAGER; echo MANPAGER=$MANPAGER; echo LESS=$LESS; echo CARGO_TERM_PROGRESS_WHEN=$CARGO_TERM_PROGRESS_WHEN; echo PIP_PROGRESS_BAR=$PIP_PROGRESS_BAR; echo TQDM_DISABLE=$TQDM_DISABLE";
+
+            let output = run_bash_tool_in(&root, command)
+                .expect("printing the configured environment should succeed");
+
+            assert_eq!(
+                output,
+                "GIT_TERMINAL_PROMPT=0\nPAGER=cat\nGIT_PAGER=cat\nMANPAGER=cat\nLESS=-R\nCARGO_TERM_PROGRESS_WHEN=never\nPIP_PROGRESS_BAR=off\nTQDM_DISABLE=1\n",
+                "every Bash child must receive the forced non-interactive defaults"
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("the test executable should be locatable");
+        let output = std::process::Command::new(executable)
+            .arg("--exact")
+            .arg(
+                "tools::tests::when_running_bash_given_default_environment_then_sets_non_interactive_pager_and_progress_vars",
+            )
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("GIT_TERMINAL_PROMPT", "1")
+            .env("PAGER", "less")
+            .env("GIT_PAGER", "less")
+            .env("MANPAGER", "less")
+            .env("LESS", "-S")
+            .env("CARGO_TERM_PROGRESS_WHEN", "always")
+            .env("PIP_PROGRESS_BAR", "on")
+            .env("TQDM_DISABLE", "0")
+            .output()
+            .expect("the isolated default-environment test process should start");
+
+        let child_stdout = String::from_utf8_lossy(&output.stdout);
+        let child_stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the isolated default-environment test failed: stdout={child_stdout}\nstderr={child_stderr}"
+        );
+        assert!(
+            child_stdout.contains("1 passed"),
+            "the isolated child must run exactly the default-environment test: stdout={child_stdout}\nstderr={child_stderr}"
+        );
+    }
+
+    /// Caller-level boundary: a background descendant cannot outlive the
+    /// timeout, while the partial stdout and stderr captured before the kill
+    /// are still returned.
+    #[test]
+    fn when_running_shell_given_background_descendant_then_returns_partial_output_and_prevents_late_write()
+     {
+        let root = scratch_dir("shell-background-descendant");
+        let marker = root.join("late-marker");
+        let command = format!(
+            "( sleep 1; printf 'LATE' > '{}' ) &\nprintf 'PARTIAL-OUT\\n'\nprintf 'PARTIAL-ERR\\n' >&2\nexec sleep 5",
+            marker.display()
+        );
+        let timeout = std::time::Duration::from_millis(100);
+
+        let started = std::time::Instant::now();
+        let outcome = shell_output_with_timeout(&root, &command, timeout)
+            .expect("a timed-out command is still a structured outcome");
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.status.is_none(),
+            "a still-running command must report no exit status"
+        );
+        assert_eq!(
+            outcome.stdout,
+            b"PARTIAL-OUT\n".to_vec(),
+            "partial stdout captured before the timeout must be preserved"
+        );
+        assert_eq!(
+            outcome.stderr,
+            b"PARTIAL-ERR\n".to_vec(),
+            "partial stderr captured before the timeout must be preserved"
+        );
+        assert_eq!(
+            outcome.timeout, timeout,
+            "the timeout outcome must carry the configured deadline"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the timeout and reader drain must stay bounded, took {elapsed:?}"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        assert!(
+            !marker.exists(),
+            "a background descendant must not survive the process-group kill"
         );
 
         let _ = std::fs::remove_dir_all(&root);
