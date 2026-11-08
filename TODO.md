@@ -15,6 +15,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md) | [x] Complete (T02, T03 done) | `T02`, `T03` | `src/prompts/plan.rs`, `src/prompts/spec.rs` |
 | [`PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md) | [x] Complete (T04, T06 done) | `T04`, `T06` | `src/prompts/code.rs`, `src/prompts/tickets.rs` |
 | [`02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md) | [x] Complete (T02, T06, T07 done) | `T02`, `T06`, `T07` | `src/prompts/tickets.rs`, `src/prompts/triage.rs` |
+| [`PROPOSAL-14-pre-planned-task-fast-track.md`](./.plans/PROPOSAL-14-pre-planned-task-fast-track.md) | `[ ]` Pending | `T19` | `src/prompts/plan.rs`, `tests/prompt_contract.rs` |
 | [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | `[ ]` Pending (T07 done; T08 pending) | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md) | `[ ]` Pending | `T09` | `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md) | `[ ]` Pending | `T10` | `src/orchestrator.rs`, `src/pipeline.rs` |
@@ -36,7 +37,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 ## 2. Task Dependency Graph (DAG)
 
-`T01` and `T02` implement [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) first so the validator, pipeline, and prompts support `test_expectations: []` (`None.`) and never demand unit tests for markdown or tracker files (`TODO.md`, `.plans/*.md`, `README.md`). Next, Wave 1 (`T05` → `T04` → `T03` → `T06`) completes all phase-prompt upgrades (`src/prompts/*.rs`) so rebuilding `ejaj` gives all subsequent runtime and pipeline tasks (`T07`–`T18`) scoped Round 2+ re-reviews, no artificial red probes, and capped ticket scopes.
+`T01` and `T02` implement [`PROPOSAL-3-non-code-test-expectations.md`](./.plans/PROPOSAL-3-non-code-test-expectations.md) first so the validator, pipeline, and prompts support `test_expectations: []` (`None.`) and never demand unit tests for markdown or tracker files (`TODO.md`, `.plans/*.md`, `README.md`). Next, Wave 1 (`T05` → `T04` → `T03` → `T06` → `T19`) completes all phase-prompt upgrades (`src/prompts/*.rs`, including [`PROPOSAL-14-pre-planned-task-fast-track.md`](./.plans/PROPOSAL-14-pre-planned-task-fast-track.md)) so rebuilding `ejaj` gives all subsequent runtime and pipeline tasks (`T08`–`T18`) Turn-1 pre-planned task handoffs, scoped Round 2+ re-reviews, no artificial red probes, and capped ticket scopes.
 
 ```text
 [x] [T01] PROPOSAL-3a: Validator, transition_fix_ticket & ticket_kickoff optional test_expectations
@@ -56,6 +57,9 @@ Tracks the implementation status of all specifications and proposals in [`.plans
       ▼
 [x] [T06] 02 + PROPOSAL-9: TICKETS_SYSTEM_PROMPT scope cap & contracts (src/prompts/tickets.rs)
       ├──► [x] [T07] PROPOSAL-1a + 02: TriageState::Done model & TRIAGE_SYSTEM_PROMPT (src/triage.rs, src/prompts/triage.rs)
+      │          │
+      │          ▼
+      │        [ ] [T19] PROPOSAL-14: Fast-track pre-planned & tracker tasks in PLAN_SYSTEM_PROMPT (src/prompts/plan.rs, tests/prompt_contract.rs)
       │          │
       │          ▼
       │        [ ] [T08] PROPOSAL-1b: Pipeline pre-completion & unblocking for Done tickets (src/pipeline.rs)
@@ -115,7 +119,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 ---
 
-### Wave 1: Phase Prompt Upgrades (`T05` → `T04` → `T03` → `T06` — Rebuild `ejaj` Before Runtime Tasks)
+### Wave 1: Phase Prompt Upgrades (`T05` → `T04` → `T03` → `T06` → `T19` — Rebuild `ejaj` Before Runtime Tasks)
 
 - [x] **`T05` — `REVIEW_SYSTEM_PROMPT` Upgrades (Diff-First Inspection, Internal Exports, & Scoped Round 2+ Re-Review)**
   - `depends_on`: `[]` (`T02` complete)
@@ -165,7 +169,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 - [x] **`T07` — Add `TriageState::Done` Data Model & Upgrade `TRIAGE_SYSTEM_PROMPT`**
   - `depends_on`: `["T06"]`
-  - `unblocks`: `["T08"]`
+  - `unblocks`: `["T19"]`
   - `plans`: [`.plans/PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md), [`.plans/02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md)
   - `files`: `src/triage.rs`, `src/prompts/triage.rs`, `src/tools.rs`, `TODO.md`
   - `tasks`:
@@ -174,8 +178,20 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `TODO.md`, mark `T07` complete (`[x]`) in the DAG and ordered backlog, mark `02-tickets-and-triage-prompts.md` `[x] Complete (T02, T06, T07 done)`, and update `PROPOSAL-1-triage-done-state.md` to `[ ]` Pending (T07 done; T08 pending) right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib triage && cargo test --lib prompts::triage && cargo test --lib tools && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
+- [ ] **`T19` — Fast-Track Pre-Planned & Tracker-Backed Tasks in `PLAN_SYSTEM_PROMPT`**
+  - `depends_on`: `["T03", "T07"]`
+  - `unblocks`: `["T08"]`
+  - `plans`: [`.plans/PROPOSAL-14-pre-planned-task-fast-track.md`](./.plans/PROPOSAL-14-pre-planned-task-fast-track.md)
+  - `files`: `src/prompts/plan.rs`, `tests/prompt_contract.rs`, `TODO.md`
+  - `tasks`:
+    - In `PLAN_SYSTEM_PROMPT` (`src/prompts/plan.rs`, preserving `OPENING_MARKER`, all 4 `##` template headings, and all existing `tests/prompt_contract.rs` and `src/prompts/review.rs` substrings): instruct the agent to inspect referenced repository task, tracker, or proposal files (`TODO.md`, `.plan/`, `.plans/`) and their target modules during Turn-1 reconnaissance and treat their concrete design choices, target paths, and integration mode (reuse, extend, or replace) as already settled unless they contradict the live codebase.
+    - Qualify the reuse/extend/replace question in `PLAN_SYSTEM_PROMPT` so the agent never asks the user to re-confirm an integration choice that the request or referenced plan already specifies and the codebase supports, and instruct it to call `finish_plan` in the first turn without asking `Q1` when reconnaissance finds no contradiction.
+    - Add caller-intent test `when_starting_given_preplanned_task_then_plan_prompt_treats_documented_choices_as_settled_and_hands_off` in `tests/prompt_contract.rs`.
+    - In `TODO.md`, mark `T19` complete (`[x]`) in the DAG and ordered backlog and mark `PROPOSAL-14-pre-planned-task-fast-track.md` `[x] Complete (T19 done)` right before running `verification_gate`.
+  - `verification_gate`: `cargo test --lib prompts && cargo test --test prompt_contract && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
 - [ ] **`T08` — Pipeline Queue Authorization & Pre-Completion for `TriageState::Done` Tickets**
-  - `depends_on`: `["T07"]`
+  - `depends_on`: `["T07", "T19"]`
   - `unblocks`: `["T09"]`
   - `plans`: [`.plans/PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md)
   - `files`: `src/pipeline.rs`, `tests/pipeline.rs`, `TODO.md`
