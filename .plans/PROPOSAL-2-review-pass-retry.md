@@ -45,8 +45,19 @@ fn retries_after_unattended_stop(kind: Option<FailureKind>) -> bool {
 
 When the first attempt in `review_round`, `spec_pass`, `tickets_pass`, or `triage_pass` returns `TurnEnd` (`None`) or `Failed(kind)` where `retries_after_unattended_stop` is `true`:
 1. Log a `[WARN]` line to `status::shared().stderr_log` noting the early stop reason and that the pass is being retried once in a fresh session.
-2. Run the pass (`review::audit_in`, `spec::to_spec_in`, `tickets::to_tickets_in`, or `triage::audit_in`) a second time with a fresh transcript.
+2. Run the pass (`review::audit_in`, `spec::to_spec_in`, `tickets::to_tickets_in`, or `triage::audit_in`) a second time with a fresh transcript **inside the same `status::timed(...)` interval** so each pass still reports exactly one timing line.
 3. If the second attempt hands over a valid artifact, continue normally; if it fails again, return the existing termination (`RunTermination::ReviewIncomplete` or `self.downstream_retry(...)`).
+
+---
+
+## Guardrails for Existing `ejaj` Tests
+
+- **Keep the retry inside the single `status::timed(...)` call for each pass:**
+  - `when_phase_is_not_invoked_given_early_pipeline_return_then_emits_no_phase_line` (`tests/pipeline.rs:9291`) runs `"triage-turn-end"` (`common::TriageScript::TurnEnd`) and asserts `phase_labels(&transcript) == ["plan-agent ask", "spec pass", "tickets pass", "triage pass"]`. Running the retry inside the `status::timed("triage pass", || ...)` closure (just as `summary_pass` runs its corrections inside one `status::timed("summary pass", || ...)` closure) preserves that single timing line.
+- **Update the `TurnEnd` request count in `when_triaging_tickets_given_missing_or_invalid_handoff_then_returns_retry_without_queue` (`tests/pipeline.rs:2461-2484`):**
+  - Because `common::TriageScript::TurnEnd` is retried once while `common::TriageScript::ApiError` is not retried, update `tests/pipeline.rs:2478` to assert `5` requests (3 handoff steps + 2 triage attempts) for `common::TriageScript::TurnEnd` and `4` requests (3 handoff steps + 1 refused triage attempt) for `common::TriageScript::ApiError`.
+- **Scope tracker updates strictly to `TODO.md`:**
+  - Update `TODO.md` only; do not edit `.plans/PROPOSAL-2-review-pass-retry.md` during implementation.
 
 ---
 
@@ -54,9 +65,10 @@ When the first attempt in `review_round`, `spec_pass`, `tickets_pass`, or `triag
 
 - `src/pipeline.rs`
 - `tests/pipeline.rs`
+- `TODO.md`
 
 ## Verification
 
 ```bash
-cargo test --lib pipeline && cargo test --test pipeline && cargo clippy --all-targets -- -D warnings
+cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings
 ```

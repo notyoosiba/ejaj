@@ -26,6 +26,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`PROPOSAL-2-review-pass-retry.md`](./.plans/PROPOSAL-2-review-pass-retry.md) | `[ ]` Pending | `T16` | `src/pipeline.rs` |
 | [`11-context-compaction-and-overflow-recovery.md`](./.plans/11-context-compaction-and-overflow-recovery.md) | `[ ]` Pending | `T17` | `src/loops/agent.rs` |
 | [`08-conversation-trajectory-persistence.md`](./.plans/08-conversation-trajectory-persistence.md) | `[ ]` Pending | `T18` | `src/loops/agent.rs`, `src/tools.rs` |
+| [`PROPOSAL-15-ticket-slicing-and-triage-alignment.md`](./.plans/PROPOSAL-15-ticket-slicing-and-triage-alignment.md) | `[ ]` Pending | `T20` | `src/prompts/{spec,tickets,triage}.rs`, `src/tickets.rs`, `src/tools.rs` |
 
 ### Completed Baseline Proposals (Already in `git` History)
 
@@ -74,18 +75,19 @@ Tracks the implementation status of all specifications and proposals in [`.plans
       ├──► [x] [T11] 05: Shell process-group kill & timeout spill (src/tools.rs) ──────────────┐
       ├──► [x] [T12] 09: CRLF tools.replace & grep line cap (src/script.rs)                    │
       ├──► [x] [T13] 12: HTTP 408, permanent 429 fast-fail & retry-after hints (src/retry.rs) ─┼──┐
-      └──► [ ] [T14] 07a: Output-token truncation detection across providers (src/api.rs, llm) │  │
-                 │                                                                             │  │
-                 ▼                                                                             │  │
-               [ ] [T15] 07b: In-loop missing-tool/truncation recovery & loop guard (agent.rs) │  │
-                 ├──────────────────────────┐                                                  │  │
-                 ▼                          ▼                                                  │  │
-               [ ] [T16] PROPOSAL-2:      [ ] [T17] 11: Compaction retry, Tier-1 soft fallback │  │
-                 Outer retry for            & HTTP 400/413/422 overflow recovery (agent.rs) ◄──┼──┘
-                 unattended passes          │                                                  │
-                 (src/pipeline.rs)          ▼                                                  │
-                                          [ ] [T18] 08: Conversation trajectory persistence ◄──┘
-                                            (.traj.json in src/loops/agent.rs, src/tools.rs)
+      ├──► [ ] [T14] 07a: Output-token truncation detection across providers (src/api.rs, llm) │  │
+      │          │                                                                             │  │
+      │          ▼                                                                             │  │
+      │        [ ] [T15] 07b: In-loop truncation recovery & tool repetition guard (agent.rs)   │  │
+      │          ├──────────────────────────┐                                                  │  │
+      │          ▼                          ▼                                                  │  │
+      │        [ ] [T16] PROPOSAL-2:      [ ] [T17] 11: Compaction retry, summary merge        │  │
+      │          Outer retry for            & HTTP 400/413/422 overflow recovery (agent.rs) ◄──┼──┘
+      │          unattended passes          │                                                  │
+      │          (src/pipeline.rs)          ▼                                                  │
+      │                                   [ ] [T18] 08: Conversation trajectory persistence ◄──┘
+      │                                     (.traj.json in src/loops/agent.rs, src/tools.rs)
+      └──► [ ] [T20] PROPOSAL-15: Multi-ticket story slicing, duplicate criteria check & Triage brief narrowing
 ```
 
 ---
@@ -264,27 +266,28 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `depends_on`: `["T06"]`
   - `unblocks`: `["T15"]`
   - `plans`: [`.plans/07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md)
-  - `files`: `src/api.rs`, `src/llm/chat_completions.rs`, `src/llm/responses_api.rs`, `src/llm/anthropic.rs`, `TODO.md`
+  - `files`: `src/api.rs`, `src/llm/chat_completions.rs`, `src/llm/responses_api.rs`, `src/llm/anthropic.rs`, `src/loops/agent.rs`, `src/loops/plan.rs`, `src/loops/summary.rs`, `TODO.md`
   - `tasks`:
-    - Add `#[serde(skip)] pub truncated: bool` to `Message` in `src/api.rs` (initialized to `false` in `Message::text` and `Message::tool` so wire payloads and `context_bytes` stay unchanged).
-    - Set `truncated = true` when `finish_reason == Some("length")` in `ChatProvider::decode` (`src/api.rs`, `src/llm/chat_completions.rs`), when `status == Some("incomplete")` and `incomplete_details["reason"] == Some("max_output_tokens")` in `ResponsesProvider::decode` (`src/llm/responses_api.rs`), and when `stop_reason == Some("max_tokens")` in `AnthropicProvider::decode` (`src/llm/anthropic.rs`, returning an empty `Message` with `truncated: true` when truncated before content/tool blocks arrive).
-    - In `TODO.md`, mark `T14` complete (`[x]`) in the DAG and ordered backlog and update `07-in-loop-truncation-and-tool-recovery.md` to `[ ]` Pending (T14 done; T15 pending) right before running `verification_gate`.
+    - Batch the `Message.truncated` addition and the three small same-shape provider decoder updates into a single cohesive ticket sharing `T14`'s verification gate (or, if sliced across multiple tickets, keep each ticket's `acceptance_criteria` strictly scoped to its own module/provider and never include criteria for a provider listed in `out_of_scope`).
+    - Add `#[serde(skip)] pub truncated: bool` to `Message` in `src/api.rs` (initialized to `false` in `Message::text` and `Message::tool`, and in existing direct `Message { ... }` struct literals in `src/llm/{anthropic,responses_api}.rs` and `src/loops/{agent,plan,summary}.rs` so wire payloads and `context_bytes` stay unchanged and `--lib` compiles cleanly).
+    - Set `truncated = true` when `finish_reason == Some("length")` in `ChatProvider::decode` (`src/api.rs`, `src/llm/chat_completions.rs`), when `status == Some("incomplete")` and `incomplete_details["reason"] == Some("max_output_tokens")` in `ResponsesProvider::decode` (`src/llm/responses_api.rs`), and when `stop_reason == Some("max_tokens")` in `AnthropicProvider::decode` (`src/llm/anthropic.rs`, keeping `MAX_TOKENS = 4096` unchanged and returning an empty `Message` with `truncated: true` when Responses API or Anthropic truncates before usable text/tool blocks arrive).
+    - In `TODO.md` only (do not edit `.plans/07-in-loop-truncation-and-tool-recovery.md`), mark `T14` complete (`[x]`) in the DAG and ordered backlog and update the `07-in-loop-truncation-and-tool-recovery.md` row in the `TODO.md` status matrix to `[ ]` Pending (T14 done; T15 pending) right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib api && cargo test --lib llm && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T15` — In-Loop Missing-Tool / Truncation Recovery & Tool-Call Repetition Guard**
+- [ ] **`T15` — In-Loop Truncation Recovery & Tool-Call Repetition Guard**
   - `depends_on`: `["T14"]`
   - `unblocks`: `["T16", "T17"]`
   - `plans`: [`.plans/07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md)
   - `files`: `src/loops/agent.rs`, `TODO.md`
   - `tasks`:
-    - In `run_agent_loop_capturing` (`src/loops/agent.rs`), prompt up to `MAX_CONSECUTIVE_FORMAT_RECOVERIES = 2` times in-loop when an unattended phase omits a required tool call or when `assistant.truncated` is `true` before returning `Stop::TurnEnd` (preserving normal tool-free turns for non-truncated `Phase::Plan` and `Phase::Summary`).
+    - In `run_agent_loop_capturing` (`src/loops/agent.rs`), when `tool_calls.is_empty()` and `messages[assistant_index].truncated` is `true`, prompt up to `MAX_CONSECUTIVE_FORMAT_RECOVERIES = 2` times in-loop before returning `Stop::Summary(answer)` (in `Phase::Summary`) or `Stop::TurnEnd` (in all other phases), while preserving immediate `Stop::Summary(answer)` / `Stop::TurnEnd` on non-truncated tool-free turns (`truncated == false`) so all existing single-reply `Script` and `CodeReply::TurnEnd` tests pass unchanged.
     - Canonicalize tool calls per turn, append a loop-redirect notice (with canonical arguments preview capped at 500 UTF-8 bytes) to the last `Role::Tool` message at `TOOL_LOOP_WARN_THRESHOLD = 3` consecutive identical turns, and abort with `Stop::Failed(FailureKind::StepLimit)` at `TOOL_LOOP_ABORT_THRESHOLD = 5`.
-    - In `TODO.md`, mark `T15` complete (`[x]`) in the DAG and ordered backlog and mark `07-in-loop-truncation-and-tool-recovery.md` `[x] Complete (T14, T15 done)` right before running `verification_gate`.
+    - In `TODO.md` only (do not edit `.plans/07-in-loop-truncation-and-tool-recovery.md`), mark `T15` complete (`[x]`) in the DAG and ordered backlog and update the `07-in-loop-truncation-and-tool-recovery.md` row in the `TODO.md` status matrix to `[x] Complete (T14, T15 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib loops::agent && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 ---
 
-### Wave 3: Outer Pass Retries, Compaction Recovery, & Trajectory Persistence
+### Wave 3: Outer Pass Retries, Compaction Recovery, Trajectory Persistence, & Ticket-Slicing Hardening
 
 - [ ] **`T16` — Outer Single-Pass Retry for Unattended Handoff Passes (`spec_pass`, `tickets_pass`, `triage_pass`, `review_round`)**
   - `depends_on`: `["T10", "T15"]`
@@ -293,21 +296,20 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `files`: `src/pipeline.rs`, `tests/pipeline.rs`, `TODO.md`
   - `tasks`:
     - Add `retries_after_unattended_stop(kind: Option<FailureKind>) -> bool` in `src/pipeline.rs` (`true` for `None` / `TurnEnd` and `Some(Malformed | StepLimit | ContextGuard)`, `false` for `Api | Transport`).
-    - Retry `spec_pass`, `tickets_pass`, `triage_pass`, and `review_round` once in a fresh session (logging a `[WARN]` line via `status::shared().stderr_log`) before returning `RunTermination::ReviewIncomplete` or `self.downstream_retry(...)`.
-    - In `TODO.md`, mark `T16` complete (`[x]`) in the DAG and ordered backlog and mark `PROPOSAL-2-review-pass-retry.md` `[x] Complete (T16 done)` right before running `verification_gate`.
+    - Retry `spec_pass`, `tickets_pass`, `triage_pass`, and `review_round` once in a fresh session inside the same `status::timed(...)` interval (logging a `[WARN]` line via `status::shared().stderr_log`) before returning `RunTermination::ReviewIncomplete` or `self.downstream_retry(...)`, and update `when_triaging_tickets_given_missing_or_invalid_handoff_then_returns_retry_without_queue` (`tests/pipeline.rs:2478`) to expect `5` requests for `TriageScript::TurnEnd` and `4` for `TriageScript::ApiError`.
+    - In `TODO.md` only (do not edit `.plans/PROPOSAL-2-review-pass-retry.md`), mark `T16` complete (`[x]`) in the DAG and ordered backlog and update the `PROPOSAL-2-review-pass-retry.md` row in the `TODO.md` status matrix to `[x] Complete (T16 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T17` — Context Compaction Resilience, Tier-1 Soft Fallback, & HTTP 400/413/422 Overflow Recovery**
+- [ ] **`T17` — Context Compaction Resilience, Prior-Summary Consolidation, & HTTP 400/413/422 Overflow Recovery**
   - `depends_on`: `["T13", "T15"]`
   - `unblocks`: `["T18"]`
   - `plans`: [`.plans/11-context-compaction-and-overflow-recovery.md`](./.plans/11-context-compaction-and-overflow-recovery.md)
   - `files`: `src/loops/agent.rs`, `TODO.md`
   - `tasks`:
-    - Retry transient failures during `request_handover_summary` via `send_summary_with_retry` (`retry::should_retry`).
-    - Instruct `HANDOVER_SUMMARY_INSTRUCTION` to merge any earlier `[HANDOVER SUMMARY]` checkpoint into a single consolidated summary.
-    - Split `SummaryError::SoftValidation` from `SummaryError::Fatal` in `prepare_for_send`, falling back to the Tier-1 compacted transcript when it fits within `CONTEXT_GUARD_BYTES` (4 MiB).
+    - Retry transient failures during `request_handover_summary` via `send_summary_with_retry` (`retry::should_retry`), while preserving existing `HANDOVER_SUMMARY_MARKER`, `HANDOVER_SUMMARY_LABELS`, and `TIER_TWO_CONTEXT_BYTES` validation so all existing summary unit tests in `src/loops/agent.rs` pass unchanged.
+    - Instruct `HANDOVER_SUMMARY_INSTRUCTION` to merge any earlier `[HANDOVER SUMMARY]` checkpoint into a single consolidated summary under the four required labels.
     - Detect context-overflow errors (`is_context_overflow_error` on HTTP `413` or HTTP `400`/`422` with overflow markers) below the 400 KiB watermark, compact once via `force_compact_on_overflow`, and retry the turn.
-    - In `TODO.md`, mark `T17` complete (`[x]`) in the DAG and ordered backlog and mark `11-context-compaction-and-overflow-recovery.md` `[x] Complete (T17 done)` right before running `verification_gate`.
+    - In `TODO.md` only (do not edit `.plans/11-context-compaction-and-overflow-recovery.md`), mark `T17` complete (`[x]`) in the DAG and ordered backlog and update the `11-context-compaction-and-overflow-recovery.md` row in the `TODO.md` status matrix to `[x] Complete (T17 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib loops::agent && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
 - [ ] **`T18` — Per-Loop Conversation Trajectory Persistence (`.traj.json`)**
@@ -316,7 +318,20 @@ Tracks the implementation status of all specifications and proposals in [`.plans
   - `plans`: [`.plans/08-conversation-trajectory-persistence.md`](./.plans/08-conversation-trajectory-persistence.md)
   - `files`: `src/loops/agent.rs`, `src/tools.rs`, `TODO.md`
   - `tasks`:
-    - Define `TrajectorySnapshot` (`phase`, `role`, `model`, `steps_taken`, `exit_status`, `messages`) and `Stop::exit_status_label` in `src/loops/agent.rs`.
-    - When `invocation.session_dir` is `Some`, persist `<phase>.traj.json` (with `<phase>-<N>.traj.json` collision suffixes `1..10_000`) under `<session-dir>/trajectories/` on every loop exit path, calling `crate::tools::ignore_run_artifacts` and logging `[WARN]` on I/O errors without altering the returned `Stop`.
-    - In `TODO.md`, mark `T18` complete (`[x]`) in the DAG and ordered backlog and mark `08-conversation-trajectory-persistence.md` `[x] Complete (T18 done)` right before running `verification_gate`.
-  - `verification_gate`: `cargo test --lib loops::agent && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+    - Define `TrajectorySnapshot` (`phase`, `role`, `model`, `steps_taken`, `exit_status`, `messages`) and `Stop::exit_status_label` in `src/loops/agent.rs`, and make `ignore_run_artifacts` and `ejaj_ancestor` `pub(crate)` in `src/tools.rs`.
+    - When `invocation.session_dir` is `Some`, `crate::tools::ejaj_ancestor(&base).is_some()`, and `!(phase == Phase::Plan && !matches!(stop, Stop::Handoff(_)))`, persist `<phase>.traj.json` (with `<phase>-<N>.traj.json` collision suffixes `1..10_000`) under `<session-dir>/trajectories/` on loop exit, calling `crate::tools::ignore_run_artifacts` and logging `[WARN]` on I/O errors without altering the returned `Stop`.
+    - In `TODO.md` only (do not edit `.plans/08-conversation-trajectory-persistence.md`), mark `T18` complete (`[x]`) in the DAG and ordered backlog and update the `08-conversation-trajectory-persistence.md` row in the `TODO.md` status matrix to `[x] Complete (T18 done)` right before running `verification_gate`.
+  - `verification_gate`: `cargo test --lib loops::agent && cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T20` — Multi-Ticket Story Slicing, Per-Ticket Criteria Validation, & Triage Slice Alignment**
+  - `depends_on`: `["T07"]`
+  - `unblocks`: `[]`
+  - `plans`: [`.plans/PROPOSAL-15-ticket-slicing-and-triage-alignment.md`](./.plans/PROPOSAL-15-ticket-slicing-and-triage-alignment.md)
+  - `files`: `src/prompts/spec.rs`, `src/prompts/tickets.rs`, `src/prompts/triage.rs`, `src/tickets.rs`, `src/tools.rs`, `tests/prompt_contract.rs`, `TODO.md`
+  - `tasks`:
+    - In `SPEC_SYSTEM_PROMPT` (`src/prompts/spec.rs`, preserving all `tests/prompt_contract.rs` and `src/prompts/review.rs` needles and avoiding all forbidden phrases), update Step 3 to structure user stories along independently verifiable vertical slices with each acceptance criterion scoped to one slice or module boundary, and to name exact target file paths in `### Module Architecture` when documentation or tracker files are updated.
+    - In `TICKETS_SYSTEM_PROMPT` (`src/prompts/tickets.rs`, preserving all existing test needles, the 11 field bullets in order, and single-source `expand, migrate, contract`), qualify Step 2 so tracker/documentation files (`README.md`, `TODO.md`, `.plan/`/`.plans/`) are folded only when the specification itself includes them, and clarify under `- acceptance_criteria:` that multi-ticket stories distribute only the verbatim criteria each ticket's `scope_of_changes` and `verification_gate` implement (never criteria for `out_of_scope` modules or duplicate/altered leftovers).
+    - In `TicketSet::validate` (`src/tickets.rs`), reject duplicate non-blank `acceptance_criteria` entries within the same ticket, and in `missing_criteria_error` (`src/tools.rs`), clarify that every criterion must appear in `acceptance_criteria` of the ticket (or across the tickets) that implement its story.
+    - In `TRIAGE_SYSTEM_PROMPT` (`src/prompts/triage.rs`, preserving all `REQUIRED_NEEDLES` and existing test substrings), update Step 2 so that when a shared specification story spans multiple draft tickets and a ticket carries a sibling ticket's verbatim criterion from that shared story while its own `scope_of_changes`, `test_expectations`, and `verification_gate` define a self-contained slice, Triage narrows `acceptance_criteria` in the `Agent Brief` and records the audit note rather than blocking the ticket as `needs-info` or `ready-for-human`.
+    - In `TODO.md` only (do not edit `.plans/PROPOSAL-15-ticket-slicing-and-triage-alignment.md`), mark `T20` complete (`[x]`) in the DAG and ordered backlog and update the `PROPOSAL-15-ticket-slicing-and-triage-alignment.md` row in the `TODO.md` status matrix to `[x] Complete (T20 done)` right before running `verification_gate`.
+  - `verification_gate`: `cargo test --lib prompts && cargo test --lib tickets && cargo test --lib tools && cargo test --test prompt_contract && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
