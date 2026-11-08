@@ -16,6 +16,7 @@ use crate::loops::{FailureKind, InvocationContext, code};
 use crate::tickets::{Ticket, TicketSet};
 use crate::timing::QueueContributions;
 use crate::tools::run_command_in;
+use crate::triage::TriageReport;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -274,6 +275,11 @@ struct Production<'a> {
     /// was supplied. Every fresh ticket attempt -- first, retry, and later
     /// queue rounds alike -- forwards it to Bash dispatch.
     session_dir: Option<&'a Path>,
+    /// The validated triage report of the invocation whose queue this is, when
+    /// one was supplied. Every fresh ticket attempt composes the matching
+    /// ticket's audit context after the canonical ticket render; a public
+    /// no-triage entry point supplies none and sends the ticket alone.
+    triage: Option<&'a TriageReport>,
     status_path: &'a Path,
     report_path: &'a Path,
 }
@@ -300,12 +306,15 @@ impl Lifecycle for Production<'_> {
         contributions: Option<&mut QueueContributions>,
     ) -> code::Attempt {
         let session = code::Session::new(self.config, self.scope);
-        session.run_ticket_attempt_in(
-            &ticket.to_markdown(),
-            handover,
-            contributions,
-            self.invocation(),
-        )
+        let mut kickoff = ticket.to_markdown();
+        if let Some(context) = self
+            .triage
+            .and_then(|report| report.agent_context_for(ticket.id.trim()))
+        {
+            kickoff.push('\n');
+            kickoff.push_str(&context);
+        }
+        session.run_ticket_attempt_in(&kickoff, handover, contributions, self.invocation())
     }
 
     fn verify(&mut self, ticket: &Ticket) -> Result<(), String> {
@@ -403,6 +412,7 @@ pub fn run_with_prior_in(
         scope,
         root,
         session_dir: None,
+        triage: None,
         status_path,
         report_path,
     };
@@ -533,21 +543,26 @@ pub(crate) fn run_with_prior_contributions_in(
         scope,
         root,
         None,
+        None,
         prior_completed,
         set,
         invocation,
     )
 }
 
-/// The accumulator-aware run with the invocation's session directory carried
-/// into every fresh code-agent attempt. The directory is never retained: it is
-/// supplied per queue invocation, so a later ask with a different directory
-/// writes there instead.
+/// The accumulator-aware run with the invocation's session directory and
+/// validated triage report carried into every fresh code-agent attempt. Neither
+/// is retained: both are supplied per queue invocation, so a later ask with a
+/// different directory or report composes its work from that invocation alone.
+/// A caller with no triage report passes `None` and keeps the pre-existing
+/// ticket-only kickoff.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_prior_contributions_in_session(
     config: &Config,
     scope: &str,
     root: &Path,
     session_dir: Option<&Path>,
+    triage: Option<&TriageReport>,
     prior_completed: &[Ticket],
     set: &TicketSet,
     invocation: QueueInvocation<'_>,
@@ -557,6 +572,7 @@ pub(crate) fn run_with_prior_contributions_in_session(
         scope,
         root,
         session_dir,
+        triage,
         status_path: invocation.status_path,
         report_path: invocation.report_path,
     };
@@ -2406,6 +2422,7 @@ mod lifecycle_tests {
             scope: "",
             root,
             session_dir,
+            triage: None,
             status_path: Path::new("unused-queue.json"),
             report_path: Path::new("unused-queue-report.md"),
         }

@@ -1117,7 +1117,7 @@ fn when_reviewing_given_three_fix_rounds_then_runs_fourth_verification_review() 
     );
     for (id, payload) in executed_ticket_ids().iter().zip(&payloads) {
         assert!(
-            payload.ends_with(&ticket_artifact(dir, id)),
+            payload.contains(&ticket_artifact(dir, id)),
             "ticket {id} was not run from its own ticket artifact"
         );
     }
@@ -1757,6 +1757,43 @@ fn code_payloads(transport: &common::ScriptedTransport) -> Vec<String> {
         .collect()
 }
 
+/// The code-agent request bodies the run actually sent, in order.
+fn code_requests(transport: &common::ScriptedTransport) -> Vec<serde_json::Value> {
+    transport
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| body.to_string().contains(common::CODE_MARKER))
+        .cloned()
+        .collect()
+}
+
+/// Every user message one code-agent request carried, in order. The first is
+/// the kickoff; a retry adds the handover as one separate later message.
+fn request_user_messages(body: &serde_json::Value) -> Vec<String> {
+    body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Run the one-ticket scripted pipeline over a caller-built transport.
+fn run_scripted_transport(transport: Arc<common::ScriptedTransport>) -> (Step, PathBuf) {
+    let config = common::scripted_pipeline_with_transport(transport);
+    let dir = scratch_dir();
+    let repository = common::TempRepo::at(dir.clone());
+    repository.commit_baseline();
+    let mut pipeline = Pipeline::new(&config, common::scope(), repository.path());
+    let step = pipeline.ask(&common::harmless_plan_request(), &dir);
+    repository.keep();
+    (step, dir)
+}
+
 /// The position of the one triage request the run made.
 fn triage_request_index(transport: &common::ScriptedTransport) -> usize {
     transport
@@ -2119,12 +2156,36 @@ fn when_triaging_tickets_given_one_blocked_ticket_in_multiple_then_runs_no_parti
 // -- Contract & Invariant Checks -------------------------------------------
 
 #[test]
-fn when_triaging_tickets_given_all_ready_then_code_request_matches_original_ticket_artifact() {
+fn when_starting_code_work_given_ready_ticket_then_includes_matching_triage_context() {
     let (step, dir, transport) = triage_run(common::TriageScript::AllReady);
     assert!(matches!(step, Step::Complete), "{step:?}");
 
     let artifact = fs::read_to_string(dir.join("tickets/1-verify-command-output.md"))
         .unwrap_or_else(|e| common::failed("the ticket artifact", &e.to_string()));
+    assert!(
+        !artifact.contains("# Triage Audit"),
+        "the on-disk ticket artifact must stay canonical: {artifact}"
+    );
+    assert!(
+        !artifact.contains(common::BRIEF_MARKER),
+        "triage content must never be written into the ticket artifact: {artifact}"
+    );
+
+    let expected_context = concat!(
+        "# Triage Audit\n\n",
+        "## Audit Notes\n\n",
+        "- Audited `1-verify-command-output` against the repository.\n\n",
+        "## Agent Brief\n\n",
+        "**Target behavior:** TRIAGE-ONLY-BRIEF: implement Verify command outputs exactly 'ejaj-e2e-ok'.\n\n",
+        "**Acceptance criteria:**\n\n",
+        "- [Pass] The command outputs exactly \"ejaj-e2e-ok\" when run\n",
+        "- [Fail] The command fails if the output differs from \"ejaj-e2b-ok\"\n\n",
+        "**Out of scope:**\n\n",
+        "- No code changes required\n",
+        "- No additional features to implement\n",
+        "- No error handling for missing commands\n",
+    );
+    let expected_suffix = format!("{artifact}\n{expected_context}");
 
     let payloads = code_payloads(&transport);
     assert!(
@@ -2133,21 +2194,174 @@ fn when_triaging_tickets_given_all_ready_then_code_request_matches_original_tick
     );
     for payload in &payloads {
         assert!(
-            payload.ends_with(&artifact),
-            "the code-agent payload must end with exactly the ticket artifact bytes: {payload}"
+            payload.ends_with(&expected_suffix),
+            "the kickoff must be the canonical ticket followed by its audit context: {payload}"
         );
-        assert!(
-            !payload.contains(common::BRIEF_MARKER),
-            "the triage Agent Brief must never reach the code agent: {payload}"
-        );
-        assert!(!payload.contains("### Agent Brief"), "{payload}");
-        assert!(!payload.contains("# Ticket triage report"), "{payload}");
     }
 
-    // The marker really is in the triage artifact, so the absence above is the
-    // one-request contract and not an empty brief.
-    let report = triage_artifact(&dir);
-    assert!(report.contains(common::BRIEF_MARKER), "{report}");
+    let after = fs::read_to_string(dir.join("tickets/1-verify-command-output.md"))
+        .unwrap_or_else(|e| common::failed("the ticket artifact", &e.to_string()));
+    assert_eq!(
+        after, artifact,
+        "the queue must not rewrite or augment the ticket artifact"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_blocked_triage_given_ready_context_elsewhere_then_starts_no_code_request() {
+    let (step, dir, transport) =
+        multi_triage_run(common::TriageScript::OneBlocked(TriageState::NeedsInfo));
+
+    assert!(
+        matches!(step, Step::Retry),
+        "the blocked set returns to the plan REPL: {step:?}"
+    );
+    assert!(
+        triage_artifact(&dir).contains(common::BRIEF_MARKER),
+        "the retained report really carries context for the ready tickets"
+    );
+    assert_no_queue(&dir, &transport);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_retrying_code_work_given_ready_ticket_then_reuses_kickoff_before_handover() {
+    let transport = Arc::new(
+        common::ScriptedTransport::new()
+            .with_gate(common::GateScript::Failing)
+            .with_triage(common::TriageScript::AllReady)
+            .with_code_replies(vec![
+                common::CodeReply::Complete(Some("first attempt narration".to_string())),
+                common::CodeReply::Complete(Some("retry narration".to_string())),
+            ]),
+    );
+    let (step, dir) = run_scripted_transport(transport.clone());
+    assert!(
+        !matches!(step, Step::Complete),
+        "the failing gate leaves the queue incomplete: {step:?}"
+    );
+
+    let requests = code_requests(&transport);
+    assert_eq!(requests.len(), 2, "one fresh request per attempt");
+    let first_users = request_user_messages(&requests[0]);
+    let second_users = request_user_messages(&requests[1]);
+    assert_eq!(first_users.len(), 1, "the first attempt has one kickoff");
+    assert_eq!(
+        second_users.len(),
+        2,
+        "the retry keeps the kickoff and adds a separate handover message"
+    );
+    assert_eq!(
+        first_users[0], second_users[0],
+        "every fresh attempt reuses the composed kickoff"
+    );
+    assert!(
+        first_users[0].contains("# Triage Audit")
+            && first_users[0].contains("## Agent Brief")
+            && first_users[0].contains(common::BRIEF_MARKER),
+        "the kickoff must carry the matching audit context: {}",
+        first_users[0]
+    );
+    assert!(
+        second_users[1].contains("[RETRY HANDOVER]"),
+        "the handover remains its own later message: {}",
+        second_users[1]
+    );
+    assert!(
+        !second_users[1].contains("# Triage Audit"),
+        "the handover does not replace or duplicate the kickoff: {}",
+        second_users[1]
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_running_without_triage_given_existing_queue_entry_point_then_sends_ticket_only() {
+    let transport = Arc::new(common::ScriptedTransport::new());
+    let config = common::scripted_pipeline_with_transport(transport.clone());
+    let dir = scratch_dir();
+    fs::create_dir_all(dir.join("tickets")).expect("the ticket directory is creatable");
+    let repository = common::TempRepo::at(dir.clone());
+    repository.commit_baseline();
+
+    let value: serde_json::Value =
+        serde_json::from_str(common::harmless_tickets_json()).expect("the ticket fixture is JSON");
+    let set: TicketSet = serde_json::from_value(value["tickets"].clone())
+        .expect("the ticket fixture carries a ticket set");
+    let status_path = dir.join("tickets/queue-status.json");
+    let report_path = dir.join("queue-report.md");
+    let result = ejaj::orchestrator::run_in(
+        &config,
+        common::scope(),
+        repository.path(),
+        &set,
+        &status_path,
+        &report_path,
+    );
+    repository.keep();
+    assert!(
+        matches!(result.outcome, ejaj::orchestrator::Outcome::Resolved),
+        "the no-triage queue resolves: {:?}",
+        result.outcome
+    );
+
+    let payloads = code_payloads(&transport);
+    assert!(!payloads.is_empty(), "the no-triage queue still runs");
+    for payload in &payloads {
+        assert!(
+            payload.contains("# 1-verify-command-output:"),
+            "the public no-triage entry point sends the ticket: {payload}"
+        );
+        assert!(
+            !payload.contains("# Triage Audit")
+                && !payload.contains("## Audit Notes")
+                && !payload.contains("## Agent Brief"),
+            "a no-triage entry point must send no audit context: {payload}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_running_review_fix_given_no_matching_triage_entry_then_omits_context() {
+    let transport = Arc::new(
+        common::ScriptedTransport::new()
+            .with_triage(common::TriageScript::AllReady)
+            .with_review(common::ReviewScript::FixOnceThenPass),
+    );
+    let (step, dir) = run_scripted_transport(transport.clone());
+    assert!(matches!(step, Step::Complete), "{step:?}");
+
+    let payloads = code_payloads(&transport);
+    let original: Vec<&String> = payloads
+        .iter()
+        .filter(|payload| payload.contains("# 1-verify-command-output:"))
+        .collect();
+    let fix: Vec<&String> = payloads
+        .iter()
+        .filter(|payload| payload.contains("# r1-1-verify-edge-case:"))
+        .collect();
+    assert!(!original.is_empty(), "the original ready ticket runs");
+    assert!(!fix.is_empty(), "the review-generated fix ticket runs");
+    for payload in original {
+        assert!(
+            payload.contains("# Triage Audit") && payload.contains(common::BRIEF_MARKER),
+            "the original ready ticket receives its matching context: {payload}"
+        );
+    }
+    for payload in fix {
+        assert!(
+            !payload.contains("# Triage Audit")
+                && !payload.contains("## Audit Notes")
+                && !payload.contains("## Agent Brief"),
+            "an unmatched generated fix must receive no audit context: {payload}"
+        );
+    }
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -2293,8 +2507,8 @@ fn when_triaging_tickets_given_one_ready_ticket_then_runs_original_ticket() {
     assert!(
         code_payloads(&transport)
             .iter()
-            .any(|payload| payload.ends_with(&artifact)),
-        "the original ticket is exactly what the code agent ran"
+            .any(|payload| payload.contains(&artifact)),
+        "the original ticket content is what the code agent ran"
     );
 
     let _ = fs::remove_dir_all(&dir);

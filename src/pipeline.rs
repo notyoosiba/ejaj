@@ -584,6 +584,7 @@ impl Pipeline {
                 &self.scope,
                 &self.root,
                 Some(dir),
+                progress.triage.as_ref(),
                 &progress.prior_completed,
                 &progress.current_set,
                 orchestrator::QueueInvocation {
@@ -1027,6 +1028,12 @@ struct ReviewProgress {
     prior_completed: Vec<Ticket>,
     all_tickets: Vec<Ticket>,
     current_set: TicketSet,
+    /// The validated triage report that authorized this loop, retained for every
+    /// queue round -- the first, each review-generated fix round, and their
+    /// retries -- so every matching ready ticket can carry its audit context.
+    /// A caller that supplied no triage report retains `None` and sends every
+    /// ticket alone.
+    triage: Option<TriageReport>,
     reviews: Vec<ReviewReport>,
     review_markdown: String,
     review_round: usize,
@@ -1072,6 +1079,7 @@ impl ReviewProgress {
             prior_completed,
             all_tickets,
             current_set: TicketSet { tickets: current },
+            triage: Some(triage.clone()),
             reviews: Vec::new(),
             review_markdown: String::new(),
             review_round: 0,

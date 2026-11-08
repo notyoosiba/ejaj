@@ -17,7 +17,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md) | [x] Complete (T02, T06, T07 done) | `T02`, `T06`, `T07` | `src/prompts/tickets.rs`, `src/prompts/triage.rs` |
 | [`PROPOSAL-14-pre-planned-task-fast-track.md`](./.plans/PROPOSAL-14-pre-planned-task-fast-track.md) | [x] Complete (T19 done) | `T19` | `src/prompts/plan.rs`, `tests/prompt_contract.rs` |
 | [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | [x] Complete (T07, T08 done) | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
-| [`PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md) | `[ ]` Pending | `T09` | `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs` |
+| [`PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md) | [x] Complete (T09 done) | `T09` | `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md) | `[ ]` Pending | `T10` | `src/orchestrator.rs`, `src/pipeline.rs` |
 | [`05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md) | `[ ]` Pending | `T11` | `src/tools.rs` |
 | [`09-file-editing-and-patch-matching.md`](./.plans/09-file-editing-and-patch-matching.md) | `[ ]` Pending | `T12` | `src/script.rs` |
@@ -65,7 +65,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
       │        [x] [T08] PROPOSAL-1b: Pipeline pre-completion & unblocking for Done tickets (src/pipeline.rs)
       │          │
       │          ▼
-      │        [ ] [T09] PROPOSAL-5: Forward Triage notes & AgentBrief to Code kickoff (src/{triage,orchestrator,pipeline}.rs)
+      │        [x] [T09] PROPOSAL-5: Forward Triage notes & AgentBrief to Code kickoff (src/{triage,orchestrator,pipeline}.rs)
       │          │
       │          ▼
       │        [ ] [T10] PROPOSAL-7: Gate failure excerpts in queue-report.md (src/{orchestrator,pipeline}.rs)
@@ -201,7 +201,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `TODO.md`, mark `T08` complete (`[x]`) in the DAG and ordered backlog and mark `PROPOSAL-1-triage-done-state.md` `[x] Complete (T07, T08 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T09` — Forward Triage `notes` and `AgentBrief` to Code Agent Kickoff**
+- [x] **`T09` — Forward Triage `notes` and `AgentBrief` to Code Agent Kickoff**
   - `depends_on`: `["T08"]`
   - `unblocks`: `["T10"]`
   - `plans`: [`.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md)

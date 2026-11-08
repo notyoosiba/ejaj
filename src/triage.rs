@@ -32,6 +32,13 @@ pub const TRIAGE_ARTIFACT: &str = "ticket-triage.md";
 pub const TRIAGE_TITLE: &str = "# Ticket triage report";
 /// The heading that opens a ready classification's Agent Brief.
 pub const BRIEF_HEADING: &str = "### Agent Brief";
+
+/// The heading that opens the triage audit block forwarded to the code agent.
+pub const AUDIT_CONTEXT_HEADING: &str = "# Triage Audit";
+/// The heading that opens the forwarded audit notes.
+pub const AUDIT_NOTES_HEADING: &str = "## Audit Notes";
+/// The heading that opens the forwarded Agent Brief.
+pub const AUDIT_BRIEF_HEADING: &str = "## Agent Brief";
 /// The boundary-matrix entry for user authorization.
 ///
 /// Triaging a draft ticket set has no user-authorization boundary: a
@@ -374,6 +381,31 @@ impl TriageReport {
         document.push('\n');
         document
     }
+
+    /// Render the validated audit notes and Agent Brief for `ticket_id`, when
+    /// that ticket is present, ready for an agent, and carries a brief.
+    ///
+    /// The returned block begins with [AUDIT_CONTEXT_HEADING] and renders only
+    /// the ticket-specific notes and brief lists; it never carries the whole
+    /// report, another ticket's context, blocker explanations, or the brief's
+    /// `blocked_by` dependencies. A blank requested id, a missing match, a
+    /// non-ready state, or a missing brief returns `None`, so forwarding is
+    /// never an error and never changes queue progress.
+    pub fn agent_context_for(&self, ticket_id: &str) -> Option<String> {
+        let requested = ticket_id.trim();
+        if requested.is_empty() {
+            return None;
+        }
+        let classification = self
+            .tickets
+            .iter()
+            .find(|classification| classification.ticket_id.trim() == requested)?;
+        if !classification.state.is_ready() {
+            return None;
+        }
+        let brief = classification.agent_brief.as_ref()?;
+        Some(audit_context(classification, brief))
+    }
 }
 
 /// Validate one classification against the draft ticket it classifies.
@@ -600,6 +632,29 @@ fn classification_markdown(id: &str, title: &str, classification: &TriageTicket)
         block.push_str(&brief_markdown(brief));
     }
 
+    block
+}
+
+/// One ticket's forwarded triage context: its audit notes and Agent Brief as
+/// the block appended after the canonical ticket kickoff.
+///
+/// Every list renders through [bullets], so whitespace-only entries are dropped,
+/// nonblank entries are trimmed and keep their order, and an empty rendered list
+/// uses the [NONE] fallback. The brief's `blocked_by` list is deliberately not
+/// rendered: the ticket's own front matter already carries the dependencies.
+fn audit_context(classification: &TriageTicket, brief: &AgentBrief) -> String {
+    let mut block = format!(
+        "{AUDIT_CONTEXT_HEADING}\n\n{AUDIT_NOTES_HEADING}\n\n{}",
+        bullets(&classification.notes)
+    );
+    block.push_str(&format!(
+        "\n\n{AUDIT_BRIEF_HEADING}\n\n**Target behavior:** {}\n\n\
+         **Acceptance criteria:**\n\n{}\n\n**Out of scope:**\n\n{}",
+        brief.target_behavior.trim(),
+        bullets(&brief.acceptance_criteria),
+        bullets(&brief.out_of_scope)
+    ));
+    block.push('\n');
     block
 }
 
@@ -2027,5 +2082,133 @@ cargo test triage::tests
                 "{payload} must not deserialize into a report"
             );
         }
+    }
+
+    // -- Forwarded audit context -------------------------------------------
+
+    #[test]
+    fn when_rendering_context_given_missing_blank_or_nonready_classification_then_returns_none() {
+        let ready = ready_classification("1-first", "First slice", &[]);
+        let blocked = blocked_classification(
+            "2-second",
+            "Second slice",
+            TriageState::NeedsInfo,
+            "The draft ticket needs a human answer.",
+        );
+        let report = report_of(vec![ready.clone(), blocked]);
+
+        assert!(
+            report.agent_context_for("1-first").is_some(),
+            "the matching ready classification must render context"
+        );
+        for requested in ["", "   ", "3-absent", "2-second"] {
+            assert_eq!(
+                report.agent_context_for(requested),
+                None,
+                "requested id {requested:?} must not render context"
+            );
+        }
+
+        let absent_report = report_of(Vec::new());
+        assert_eq!(absent_report.agent_context_for("1-first"), None);
+
+        let mut without_brief = ready;
+        without_brief.agent_brief = None;
+        assert_eq!(
+            report_of(vec![without_brief]).agent_context_for("1-first"),
+            None,
+            "a ready classification with no brief must not render context"
+        );
+    }
+
+    #[test]
+    fn when_rendering_context_given_blank_only_list_entries_then_uses_empty_list_fallback() {
+        let mut classification = ready_classification("1-first", "First slice", &[]);
+        let mut brief = classification
+            .agent_brief
+            .take()
+            .expect("the ready fixture carries a brief");
+        classification.notes = vec!["   ".to_string(), "\t".to_string()];
+        brief.target_behavior = "  Implement First slice.  ".to_string();
+        brief.acceptance_criteria = vec!["  ".to_string(), String::new()];
+        brief.out_of_scope = vec!["\t".to_string()];
+        classification.agent_brief = Some(brief);
+
+        let context = report_of(vec![classification])
+            .agent_context_for("1-first")
+            .expect("the ready classification renders context");
+
+        assert_eq!(
+            context,
+            concat!(
+                "# Triage Audit\n\n",
+                "## Audit Notes\n\n",
+                "None.\n\n",
+                "## Agent Brief\n\n",
+                "**Target behavior:** Implement First slice.\n\n",
+                "**Acceptance criteria:**\n\n",
+                "None.\n\n",
+                "**Out of scope:**\n\n",
+                "None.\n",
+            )
+        );
+    }
+
+    #[test]
+    fn when_rendering_context_given_multiple_notes_and_brief_entries_then_preserves_every_entry_in_order()
+     {
+        let mut first = ready_classification("1-first", "First slice", &["0-base"]);
+        let mut first_brief = first
+            .agent_brief
+            .take()
+            .expect("the ready fixture carries a brief");
+        first.notes = vec![
+            "  First audit note.  ".to_string(),
+            "   ".to_string(),
+            "Second audit note.".to_string(),
+            "Third audit note.".to_string(),
+        ];
+        first_brief.target_behavior = "  Deliver the first slice.  ".to_string();
+        first_brief.acceptance_criteria = vec![
+            "  First criterion.  ".to_string(),
+            String::new(),
+            "Second criterion.".to_string(),
+            "Third criterion.".to_string(),
+        ];
+        first_brief.out_of_scope = vec![
+            "  Do not touch the second slice.  ".to_string(),
+            "\t".to_string(),
+            "Do not touch the third slice.".to_string(),
+        ];
+        first_brief.blocked_by = vec!["0-base".to_string()];
+        first.agent_brief = Some(first_brief);
+        let second = ready_classification("2-second", "Second slice", &[]);
+
+        let context = report_of(vec![first, second])
+            .agent_context_for(" 1-first ")
+            .expect("the trimmed requested id matches");
+
+        assert_eq!(
+            context,
+            concat!(
+                "# Triage Audit\n\n",
+                "## Audit Notes\n\n",
+                "- First audit note.\n",
+                "- Second audit note.\n",
+                "- Third audit note.\n\n",
+                "## Agent Brief\n\n",
+                "**Target behavior:** Deliver the first slice.\n\n",
+                "**Acceptance criteria:**\n\n",
+                "- First criterion.\n",
+                "- Second criterion.\n",
+                "- Third criterion.\n\n",
+                "**Out of scope:**\n\n",
+                "- Do not touch the second slice.\n",
+                "- Do not touch the third slice.\n",
+            )
+        );
+        assert!(!context.contains("Blocked by"), "{context}");
+        assert!(!context.contains("0-base"), "{context}");
+        assert!(!context.contains("Second slice"), "{context}");
     }
 }

@@ -654,8 +654,9 @@ pub enum CodeScript {
 }
 
 /// The marker every scripted `ready-for-agent` classification's Agent Brief
-/// carries. It is unique to the brief, so a test can prove the brief never
-/// reaches the code agent's payload.
+/// carries. It is unique to the brief, so a test can prove the matching
+/// ticket's forwarded audit block reaches the code kickoff while a generated
+/// fix ticket's kickoff omits it.
 pub const BRIEF_MARKER: &str = "TRIAGE-ONLY-BRIEF";
 
 /// A phrase only the triage kickoff carries. The scripted transport reads it
