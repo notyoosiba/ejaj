@@ -22,7 +22,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md) | `[x]` Complete (T11 done) | `T11` | `src/tools.rs` |
 | [`09-file-editing-and-patch-matching.md`](./.plans/09-file-editing-and-patch-matching.md) | `[x]` Complete (T12 done) | `T12` | `src/script.rs` |
 | [`12-http-retry-and-overload-resilience.md`](./.plans/12-http-retry-and-overload-resilience.md) | `[x]` Complete (T13 done) | `T13` | `src/retry.rs` |
-| [`07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md) | `[ ] Pending (T14 done; T15 pending)` | `T14`, `T15` | `src/api.rs`, `src/llm/`, `src/loops/agent.rs` |
+| [`07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md) | `[x] Complete (T14, T15 done)` | `T14`, `T15` | `src/api.rs`, `src/llm/`, `src/loops/agent.rs` |
 | [`PROPOSAL-2-review-pass-retry.md`](./.plans/PROPOSAL-2-review-pass-retry.md) | `[ ]` Pending | `T16` | `src/pipeline.rs` |
 | [`11-context-compaction-and-overflow-recovery.md`](./.plans/11-context-compaction-and-overflow-recovery.md) | `[ ]` Pending | `T17` | `src/loops/agent.rs` |
 | [`08-conversation-trajectory-persistence.md`](./.plans/08-conversation-trajectory-persistence.md) | `[ ]` Pending | `T18` | `src/loops/agent.rs`, `src/tools.rs` |
@@ -78,7 +78,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
       ├──► [x] [T14] 07a: Output-token truncation detection across providers (src/api.rs, llm) │  │
       │          │                                                                             │  │
       │          ▼                                                                             │  │
-      │        [ ] [T15] 07b: In-loop truncation recovery & tool repetition guard (agent.rs)   │  │
+      │        [x] [T15] 07b: In-loop truncation recovery & tool repetition guard (agent.rs)   │  │
       │          ├──────────────────────────┐                                                  │  │
       │          ▼                          ▼                                                  │  │
       │        [ ] [T16] PROPOSAL-2:      [ ] [T17] 11: Compaction retry, summary merge        │  │
@@ -274,7 +274,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `TODO.md` only (do not edit `.plans/07-in-loop-truncation-and-tool-recovery.md`), mark `T14` complete (`[x]`) in the DAG and ordered backlog and update the `07-in-loop-truncation-and-tool-recovery.md` row in the `TODO.md` status matrix to `[ ]` Pending (T14 done; T15 pending) right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib api && cargo test --lib llm && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T15` — In-Loop Truncation Recovery & Tool-Call Repetition Guard**
+- [x] **`T15` — In-Loop Truncation Recovery & Tool-Call Repetition Guard**
   - `depends_on`: `["T14"]`
   - `unblocks`: `["T16", "T17"]`
   - `plans`: [`.plans/07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md)

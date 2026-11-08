@@ -65,6 +65,40 @@ const HANDOVER_SUMMARY_LABELS: [&str; 4] = [
 /// answer with text only.
 const HANDOVER_SUMMARY_INSTRUCTION: &str = "[HANDOVER SUMMARY REQUEST] The transcript above has been compacted. Write one concise handover summary so the same agent can continue the work without re-reading it. Begin the reply with `[HANDOVER SUMMARY]` and use these labeled lines: `Completed/work context:`, `Decisions:`, `Unresolved work/blockers:`, `Relevant findings:`. Do not call tools; reply with text only.";
 
+/// How many consecutive truncation recoveries one invocation may request
+/// before a still-truncated tool-free reply is accepted as the turn's end.
+const MAX_TRUNCATION_RECOVERIES: usize = 2;
+
+/// The concise instruction appended after a truncated tool-free reply. It asks
+/// the model to continue from the partial reply in the same transcript and to
+/// complete either its intended prose or the tool call it meant to make.
+const TRUNCATION_RECOVERY_INSTRUCTION: &str = "The assistant reply above was cut off. Continue from that partial reply and complete the intended response or tool call. Do not repeat completed content.";
+
+/// How many consecutive assistant turns may issue the same ordered tool calls
+/// before the loop appends a redirect notice to the newest turn's last result.
+const REPEATED_TOOL_CALL_WARN_THRESHOLD: usize = 3;
+
+/// The first consecutive identical tool-call turn the loop stops before any of
+/// its calls are parsed or dispatched.
+const REPEATED_TOOL_CALL_ABORT_THRESHOLD: usize = 5;
+
+/// The most bytes of the ordered canonical-arguments preview the redirect
+/// notice carries. The cut never splits a UTF-8 code point.
+const REPEATED_TOOL_CALL_PREVIEW_BYTES: usize = 500;
+
+/// The stderr warning logged when a repeating turn is redirected.
+const REPEATED_TOOL_CALL_WARNING: &str =
+    "[WARN] repeated tool calls; asking the model to choose a different action";
+
+/// The stderr warning logged when an over-repeating turn is stopped before
+/// dispatch.
+const REPEATED_TOOL_CALL_ABORT_WARNING: &str =
+    "[WARN] repeated tool calls; stopping before the step limit";
+
+/// The fixed leading text of the redirect notice appended to a repeating
+/// turn's last delivered tool result.
+const REPEATED_TOOL_CALL_REDIRECT: &str = "[WARN: repeated tool calls] Your last turns issued the same tool calls. Choose a different action instead of repeating them. Canonical arguments preview: ";
+
 /// Why the tool loop stopped. Every exit carries its own meaning, so the caller
 /// can report what actually happened instead of assuming success.
 // The plan, specification and ticket-set payloads are large, but they are moved
@@ -699,6 +733,14 @@ fn run_agent_loop_capturing(
     // write; Drop covers the error returns and the final break. The size shown
     // comes from the request about to be sent.
     let mut status = status::Status::new();
+    // How many recovery prompts this invocation has appended since the last
+    // reply that carried a tool call. It is invocation-local: a new call to the
+    // loop starts a new conversation state, and any tool-call reply proves the
+    // model resumed, so the count begins again from zero.
+    let mut consecutive_recoveries = 0usize;
+    // The signature and consecutive count of the newest tool-call turn. It is
+    // invocation-local, and a tool-free turn clears it.
+    let mut repeated_tool_turns: Option<(Vec<(String, String)>, usize)> = None;
     for step_idx in 0..MAX_STEPS {
         let step = step_idx + 1;
         let provider = config.provider(phase);
@@ -788,12 +830,37 @@ fn run_agent_loop_capturing(
         // Replay the assistant message (reasoning_content and tool_calls
         // included) before answering its tool calls, as the API requires.
         let tool_calls = assistant.tool_calls.clone().unwrap_or_default();
+        // Count this turn's ordered calls before anything is parsed or
+        // dispatched, so a rejected call counts exactly like an executed one. A
+        // tool-free turn clears the sequence instead of extending it.
+        let (redirect_repeated_turn, abort_repeated_turn) =
+            repeated_tool_turn_action(&mut repeated_tool_turns, &tool_calls);
+        if abort_repeated_turn {
+            // The response is already received, but none of its calls may run:
+            // no result is appended and no further request is sent.
+            let _ = status::shared().stderr_log(REPEATED_TOOL_CALL_ABORT_WARNING);
+            return Stop::Failed(FailureKind::StepLimit);
+        }
         messages.push(assistant);
         // Where that message landed. Its tool results are appended after it, so
         // a control-tool exit below cannot simply look at the last element.
         let assistant_index = messages.len() - 1;
 
         if tool_calls.is_empty() {
+            // A tool-free reply that the provider stopped at its output limit
+            // is not a finished turn: append one concise instruction after the
+            // partial assistant message and continue in the same transcript.
+            // At most two consecutive prompts are allowed; after that the
+            // still-truncated reply is accepted as the phase's own end. At the
+            // final available step the appended prompt is never sent, so the
+            // existing step limit still governs.
+            if messages[assistant_index].truncated
+                && consecutive_recoveries < MAX_TRUNCATION_RECOVERIES
+            {
+                messages.push(Message::user(TRUNCATION_RECOVERY_INSTRUCTION));
+                consecutive_recoveries += 1;
+                continue;
+            }
             // The summary phase has no control tool to end it, so the model's
             // own last turn is the answer: its text -- absent when the turn
             // carried none -- is handed to the caller exactly as it was
@@ -805,6 +872,10 @@ fn run_agent_loop_capturing(
             return Stop::TurnEnd;
         }
 
+        // Any tool-call reply -- truncated or not -- shows the model resumed
+        // its work, so the consecutive recovery count starts over.
+        consecutive_recoveries = 0;
+
         let mut runner = CallRunner {
             phase,
             source,
@@ -814,8 +885,15 @@ fn run_agent_loop_capturing(
             contributions: contributions.as_deref_mut(),
             bash_calls: 0,
         };
-        if let CallOutcome::Stop(stop) = runner.run(messages, assistant_index, &tool_calls, waiting)
-        {
+        let outcome = runner.run(messages, assistant_index, &tool_calls, waiting);
+        if redirect_repeated_turn {
+            // The calls have now delivered their results; point the model at the
+            // repetition. A turn that delivered no result still gets the warning,
+            // it simply has nothing to annotate.
+            let _ = status::shared().stderr_log(REPEATED_TOOL_CALL_WARNING);
+            annotate_last_tool_result(messages, assistant_index, &tool_turn_signature(&tool_calls));
+        }
+        if let CallOutcome::Stop(stop) = outcome {
             return stop;
         }
 
@@ -963,6 +1041,133 @@ fn with_step_warning(text: String, step: usize) -> String {
 /// included -- stays within the delivery cap.
 fn cap_tool_result(text: String) -> String {
     cap_tool_output(text, TOOL_RESULT_BYTES)
+}
+
+/// Observe one assistant turn and report whether it is the redirect or abort
+/// threshold of a consecutive identical tool-call sequence.
+///
+/// A tool-free turn is not part of a tool-call sequence, so it clears the
+/// remembered signature. Every tool-call turn is counted before any call is
+/// parsed or dispatched, so a rejected call counts exactly like an executed one.
+/// The returned flags are (redirect, abort).
+fn repeated_tool_turn_action(
+    last: &mut Option<(Vec<(String, String)>, usize)>,
+    tool_calls: &[ToolCall],
+) -> (bool, bool) {
+    if tool_calls.is_empty() {
+        *last = None;
+        return (false, false);
+    }
+    let signature = tool_turn_signature(tool_calls);
+    let count = match last.take() {
+        Some((previous, count)) if previous == signature => count + 1,
+        _ => 1,
+    };
+    *last = Some((signature, count));
+    (
+        count == REPEATED_TOOL_CALL_WARN_THRESHOLD,
+        count >= REPEATED_TOOL_CALL_ABORT_THRESHOLD,
+    )
+}
+
+/// One turn's ordered tool-call signature: every call's function name and
+/// canonical arguments, in emitted order. Tool-call ids and kinds are excluded.
+fn tool_turn_signature(tool_calls: &[ToolCall]) -> Vec<(String, String)> {
+    tool_calls
+        .iter()
+        .map(|call| {
+            (
+                call.function.name.clone(),
+                canonical_arguments(&call.function.arguments),
+            )
+        })
+        .collect()
+}
+
+/// Canonicalize one argument string. Valid JSON is re-serialized compactly with
+/// every object's keys sorted recursively, preserving array order and every
+/// value; a string that is not valid JSON is kept byte-for-byte.
+fn canonical_arguments(arguments: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(value) => {
+            serde_json::to_string(&sort_json_keys(value)).unwrap_or_else(|_| arguments.to_string())
+        }
+        Err(_) => arguments.to_string(),
+    }
+}
+
+/// Recursively sort every object's keys, keeping array order and every value.
+fn sort_json_keys(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut entries: Vec<(String, serde_json::Value)> = object.into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, sort_json_keys(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sort_json_keys).collect())
+        }
+        other => other,
+    }
+}
+
+/// The canonical argument strings of a tool-call signature, joined by ` | `
+/// in call order and cut to REPEATED_TOOL_CALL_PREVIEW_BYTES at a UTF-8
+/// character boundary.
+fn canonical_arguments_preview(signature: &[(String, String)]) -> String {
+    let mut preview = String::new();
+    for (index, (_, arguments)) in signature.iter().enumerate() {
+        if index > 0 {
+            preview.push_str(" | ");
+        }
+        preview.push_str(arguments);
+    }
+    let end = floor_char_boundary(&preview, REPEATED_TOOL_CALL_PREVIEW_BYTES);
+    preview.truncate(end);
+    preview
+}
+
+/// Build the redirect notice for a repeating turn: the fixed instruction and
+/// the ordered canonical arguments preview of its signature.
+fn repeated_tool_call_notice(signature: &[(String, String)]) -> String {
+    format!(
+        "{REPEATED_TOOL_CALL_REDIRECT}{}",
+        canonical_arguments_preview(signature)
+    )
+}
+
+/// Append the redirect notice to one already-delivered tool result, cutting the
+/// result first so the notice stays intact at the tail and the whole value
+/// never exceeds TOOL_RESULT_BYTES.
+fn with_repeated_tool_call_notice(result: String, notice: &str) -> String {
+    let budget = TOOL_RESULT_BYTES.saturating_sub(notice.len() + 1);
+    let body = cap_tool_output(result, budget);
+    format!("{body}\n{notice}")
+}
+
+/// Append the redirect notice to the last tool result the given assistant turn
+/// delivered. A turn that delivered none has nothing to annotate; the caller
+/// logs the warning either way.
+fn annotate_last_tool_result(
+    messages: &mut [Message],
+    assistant_index: usize,
+    signature: &[(String, String)],
+) {
+    let notice = repeated_tool_call_notice(signature);
+    let Some(result) = messages[assistant_index + 1..]
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == Role::Tool)
+    else {
+        return;
+    };
+    let delivered = result.content.take().unwrap_or_default();
+    result.content = Some(with_repeated_tool_call_notice(delivered, &notice));
 }
 
 /// The shared final cap: retain a UTF-8-safe prefix of `text`, replace the
@@ -1683,6 +1888,53 @@ mod tests {
             }]
         })
         .to_string()
+    }
+
+    /// Like [`reply`], but numbering its tool-call ids from `first_id`. Repeated
+    /// turns must never reuse an id: the transcript pairing guard would reject
+    /// them before the repetition logic ever saw the next request.
+    fn reply_numbered(first_id: usize, content: Option<&str>, calls: &[(&str, String)]) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&reply(content, calls)).expect("the scripted reply is JSON");
+        if let Some(tool_calls) = value["choices"][0]["message"]["tool_calls"].as_array_mut() {
+            for (index, call) in tool_calls.iter_mut().enumerate() {
+                call["id"] = serde_json::json!(format!("call-{}", first_id + index));
+            }
+        }
+        value.to_string()
+    }
+
+    /// One truncated chat-completions assistant message: the same content and
+    /// calls as [`reply`], with the provider's `length` stop reason that marks
+    /// the message truncated.
+    fn truncated_reply(content: Option<&str>, calls: &[(&str, String)]) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&reply(content, calls)).expect("the scripted reply is JSON");
+        value["choices"][0]["finish_reason"] = serde_json::json!("length");
+        value.to_string()
+    }
+
+    /// One truncated chat-completions reply whose message omits `tool_calls`
+    /// entirely: the absent-list shape, as opposed to [`truncated_reply`]'s
+    /// explicit empty list.
+    fn truncated_reply_without_tool_calls(content: &str) -> String {
+        serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "role": "assistant", "content": content },
+            }]
+        })
+        .to_string()
+    }
+
+    /// One truncated native Anthropic Messages reply: the same blocks as
+    /// [`native_reply`], with the `max_tokens` stop reason that marks the
+    /// message truncated.
+    fn native_truncated_reply(content: Option<&str>, calls: &[(&str, String)]) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(&native_reply(content, calls))
+            .expect("the scripted reply is JSON");
+        value["stop_reason"] = serde_json::json!("max_tokens");
+        value.to_string()
     }
 
     fn finish_plan_arguments() -> String {
@@ -3223,6 +3475,16 @@ mod tests {
             .find(|message| message.role == Role::Tool)
             .and_then(|message| message.content.clone())
             .expect("the transcript must carry the tool result")
+    }
+
+    /// The tool result delivered for one call id, if any.
+    fn tool_result_for(messages: &[Message], id: &str) -> Option<String> {
+        messages
+            .iter()
+            .find(|message| {
+                message.role == Role::Tool && message.tool_call_id.as_deref() == Some(id)
+            })
+            .and_then(|message| message.content.clone())
     }
 
     /// Whether one transcript line is a permanent call echo rather than a log.
@@ -7099,5 +7361,921 @@ mod tests {
         let base = encoded_body_bytes(&prepared.outgoing.body);
         assert!(target > base, "the target body must exceed {base} bytes");
         target - base
+    }
+
+    // -----------------------------------------------------------------------
+    // Truncated tool-free reply recovery
+    //
+    // A provider can stop a reply at its output limit. When that reply also
+    // carries no tool call, the loop asks the model once -- at most twice in a
+    // row -- to continue in the same transcript before it treats the turn as
+    // finished. Only the external transport is scripted; every request body is
+    // observed at that boundary.
+    // -----------------------------------------------------------------------
+
+    /// The exact instruction the loop appends after a truncated tool-free
+    /// reply. Duplicated in the tests as an independent literal so a change to
+    /// the wording is a visible test failure, not a silently recomputed value.
+    const TRUNCATION_RECOVERY: &str = "The assistant reply above was cut off. Continue from that partial reply and complete the intended response or tool call. Do not repeat completed content.";
+
+    /// Core entry-point behavior and the minimum valid boundary: one truncated
+    /// tool-free reply earns exactly one recovery prompt, appended after the
+    /// partial assistant turn, with the earlier transcript preserved.
+    #[test]
+    fn when_reply_is_truncated_given_no_tool_calls_then_requests_recovery_in_same_conversation() {
+        const PARTIAL: &str = "I will inspect the build and";
+        let script = Script::new(vec![
+            truncated_reply(Some(PARTIAL), &[]),
+            reply(Some("done"), &[]),
+        ]);
+        let config = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &config, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(
+            script.requests(),
+            2,
+            "the partial reply earns exactly one recovery request"
+        );
+
+        let sent = recorded_messages(&script.sent()[1], "messages");
+        assert_eq!(
+            sent.len(),
+            4,
+            "the transcript gained the reply and one prompt"
+        );
+        assert_eq!(sent[0].role, Role::System);
+        assert_eq!(sent[0].content.as_deref(), Some("sys"));
+        assert_eq!(sent[1].role, Role::User);
+        assert_eq!(sent[1].content.as_deref(), Some("do it"));
+        assert_eq!(sent[2].role, Role::Assistant);
+        assert_eq!(
+            sent[2].content.as_deref(),
+            Some(PARTIAL),
+            "the partial assistant reply is replayed unchanged"
+        );
+        assert_eq!(sent[3].role, Role::User);
+        assert_eq!(
+            sent[3].content.as_deref(),
+            Some(TRUNCATION_RECOVERY),
+            "the recovery prompt follows the partial reply"
+        );
+    }
+
+    /// Core entry-point behavior and the maximum consecutive limit: two
+    /// recovery prompts are allowed, and the third truncated tool-free reply
+    /// ends the turn without another request. Summary returns its last answer;
+    /// every other phase returns the ordinary turn end.
+    #[test]
+    fn when_reply_stays_truncated_given_two_recoveries_then_ends_without_third_request() {
+        let script = Script::new(vec![
+            truncated_reply(Some("partial one"), &[]),
+            truncated_reply(Some("partial two"), &[]),
+            truncated_reply(Some("partial three"), &[]),
+        ]);
+        let code_config = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &code_config, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(
+            script.requests(),
+            3,
+            "two recovery requests follow the initial turn, and no third is sent"
+        );
+        let sent = recorded_messages(&script.sent()[2], "messages");
+        let recoveries = sent
+            .iter()
+            .filter(|message| {
+                message.role == Role::User
+                    && message.content.as_deref() == Some(TRUNCATION_RECOVERY)
+            })
+            .count();
+        assert_eq!(
+            recoveries, 2,
+            "both permitted prompts are in the transcript"
+        );
+
+        let script = Script::new(vec![
+            native_truncated_reply(Some("partial one"), &[]),
+            native_truncated_reply(Some("partial two"), &[]),
+            native_truncated_reply(Some("partial three"), &[]),
+        ]);
+        let summary_config = config(script.clone());
+        let mut messages = summary_transcript();
+
+        match run_agent_loop(&mut messages, &summary_config, Phase::Summary, Source::None) {
+            Stop::Summary(Some(answer)) => assert_eq!(answer, "partial three"),
+            _ => panic!("the exhausted summary returns its last assistant content"),
+        }
+        assert_eq!(
+            script.requests(),
+            3,
+            "the summary sends no request after its second recovery"
+        );
+        let bodies = script.sent();
+        let sent = bodies[2]["messages"]
+            .as_array()
+            .expect("the native request carries a messages array");
+        let recoveries = sent
+            .iter()
+            .filter(|message| {
+                message["role"] == serde_json::json!("user")
+                    && message["content"].as_array().is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|block| block["text"].as_str() == Some(TRUNCATION_RECOVERY))
+                    })
+            })
+            .count();
+        assert_eq!(recoveries, 2, "the summary allows exactly two prompts");
+    }
+
+    /// Malformed/Invalid payload boundary: a truncated summary with absent or
+    /// empty content ends with the absent answer preserved as `None`, and the
+    /// loop never invents content for it.
+    #[test]
+    fn when_reply_has_no_content_given_truncated_summary_then_preserves_absent_answer() {
+        for body in [
+            native_truncated_reply(None, &[]),
+            native_truncated_reply(Some(""), &[]),
+        ] {
+            let script = Script::new(vec![body.clone(), body.clone(), body]);
+            let config = config(script.clone());
+            let mut messages = summary_transcript();
+
+            match run_agent_loop(&mut messages, &config, Phase::Summary, Source::None) {
+                Stop::Summary(None) => {}
+                _ => panic!("a truncated summary with no content has no answer to report"),
+            }
+            assert_eq!(
+                script.requests(),
+                3,
+                "two recoveries precede the absent final answer"
+            );
+        }
+    }
+
+    /// Upper boundary: the existing step budget still governs. A truncated
+    /// tool-free reply at the final available iteration cannot earn a request
+    /// beyond `MAX_STEPS`, so the loop stops at the step limit.
+    #[test]
+    fn when_final_step_reply_is_truncated_given_recovery_would_exceed_budget_then_stops_at_step_limit()
+     {
+        let mut bodies = Vec::new();
+        for index in 0..MAX_STEPS - 1 {
+            // Every step needs its own call id and arguments: a repeated id is
+            // an invalid transcript, and a repeated signature would trip the
+            // repeated-tool-call guard before the step limit.
+            let mut body: serde_json::Value = serde_json::from_str(&reply(
+                Some("working"),
+                &[("no_such_tool", format!(r#"{{"step":{index}}}"#))],
+            ))
+            .expect("the scripted reply is JSON");
+            body["choices"][0]["message"]["tool_calls"][0]["id"] =
+                serde_json::json!(format!("call-{index}"));
+            bodies.push(body.to_string());
+        }
+        bodies.push(truncated_reply(Some("partial at the limit"), &[]));
+        let script = Script::new(bodies);
+        let config = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &config, Phase::Code, Source::None),
+            Stop::Failed(FailureKind::StepLimit)
+        ));
+        assert_eq!(
+            script.requests(),
+            MAX_STEPS,
+            "recovery never sends a request beyond the step budget"
+        );
+    }
+
+    /// Contract and invariant: a tool-call reply resets the consecutive
+    /// recovery count even when the provider marked it truncated, and the
+    /// existing tool handling still runs. After the reset, two further prompts
+    /// are available again.
+    #[test]
+    fn when_recovery_is_followed_by_a_tool_call_given_a_truncated_reply_then_resets_recovery_count()
+    {
+        let script = Script::new(vec![
+            truncated_reply(Some("partial one"), &[]),
+            truncated_reply(
+                Some("calling a tool"),
+                &[("no_such_tool", "{}".to_string())],
+            ),
+            truncated_reply(Some("partial two"), &[]),
+            truncated_reply(Some("partial three"), &[]),
+            truncated_reply(Some("partial four"), &[]),
+        ]);
+        let config = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &config, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(
+            script.requests(),
+            5,
+            "the reset makes two more prompts available after the tool call"
+        );
+
+        let after_tool_call = recorded_messages(&script.sent()[2], "messages");
+        assert!(
+            after_tool_call
+                .iter()
+                .any(|message| message.role == Role::Tool
+                    && message.tool_call_id.as_deref() == Some("call-0")),
+            "the truncated tool-call reply still ran the existing tool handling: {after_tool_call:?}"
+        );
+        let sent = recorded_messages(&script.sent()[4], "messages");
+        let recoveries = sent
+            .iter()
+            .filter(|message| {
+                message.role == Role::User
+                    && message.content.as_deref() == Some(TRUNCATION_RECOVERY)
+            })
+            .count();
+        assert_eq!(
+            recoveries, 3,
+            "one prompt before the tool call plus the two after the reset"
+        );
+    }
+
+    /// Contract and invariant: a complete tool-free reply ends immediately even
+    /// when a recovery was requested earlier, with the existing phase-specific
+    /// result and no extra request.
+    #[test]
+    fn when_recovery_reply_is_complete_given_a_prior_recovery_then_ends_immediately() {
+        let script = Script::new(vec![
+            truncated_reply(Some("partial"), &[]),
+            reply(Some("done"), &[]),
+        ]);
+        let code_config = config(script.clone());
+        let mut messages = plan_transcript();
+        assert!(matches!(
+            run_agent_loop(&mut messages, &code_config, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(
+            script.requests(),
+            2,
+            "the complete reply needs no third turn"
+        );
+
+        let script = Script::new(vec![
+            native_truncated_reply(Some("partial"), &[]),
+            native_text("complete answer"),
+        ]);
+        let summary_config = config(script.clone());
+        let mut messages = summary_transcript();
+        match run_agent_loop(&mut messages, &summary_config, Phase::Summary, Source::None) {
+            Stop::Summary(Some(answer)) => assert_eq!(answer, "complete answer"),
+            _ => panic!("the complete summary reply is the answer"),
+        }
+        assert_eq!(
+            script.requests(),
+            2,
+            "the complete summary reply ends the pass without another request"
+        );
+    }
+
+    /// Regression: the recovery path does not touch authentication or the
+    /// existing fatal API failure. A forbidden provider response is reported
+    /// once, and no recovery prompt is appended.
+    #[test]
+    fn when_provider_forbids_access_given_recovery_is_enabled_then_returns_existing_api_failure() {
+        for status in [401, 403] {
+            let script = Script::with_errors(vec![CallError::Api {
+                status,
+                message: format!("denied {status}"),
+            }]);
+            let config = config(script.clone());
+            let mut messages = plan_transcript();
+            let original = messages.clone();
+
+            assert!(matches!(
+                run_agent_loop(&mut messages, &config, Phase::Code, Source::None),
+                Stop::Failed(FailureKind::Api)
+            ));
+            assert_eq!(script.requests(), 1, "HTTP {status} is not retried");
+            assert_eq!(
+                serde_json::to_value(&messages).unwrap(),
+                serde_json::to_value(&original).unwrap(),
+                "a failed request appends no recovery prompt"
+            );
+        }
+    }
+
+    /// Empty/zero/nil boundary: an absent tool-call list and an explicitly
+    /// empty one are both tool-free, so each truncated reply earns the same
+    /// recovery request.
+    #[test]
+    fn when_tool_calls_are_absent_or_empty_given_a_truncated_reply_then_treats_reply_as_tool_free()
+    {
+        const PARTIAL: &str = "partial";
+        for first in [
+            truncated_reply(Some(PARTIAL), &[]),
+            truncated_reply_without_tool_calls(PARTIAL),
+        ] {
+            let script = Script::new(vec![first, reply(Some("done"), &[])]);
+            let config = config(script.clone());
+            let mut messages = plan_transcript();
+
+            assert!(matches!(
+                run_agent_loop(&mut messages, &config, Phase::Code, Source::None),
+                Stop::TurnEnd
+            ));
+            assert_eq!(
+                script.requests(),
+                2,
+                "a tool-free truncated reply always earns one recovery request"
+            );
+            let sent = recorded_messages(&script.sent()[1], "messages");
+            assert_eq!(sent.last().unwrap().role, Role::User);
+            assert_eq!(
+                sent.last().unwrap().content.as_deref(),
+                Some(TRUNCATION_RECOVERY),
+                "the recovery prompt is appended for the empty and the absent list"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Repeated tool-call guard
+    // -----------------------------------------------------------------------
+
+    /// The redirect notice's fixed leading text, duplicated here as an
+    /// independent literal so these expectations do not read the loop constant.
+    const REPEATED_CALL_REDIRECT_HEADER: &str = "[WARN: repeated tool calls] Your last turns issued the same tool calls. Choose a different action instead of repeating them. Canonical arguments preview: ";
+
+    /// The stderr line logged when the third matching turn is redirected.
+    const REPEATED_CALL_WARNING: &str =
+        "[WARN] repeated tool calls; asking the model to choose a different action";
+
+    /// The stderr line logged when the fifth matching turn is stopped.
+    const REPEATED_CALL_ABORT_WARNING: &str =
+        "[WARN] repeated tool calls; stopping before the step limit";
+
+    fn redirect_notice(preview: &str) -> String {
+        format!("{REPEATED_CALL_REDIRECT_HEADER}{preview}")
+    }
+
+    fn assert_no_redirect(content: &str) {
+        assert!(
+            !content.contains(REPEATED_CALL_REDIRECT_HEADER),
+            "this tool result must not carry a redirect: {content:?}"
+        );
+    }
+
+    /// Core entry point and upper boundary: the third matching turn runs and is
+    /// redirected, the fourth still runs, and the fifth is stopped before any
+    /// call is parsed or dispatched.
+    #[test]
+    fn when_tool_calls_repeat_given_five_matching_turns_then_stops_before_dispatch() {
+        let arguments = r#"{"code":"return 'same';"}"#.to_string();
+        let mut bodies = Vec::new();
+        for turn in 0..5 {
+            bodies.push(reply_numbered(
+                turn * 10,
+                Some("working"),
+                &[("execute_script", arguments.clone())],
+            ));
+        }
+        let script = Script::new(bodies);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        let stop = run_agent_loop(&mut messages, &settings, Phase::Code, Source::None);
+
+        assert!(matches!(stop, Stop::Failed(FailureKind::StepLimit)));
+        assert_eq!(
+            script.requests(),
+            5,
+            "the fifth reply arrived and no sixth request was sent"
+        );
+        assert_eq!(
+            assistant_tool_steps(&messages).len(),
+            4,
+            "the fifth response is never replayed into the transcript"
+        );
+
+        for id in ["call-0", "call-10", "call-30"] {
+            let result = tool_result_for(&messages, id).expect("the turn dispatched its call");
+            assert_eq!(result, "same", "turns one, two and four dispatch normally");
+            assert_no_redirect(&result);
+        }
+        let third = tool_result_for(&messages, "call-20").expect("the third turn dispatched");
+        assert_eq!(
+            third,
+            format!("same\n{}", redirect_notice(r#"{"code":"return 'same';"}"#)),
+            "the third turn's last delivered result carries the redirect"
+        );
+        assert!(
+            tool_result_for(&messages, "call-40").is_none(),
+            "the fifth turn dispatched none of its calls and appended no result"
+        );
+    }
+
+    /// Malformed-payload boundary: rejected calls are counted before parsing or
+    /// dispatch, a changed signature starts a new sequence, and a tool-free turn
+    /// breaks the consecutive tool-call sequence.
+    #[test]
+    fn when_rejected_calls_repeat_given_matching_turns_then_counts_each_turn() {
+        // Five identical rejected turns still reach the abort threshold.
+        let mut bodies = Vec::new();
+        for turn in 0..5 {
+            bodies.push(reply_numbered(
+                turn * 10,
+                Some("retrying"),
+                &[("no_such_tool", r#"{}"#.to_string())],
+            ));
+        }
+        let script = Script::new(bodies);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::Failed(FailureKind::StepLimit)
+        ));
+        assert_eq!(script.requests(), 5, "the fifth rejected turn is counted");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == Role::Tool)
+                .count(),
+            4,
+            "a rejected call still delivers a result, and the fifth turn delivers none"
+        );
+        let third = tool_result_for(&messages, "call-20").expect("the third turn was rejected");
+        assert!(third.ends_with(&redirect_notice("{}")));
+        assert!(tool_result_for(&messages, "call-40").is_none());
+
+        // A changed signature resets the count: only two turns share call two's
+        // signature, so the third overall turn is not redirected.
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[("no_such_tool", r#"{}"#.to_string())]),
+            reply_numbered(10, Some("two"), &[("no_such_tool", r#"{}"#.to_string())]),
+            reply_numbered(
+                20,
+                Some("three"),
+                &[("other_missing_tool", r#"{}"#.to_string())],
+            ),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 4);
+        for id in ["call-0", "call-10", "call-20"] {
+            assert_no_redirect(&tool_result_for(&messages, id).expect("the call ran"));
+        }
+
+        // A tool-free truncated turn breaks the sequence even though the loop
+        // continues through its recovery prompt.
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[("no_such_tool", r#"{}"#.to_string())]),
+            reply_numbered(10, Some("two"), &[("no_such_tool", r#"{}"#.to_string())]),
+            truncated_reply(Some("cut off"), &[]),
+            reply_numbered(20, Some("three"), &[("no_such_tool", r#"{}"#.to_string())]),
+            reply_numbered(30, Some("four"), &[("no_such_tool", r#"{}"#.to_string())]),
+            reply_numbered(40, Some("five"), &[("no_such_tool", r#"{}"#.to_string())]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 7);
+        for id in ["call-0", "call-10", "call-20", "call-30"] {
+            assert_no_redirect(&tool_result_for(&messages, id).expect("the call ran"));
+        }
+        let third_after_break =
+            tool_result_for(&messages, "call-40").expect("the third turn was rejected");
+        assert!(
+            third_after_break.ends_with(&redirect_notice("{}")),
+            "the first matching turn after the tool-free break starts at one and the third is redirected"
+        );
+    }
+
+    /// Contract: recursively reordered object keys compare equal, while array
+    /// order and JSON values remain significant.
+    #[test]
+    fn when_arguments_reorder_given_matching_json_objects_then_counts_the_same_turn() {
+        let code = "return 'same';";
+        let first = format!(r#"{{"code":"{code}","meta":{{"b":[1,{{"y":2,"x":1}}],"a":true}}}}"#);
+        let second = format!(r#"{{"meta":{{"a":true,"b":[1,{{"x":1,"y":2}}]}},"code":"{code}"}}"#);
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[("execute_script", first.clone())]),
+            reply_numbered(10, Some("two"), &[("execute_script", second)]),
+            reply_numbered(20, Some("three"), &[("execute_script", first)]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 4);
+        for id in ["call-0", "call-10"] {
+            assert_no_redirect(&tool_result_for(&messages, id).expect("the call ran"));
+        }
+        let third = tool_result_for(&messages, "call-20").expect("the third turn ran");
+        assert!(third.ends_with(&redirect_notice(
+            r#"{"code":"return 'same';","meta":{"a":true,"b":[1,{"x":1,"y":2}]}}"#
+        )));
+
+        // Array order stays significant: a reordered array is a new signature,
+        // so the third overall turn is only the second matching one.
+        let first = format!(r#"{{"code":"{code}","tags":["a","b"]}}"#);
+        let second = format!(r#"{{"code":"{code}","tags":["b","a"]}}"#);
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[("execute_script", first.clone())]),
+            reply_numbered(10, Some("two"), &[("execute_script", second.clone())]),
+            reply_numbered(20, Some("three"), &[("execute_script", first)]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 4);
+        for id in ["call-0", "call-10", "call-20"] {
+            assert_no_redirect(&tool_result_for(&messages, id).expect("the call ran"));
+        }
+
+        // JSON values stay significant for the same reason.
+        let first = format!(r#"{{"code":"{code}","n":1}}"#);
+        let second = format!(r#"{{"code":"{code}","n":2}}"#);
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[("execute_script", first.clone())]),
+            reply_numbered(10, Some("two"), &[("execute_script", second)]),
+            reply_numbered(20, Some("three"), &[("execute_script", first)]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 4);
+        for id in ["call-0", "call-10", "call-20"] {
+            assert_no_redirect(&tool_result_for(&messages, id).expect("the call ran"));
+        }
+    }
+
+    /// Contract: the ordered signature includes every function name and
+    /// canonical arguments in call order and excludes call ids and kind.
+    #[test]
+    fn when_calls_reorder_given_same_calls_in_different_order_then_starts_a_new_sequence() {
+        let a = ("execute_script", r#"{"code":"return 'a';"}"#.to_string());
+        let b = ("execute_script", r#"{"code":"return 'b';"}"#.to_string());
+
+        // Swapping the calls changes the signature, so the third overall turn is
+        // only the second matching one.
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[a.clone(), b.clone()]),
+            reply_numbered(10, Some("two"), &[b.clone(), a.clone()]),
+            reply_numbered(20, Some("three"), &[b.clone(), a.clone()]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 4);
+        for id in [
+            "call-0", "call-1", "call-10", "call-11", "call-20", "call-21",
+        ] {
+            assert_no_redirect(&tool_result_for(&messages, id).expect("the call ran"));
+        }
+
+        // A changed function name changes the signature, even when the
+        // arguments and the order are identical.
+        let same_arguments = r#"{"code":"return 'a';"}"#.to_string();
+        let script = Script::new(vec![
+            reply_numbered(
+                0,
+                Some("one"),
+                &[("execute_script", same_arguments.clone())],
+            ),
+            reply_numbered(10, Some("two"), &[("no_such_tool", same_arguments.clone())]),
+            reply_numbered(20, Some("three"), &[("no_such_tool", same_arguments)]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 4);
+        for id in ["call-0", "call-10", "call-20"] {
+            assert_no_redirect(&tool_result_for(&messages, id).expect("the call ran"));
+        }
+
+        // Different call ids are excluded from the signature: three turns with
+        // distinct ids still match and the third is redirected.
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[a.clone(), b.clone()]),
+            reply_numbered(10, Some("two"), &[a.clone(), b.clone()]),
+            reply_numbered(20, Some("three"), &[a.clone(), b.clone()]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 4);
+        for id in ["call-0", "call-1", "call-10", "call-11", "call-20"] {
+            assert_no_redirect(&tool_result_for(&messages, id).expect("the call ran"));
+        }
+        assert_eq!(
+            tool_result_for(&messages, "call-21").expect("the last call ran"),
+            format!(
+                "b\n{}",
+                redirect_notice(r#"{"code":"return 'a';"} | {"code":"return 'b';"}"#)
+            ),
+            "the last delivered result of the matching turn is annotated"
+        );
+    }
+
+    /// Contract: invalid argument strings are compared byte-for-byte in their
+    /// original form, with no normalization.
+    #[test]
+    fn when_arguments_are_invalid_given_repeated_calls_then_compares_original_bytes() {
+        // Three identical malformed strings match and the third is redirected.
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[("no_such_tool", r#"{"#.to_string())]),
+            reply_numbered(10, Some("two"), &[("no_such_tool", r#"{"#.to_string())]),
+            reply_numbered(20, Some("three"), &[("no_such_tool", r#"{"#.to_string())]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 4);
+        let third = tool_result_for(&messages, "call-20").expect("the third turn was rejected");
+        assert!(third.ends_with(&redirect_notice("{")));
+
+        // A different byte sequence is a different signature even though neither
+        // string is valid JSON, so only the fourth overall turn is redirected.
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[("no_such_tool", r#"{"#.to_string())]),
+            reply_numbered(10, Some("two"), &[("no_such_tool", r#"{ "#.to_string())]),
+            reply_numbered(20, Some("three"), &[("no_such_tool", r#"{ "#.to_string())]),
+            reply_numbered(30, Some("four"), &[("no_such_tool", r#"{ "#.to_string())]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 5);
+        for id in ["call-0", "call-10", "call-20"] {
+            assert_no_redirect(&tool_result_for(&messages, id).expect("the call was rejected"));
+        }
+        let fourth = tool_result_for(&messages, "call-30").expect("the fourth turn was rejected");
+        assert!(fourth.ends_with(&redirect_notice("{ ")));
+    }
+
+    /// Empty boundary: empty argument strings compare byte-for-byte and are not
+    /// normalized into whitespace-only strings.
+    #[test]
+    fn when_arguments_are_empty_given_repeated_calls_then_compares_original_bytes() {
+        // Three identical empty strings match and the third is redirected.
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[("no_such_tool", String::new())]),
+            reply_numbered(10, Some("two"), &[("no_such_tool", String::new())]),
+            reply_numbered(20, Some("three"), &[("no_such_tool", String::new())]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 4);
+        let third = tool_result_for(&messages, "call-20").expect("the third turn was rejected");
+        assert!(third.ends_with(REPEATED_CALL_REDIRECT_HEADER));
+
+        // An empty string and a whitespace-only string are different bytes, so
+        // only the fourth overall turn is redirected.
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[("no_such_tool", String::new())]),
+            reply_numbered(10, Some("two"), &[("no_such_tool", " ".to_string())]),
+            reply_numbered(20, Some("three"), &[("no_such_tool", " ".to_string())]),
+            reply_numbered(30, Some("four"), &[("no_such_tool", " ".to_string())]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 5);
+        for id in ["call-0", "call-10", "call-20"] {
+            assert_no_redirect(&tool_result_for(&messages, id).expect("the call was rejected"));
+        }
+        let fourth = tool_result_for(&messages, "call-30").expect("the fourth turn was rejected");
+        assert!(fourth.ends_with(&redirect_notice(" ")));
+    }
+
+    /// Minimum valid boundary: one tool call is a new signature, so it dispatches
+    /// normally and its result carries no redirect.
+    #[test]
+    fn when_one_tool_call_is_received_given_a_new_signature_then_dispatches_normally() {
+        let script = Script::new(vec![
+            reply(
+                Some("running"),
+                &[(
+                    "execute_script",
+                    serde_json::json!({ "code": "return 40 + 2;" }).to_string(),
+                )],
+            ),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 2);
+        let result = tool_result_for(&messages, "call-0").expect("the call ran");
+        assert_eq!(result, "42");
+        assert_no_redirect(&result);
+    }
+
+    /// Upper boundary: the redirect keeps the ordered canonical-arguments
+    /// preview within 500 UTF-8 bytes, stays at the tail of a capped result, and
+    /// never pushes the delivered result over TOOL_RESULT_BYTES.
+    #[test]
+    fn when_redirect_is_added_given_a_large_multibyte_tool_result_then_keeps_notice_and_both_byte_limits()
+     {
+        let huge = "€".repeat(300);
+        let code = format!("'{huge}'.repeat(2000)");
+        let arguments = serde_json::json!({ "code": code }).to_string();
+        let script = Script::new(vec![
+            reply_numbered(0, Some("one"), &[("execute_script", arguments.clone())]),
+            reply_numbered(10, Some("two"), &[("execute_script", arguments.clone())]),
+            reply_numbered(20, Some("three"), &[("execute_script", arguments.clone())]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(script.requests(), 4);
+        let third = tool_result_for(&messages, "call-20").expect("the third turn ran");
+        assert!(
+            third.len() <= TOOL_RESULT_BYTES,
+            "the annotated result stays within the delivery cap: {} bytes",
+            third.len()
+        );
+        let start = third
+            .rfind(REPEATED_CALL_REDIRECT_HEADER)
+            .expect("the redirect notice is present");
+        let preview = &third[start + REPEATED_CALL_REDIRECT_HEADER.len()..];
+        let expected_preview = format!("{{\"code\":\"'{}", "€".repeat(163));
+        assert_eq!(
+            preview, expected_preview,
+            "the preview is the ordered canonical arguments cut at a UTF-8 boundary"
+        );
+        assert!(
+            preview.len() <= 500,
+            "the preview is at most 500 bytes, got {}",
+            preview.len()
+        );
+        assert!(
+            preview.ends_with('€'),
+            "the cut lands on a code-point boundary inside the multibyte run"
+        );
+        assert!(
+            third.ends_with(&redirect_notice(&expected_preview)),
+            "the notice stays intact at the end of the capped result"
+        );
+        assert!(
+            third.len() > TOOL_RESULT_BYTES - 1_000,
+            "the result is still near the cap it was cut from, got {} bytes",
+            third.len()
+        );
+    }
+
+    /// Regression: the redirect warning is emitted even when a repeating turn
+    /// has no tool result to annotate, and 401/403 provider failures stay API
+    /// failures instead of entering repetition processing.
+    #[test]
+    fn when_repeated_turn_has_no_tool_result_given_the_warning_threshold_then_warns_without_annotation()
+     {
+        if is_timing_child() {
+            start_timing_child();
+            let arguments = r#"{"code":"return 'same';"}"#.to_string();
+            let mut bodies = Vec::new();
+            for turn in 0..5 {
+                bodies.push(reply_numbered(
+                    turn * 10,
+                    Some("working"),
+                    &[("execute_script", arguments.clone())],
+                ));
+            }
+            let script = Script::new(bodies);
+            let settings = config(script.clone());
+            let mut messages = plan_transcript();
+
+            assert!(matches!(
+                run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+                Stop::Failed(FailureKind::StepLimit)
+            ));
+            assert_eq!(script.requests(), 5);
+            assert_eq!(assistant_tool_steps(&messages).len(), 4);
+            let third = tool_result_for(&messages, "call-20").expect("the third turn ran");
+            assert!(third.ends_with(&redirect_notice(r#"{"code":"return 'same';"}"#)));
+            assert!(
+                tool_result_for(&messages, "call-40").is_none(),
+                "the stopped fifth turn has no result to annotate"
+            );
+            return;
+        }
+
+        let transcript = timing_transcript(
+            "when_repeated_turn_has_no_tool_result_given_the_warning_threshold_then_warns_without_annotation",
+        );
+        assert_eq!(
+            transcript.matches(REPEATED_CALL_WARNING).count(),
+            1,
+            "the redirect warning is emitted even when no result exists to annotate:\n{transcript}"
+        );
+        assert_eq!(
+            transcript.matches(REPEATED_CALL_ABORT_WARNING).count(),
+            1,
+            "the abort warning is emitted:\n{transcript}"
+        );
+
+        // Regression: unauthorized provider failures bypass repetition handling.
+        for status in [401, 403] {
+            let script = Script::with_errors(vec![CallError::Api {
+                status,
+                message: format!("denied {status}"),
+            }]);
+            let settings = config(script.clone());
+            let mut messages = plan_transcript();
+            let original = messages.clone();
+
+            assert!(matches!(
+                run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+                Stop::Failed(FailureKind::Api)
+            ));
+            assert_eq!(script.requests(), 1, "HTTP {status} is not retried");
+            assert_eq!(
+                serde_json::to_value(&messages).unwrap(),
+                serde_json::to_value(&original).unwrap(),
+                "an API failure never enters repetition processing"
+            );
+        }
     }
 }
