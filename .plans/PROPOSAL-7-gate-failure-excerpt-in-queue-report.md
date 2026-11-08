@@ -1,5 +1,7 @@
 # Proposal 7: Include Failing Verification Gate Excerpts in `queue-report.md` and Retry Handovers
 
+**Status:** `[x]` Complete (T10 done).
+
 ## Problem
 
 When a ticket fails in `work_with_retry` / `retry_once` (`src/orchestrator.rs:507-554, 605-625, 731-744`), `Ending::GateFailed` and `Ending::RetryExhausted` discard the gate output:

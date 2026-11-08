@@ -1191,7 +1191,9 @@ impl ScriptedTransport {
     /// model-authored omission.
     fn triage_report(&self, reject: bool) -> TriageReport {
         if matches!(self.triage, TriageScript::Empty) {
-            return TriageReport { tickets: Vec::new() };
+            return TriageReport {
+                tickets: Vec::new(),
+            };
         }
         let mut tickets: Vec<TriageTicket> = self
             .tickets

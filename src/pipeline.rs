@@ -931,27 +931,137 @@ fn queue_retry_detail(outcome: &orchestrator::Outcome, report: &str) -> String {
 }
 
 /// The failed ticket sections of a queue report, as "id: ending" fragments in
-/// emitted order.
+/// emitted order. A failed section's valid fenced gate diagnostic is appended
+/// to its fragment; an absent or malformed diagnostic leaves the id and ending
+/// untouched, and a non-failed section never contributes one.
 fn queue_failures(report: &str) -> String {
+    let lines: Vec<&str> = report.lines().collect();
     let mut failures = Vec::new();
     let mut id: Option<String> = None;
     let mut status: Option<String> = None;
     let mut ended: Option<String> = None;
+    let mut gate: Option<String> = None;
+    let mut index = 0usize;
 
-    for line in report.lines() {
+    while index < lines.len() {
+        let line = lines[index];
         if let Some(section) = line.strip_prefix("## ") {
-            flush_queue_failure(&mut failures, &mut id, &mut status, &mut ended);
+            flush_queue_failure(&mut failures, &mut id, &mut status, &mut ended, &mut gate);
             id = Some(section.trim().to_string());
             status = None;
             ended = None;
+            gate = None;
         } else if let Some(value) = line.strip_prefix("- Status: ") {
             status = Some(value.trim().to_string());
         } else if let Some(value) = line.strip_prefix("- Ended: ") {
             ended = Some(value.trim().to_string());
+        } else if line == "- Gate output:" {
+            let (output, next) = parse_gate_output(&lines, index + 1);
+            gate = output;
+            index = next;
+            continue;
         }
+        index += 1;
     }
-    flush_queue_failure(&mut failures, &mut id, &mut status, &mut ended);
+    flush_queue_failure(&mut failures, &mut id, &mut status, &mut ended, &mut gate);
     failures.join("; ")
+}
+
+/// The number of backticks when `line` is a standalone Markdown fence, or
+/// `None` when it is not.
+fn fence_ticks(line: &str) -> Option<usize> {
+    let trimmed = line.trim();
+    if trimmed.len() >= 3 && trimmed.chars().all(|ch| ch == '`') {
+        Some(trimmed.len())
+    } else {
+        None
+    }
+}
+
+/// Parse one fenced gate diagnostic beginning after `- Gate output:`.
+///
+/// The opener must be a standalone backtick fence. Content is every line up to
+/// a closing fence at least as long as the opener, so arbitrary multiline gate
+/// text -- including heading-like lines followed by report-field-like lines --
+/// stays inside the excerpt. A candidate ticket-section header only ends the
+/// block when the fence never closes: a fence-sized line that belongs to the
+/// next ticket's open block is not a closing fence, and the parser resumes at
+/// the first section-like line instead of inventing an excerpt. A missing
+/// closing fence or blank content is malformed and yields no diagnostic. The
+/// returned index is the line after the block when it is well formed, or the
+/// input position when no valid opener follows, so the surrounding section
+/// parser keeps reading.
+fn parse_gate_output(lines: &[&str], start: usize) -> (Option<String>, usize) {
+    let Some(opener) = lines.get(start) else {
+        return (None, start);
+    };
+    let Some(open_ticks) = fence_ticks(opener) else {
+        return (None, start);
+    };
+    let mut content = Vec::new();
+    let mut boundary = None;
+    let mut index = start + 1;
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some(close_ticks) = fence_ticks(line)
+            && close_ticks >= open_ticks
+        {
+            if !closes_gate_block(lines, index) {
+                // This fence-sized line opens the next ticket's diagnostic, so
+                // the current block is unterminated: resume at its first
+                // section-like line without inventing an excerpt.
+                return (None, boundary.unwrap_or(index));
+            }
+            let text = content.join("\n");
+            if text.trim().is_empty() {
+                return (None, index + 1);
+            }
+            return (Some(text), index + 1);
+        }
+        if boundary.is_none() && line.starts_with("## ") && begins_ticket_section(lines, index) {
+            boundary = Some(index);
+        }
+        content.push(line);
+        index += 1;
+    }
+    (None, boundary.unwrap_or(index))
+}
+
+/// Whether the fence line at `index` closes a well-formed gate diagnostic
+/// rather than opening the next ticket's diagnostic.
+///
+/// A genuine closing fence never immediately follows `- Gate output:`, and it
+/// ends its ticket section, so the next non-blank line is either the end of
+/// the report or a structural `## ` ticket-section header. A fence-sized line
+/// that opens a later ticket's block or is followed by excerpt content is not a
+/// closing fence.
+fn closes_gate_block(lines: &[&str], index: usize) -> bool {
+    lines[index - 1].trim() != "- Gate output:"
+        && lines[index + 1..]
+            .iter()
+            .enumerate()
+            .find(|(_, line)| !line.trim().is_empty())
+            .is_none_or(|(offset, line)| {
+                line.starts_with("## ") && begins_ticket_section(lines, index + 1 + offset)
+            })
+}
+
+/// Whether the line at `index` is one of the report's own `## ` ticket section
+/// headers rather than heading-like text inside a gate diagnostic.
+///
+/// The report writer always follows a section header with the ticket's own
+/// fields, so a heading whose next non-blank line opens a ticket field is
+/// structural. Any other heading is gate content and stays in the excerpt.
+fn begins_ticket_section(lines: &[&str], index: usize) -> bool {
+    lines[index + 1..]
+        .iter()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            line.starts_with("- Title: ")
+                || line.starts_with("- Status: ")
+                || line.starts_with("- Ended: ")
+                || line.starts_with("- Gate: ")
+        })
 }
 
 fn flush_queue_failure(
@@ -959,16 +1069,21 @@ fn flush_queue_failure(
     id: &mut Option<String>,
     status: &mut Option<String>,
     ended: &mut Option<String>,
+    gate: &mut Option<String>,
 ) {
     let Some(ticket) = id.take() else {
         return;
     };
     if status.as_deref() == Some("failed") {
         let ending = ended.take().unwrap_or_else(|| "failed".to_string());
-        failures.push(format!("{ticket}: {ending}"));
+        match gate.take().filter(|output| !output.trim().is_empty()) {
+            Some(output) => failures.push(format!("{ticket}: {ending}; gate output: {output}")),
+            None => failures.push(format!("{ticket}: {ending}")),
+        }
     }
     *status = None;
     *ended = None;
+    *gate = None;
 }
 
 /// Whether the validated triage report authorizes the queue: every draft ticket
@@ -2052,6 +2167,141 @@ mod tests {
         assert!(
             !ticket.to_markdown().contains(synthetic),
             "the rendered repair ticket must not name the synthetic expectation"
+        );
+    }
+
+    /// The queue-report parser keeps only valid, non-empty gate diagnostics from
+    /// failed sections; absent or malformed blocks leave the id and ending, and
+    /// a non-failed section never contributes output.
+    #[test]
+    fn when_retry_context_reads_queue_report_given_missing_malformed_or_nonfailed_diagnostics_then_failure_detail_remains_valid()
+     {
+        let valid = "# Ticket queue report\n\n2 tickets: 0 completed, 2 failed, 0 blocked.\n\n## 1-failed\n\n- Title: Failed\n- Status: failed\n- Ended: gate failed\n- Gate: `cargo check`\n- Gate output:\n```\nfinal diagnostic\n```\n\n## 2-other\n\n- Title: Other\n- Status: completed\n- Ended: declared\n- Gate: `true`\n- Gate output:\n```\nmust not leak\n```\n";
+        let detail = queue_retry_detail(&orchestrator::Outcome::Incomplete, valid);
+        assert!(detail.contains("1-failed"), "{detail}");
+        assert!(detail.contains("gate failed"), "{detail}");
+        assert!(detail.contains("final diagnostic"), "{detail}");
+        assert!(!detail.contains("must not leak"), "{detail}");
+        assert!(!detail.contains("2-other"), "{detail}");
+
+        for report in [
+            "## 1-failed\n\n- Status: failed\n- Ended: gate failed\n",
+            "## 1-failed\n\n- Status: failed\n- Ended: gate failed\n- Gate output:\nnot a fence\n",
+            "## 1-failed\n\n- Status: failed\n- Ended: gate failed\n- Gate output:\n```\nunterminated\n",
+            "## 1-failed\n\n- Status: failed\n- Ended: gate failed\n- Gate output:\n```\n```\n",
+        ] {
+            let detail = queue_retry_detail(&orchestrator::Outcome::Incomplete, report);
+            assert!(detail.contains("1-failed"), "{detail}");
+            assert!(detail.contains("gate failed"), "{detail}");
+            assert!(
+                !detail.contains("gate output:"),
+                "no diagnostic is invented: {detail}"
+            );
+        }
+
+        let long = "x".repeat(900);
+        let report = format!(
+            "## 1-failed\n\n- Status: failed\n- Ended: gate failed\n- Gate output:\n```\n{long}\n```\n"
+        );
+        let detail = queue_retry_detail(&orchestrator::Outcome::Incomplete, &report);
+        assert!(
+            detail.contains(&long),
+            "the parser retains the complete report excerpt before the plan cap"
+        );
+    }
+
+    /// Regression: a heading-like line inside a valid fenced gate diagnostic is
+    /// excerpt content, not the next ticket section, so the failed ticket keeps
+    /// its non-empty excerpt.
+    #[test]
+    fn when_gate_output_contains_section_heading_given_valid_fenced_queue_report_then_retry_detail_preserves_excerpt()
+     {
+        let report = "# Ticket queue report\n\n2 tickets: 0 completed, 1 failed, 1 completed.\n\n## 1-heading\n\n- Title: Heading\n- Status: failed\n- Ended: gate failed\n- Gate: `cargo test`\n- Gate output:\n````\n## cargo test result\n```\nassertion failed: left == right\n```\n````\n\n## 2-after\n\n- Title: After\n- Status: completed\n- Ended: declared\n- Gate: `true`\n";
+
+        let detail = queue_retry_detail(&orchestrator::Outcome::Incomplete, report);
+
+        assert!(detail.contains("1-heading"), "{detail}");
+        assert!(detail.contains("gate failed"), "{detail}");
+        assert!(
+            detail.contains("## cargo test result"),
+            "the heading stays in the excerpt: {detail}"
+        );
+        assert!(
+            detail.contains("```\nassertion failed: left == right\n```"),
+            "the backtick run stays content: {detail}"
+        );
+        assert!(
+            !detail.contains("2-after"),
+            "the later ticket does not leak: {detail}"
+        );
+    }
+
+    /// Regression: a ticket-like heading followed by report-field-like lines
+    /// inside a valid fenced gate diagnostic is excerpt content, not the next
+    /// ticket section, so the failed ticket keeps the complete excerpt and the
+    /// later genuine section stays out of it. An unterminated diagnostic still
+    /// recovers at the next genuine section without inventing an excerpt.
+    #[test]
+    fn when_gate_output_contains_ticket_like_heading_given_valid_fenced_queue_report_then_excerpt_is_preserved()
+     {
+        let valid = "# Ticket queue report\n\n2 tickets: 0 completed, 1 failed, 1 completed.\n\n## 1-heading\n\n- Title: Heading\n- Status: failed\n- Ended: gate failed\n- Gate: `cargo test`\n- Gate output:\n````\n## 2-trap\n\n- Title: Trap\n- Status: failed\n- Ended: invented ending\n- Gate: `false`\n```\ninner run\n```\n````\n\n## 2-after\n\n- Title: After\n- Status: completed\n- Ended: declared\n- Gate: `true`\n";
+
+        let detail = queue_retry_detail(&orchestrator::Outcome::Incomplete, valid);
+
+        assert_eq!(
+            detail,
+            "drained without completing every ticket (1-heading: gate failed; gate output: ## 2-trap\n\n- Title: Trap\n- Status: failed\n- Ended: invented ending\n- Gate: `false`\n```\ninner run\n```)"
+        );
+
+        let malformed = "# Ticket queue report\n\n2 tickets: 0 completed, 2 failed, 0 blocked.\n\n## 1-first\n\n- Title: First\n- Status: failed\n- Ended: gate failed\n- Gate: `cargo check`\n- Gate output:\n```\nunterminated diagnostic\n\n## 2-second\n\n- Title: Second\n- Status: failed\n- Ended: retry exhausted\n- Gate: `cargo test`\n- Gate output:\n```\nsecond diagnostic\n```\n";
+
+        let detail = queue_retry_detail(&orchestrator::Outcome::Incomplete, malformed);
+
+        assert_eq!(
+            detail,
+            "drained without completing every ticket (1-first: gate failed; 2-second: retry exhausted; gate output: second diagnostic)"
+        );
+    }
+
+    /// Regression: an unterminated diagnostic fence stops at the next ticket
+    /// section header, so the malformed block stays confined to its own
+    /// section and a later failed ticket still contributes its details.
+    #[test]
+    fn when_malformed_gate_fence_precedes_another_failure_given_incomplete_queue_report_then_all_failure_details_are_preserved()
+     {
+        let report = "# Ticket queue report\n\n2 tickets: 0 completed, 2 failed, 0 blocked.\n\n## 1-first\n\n- Title: First\n- Status: failed\n- Ended: gate failed\n- Gate: `cargo check`\n- Gate output:\n```\nunterminated diagnostic\n\n## 2-second\n\n- Title: Second\n- Status: failed\n- Ended: retry exhausted\n- Gate: `cargo test`\n- Gate output:\n```\nsecond diagnostic\n```\n";
+
+        let detail = queue_retry_detail(&orchestrator::Outcome::Incomplete, report);
+
+        assert_eq!(
+            detail,
+            "drained without completing every ticket (1-first: gate failed; 2-second: retry exhausted; gate output: second diagnostic)"
+        );
+    }
+
+    /// Regression: when an unterminated diagnostic fence is followed by another
+    /// failed section whose valid fenced diagnostic starts with a Markdown
+    /// heading (including a ticket-like heading and field lines), the second
+    /// section's opening fence is not mistaken for the first section's close.
+    #[test]
+    fn when_malformed_gate_fence_precedes_heading_diagnostic_given_incomplete_queue_report_then_later_failure_detail_is_preserved()
+     {
+        let heading_start = "# Ticket queue report\n\n2 tickets: 0 completed, 2 failed, 0 blocked.\n\n## 1-first\n\n- Title: First\n- Status: failed\n- Ended: gate failed\n- Gate: `cargo check`\n- Gate output:\n```\nunterminated diagnostic\n\n## 2-second\n\n- Title: Second\n- Status: failed\n- Ended: retry exhausted\n- Gate: `cargo test`\n- Gate output:\n```\n## compiler output\nsecond diagnostic\n```\n";
+
+        let detail = queue_retry_detail(&orchestrator::Outcome::Incomplete, heading_start);
+
+        assert_eq!(
+            detail,
+            "drained without completing every ticket (1-first: gate failed; 2-second: retry exhausted; gate output: ## compiler output\nsecond diagnostic)"
+        );
+
+        let ticket_like_start = "# Ticket queue report\n\n2 tickets: 0 completed, 2 failed, 0 blocked.\n\n## 1-first\n\n- Title: First\n- Status: failed\n- Ended: gate failed\n- Gate: `cargo check`\n- Gate output:\n```\nunterminated diagnostic\n\n## 2-second\n\n- Title: Second\n- Status: failed\n- Ended: retry exhausted\n- Gate: `cargo test`\n- Gate output:\n```\n## 3-trap\n\n- Title: Trap\n- Status: failed\nsecond diagnostic\n```\n";
+
+        let detail = queue_retry_detail(&orchestrator::Outcome::Incomplete, ticket_like_start);
+
+        assert_eq!(
+            detail,
+            "drained without completing every ticket (1-first: gate failed; 2-second: retry exhausted; gate output: ## 3-trap\n\n- Title: Trap\n- Status: failed\nsecond diagnostic)"
         );
     }
 }

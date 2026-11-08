@@ -18,7 +18,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`PROPOSAL-14-pre-planned-task-fast-track.md`](./.plans/PROPOSAL-14-pre-planned-task-fast-track.md) | [x] Complete (T19 done) | `T19` | `src/prompts/plan.rs`, `tests/prompt_contract.rs` |
 | [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | [x] Complete (T07, T08 done) | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md) | [x] Complete (T09 done) | `T09` | `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs` |
-| [`PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md) | `[ ]` Pending | `T10` | `src/orchestrator.rs`, `src/pipeline.rs` |
+| [`PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md) | `[x]` Complete (T10 done) | `T10` | `src/orchestrator.rs`, `src/pipeline.rs` |
 | [`05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md) | `[ ]` Pending | `T11` | `src/tools.rs` |
 | [`09-file-editing-and-patch-matching.md`](./.plans/09-file-editing-and-patch-matching.md) | `[ ]` Pending | `T12` | `src/script.rs` |
 | [`12-http-retry-and-overload-resilience.md`](./.plans/12-http-retry-and-overload-resilience.md) | `[ ]` Pending | `T13` | `src/retry.rs` |
@@ -68,7 +68,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
       │        [x] [T09] PROPOSAL-5: Forward Triage notes & AgentBrief to Code kickoff (src/{triage,orchestrator,pipeline}.rs)
       │          │
       │          ▼
-      │        [ ] [T10] PROPOSAL-7: Gate failure excerpts in queue-report.md (src/{orchestrator,pipeline}.rs)
+      │        [x] [T10] PROPOSAL-7: Gate failure excerpts in queue-report.md (src/{orchestrator,pipeline}.rs)
       │          │
       │          └──────────────────────────┐
       ├──► [ ] [T11] 05: Shell process-group kill & timeout spill (src/tools.rs) ──────────────┐
@@ -212,7 +212,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `TODO.md`, mark `T09` complete (`[x]`) in the DAG and ordered backlog and mark `PROPOSAL-5-forward-triage-brief-to-code-agent.md` `[x] Complete (T09 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib triage && cargo test --lib orchestrator && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T10` — Include Verification Gate Failure Excerpts in `queue-report.md` and Retry Handovers**
+- [x] **`T10` — Include Verification Gate Failure Excerpts in `queue-report.md` and Retry Handovers**
   - `depends_on`: `["T09"]`
   - `unblocks`: `["T16"]`
   - `plans`: [`.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md)

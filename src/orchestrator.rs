@@ -445,7 +445,9 @@ pub(crate) fn record_precompleted(
     finish(
         &mut lifecycle,
         prior_completed,
-        &TicketSet { tickets: Vec::new() },
+        &TicketSet {
+            tickets: Vec::new(),
+        },
         &[],
         outcome,
     )
@@ -591,10 +593,12 @@ enum Ending {
     Declared,
     /// The agent never declared it, but the gate passed.
     GateAccepted,
-    /// The agent never declared it, and the gate failed too.
-    RetryExhausted,
-    /// The agent declared it, and the gate failed.
-    GateFailed,
+    /// The agent never declared it, and the gate failed too. The string is the
+    /// bounded final-gate excerpt.
+    RetryExhausted(String),
+    /// The agent declared it, and the gate failed. The string is the bounded
+    /// final-gate excerpt.
+    GateFailed(String),
     /// The loop broke off; the label names why.
     AgentFailure(FailureKind),
     /// The queue never reached it: the named failure blocks it.
@@ -614,7 +618,7 @@ impl Ending {
     fn status(&self) -> &'static str {
         match self {
             Ending::Declared | Ending::GateAccepted => "completed",
-            Ending::GateFailed | Ending::RetryExhausted | Ending::AgentFailure(_) => "failed",
+            Ending::GateFailed(_) | Ending::RetryExhausted(_) | Ending::AgentFailure(_) => "failed",
             Ending::Blocked(_) => "blocked",
             Ending::NeverStarted => "pending",
         }
@@ -626,8 +630,8 @@ impl Ending {
         match self {
             Ending::Declared => "declared".to_string(),
             Ending::GateAccepted => "gate accepted without declaration".to_string(),
-            Ending::RetryExhausted => "retry exhausted without task_complete".to_string(),
-            Ending::GateFailed => "gate failed".to_string(),
+            Ending::RetryExhausted(_) => "retry exhausted without task_complete".to_string(),
+            Ending::GateFailed(_) => "gate failed".to_string(),
             Ending::AgentFailure(kind) => format!("agent failure: {}", kind.label()),
             Ending::Blocked(blocker) => format!("blocked by {blocker}"),
             Ending::NeverStarted => "never started".to_string(),
@@ -651,7 +655,7 @@ impl Report<'_> {
             .filter(|e| {
                 matches!(
                     e,
-                    Ending::GateFailed | Ending::RetryExhausted | Ending::AgentFailure(_)
+                    Ending::GateFailed(_) | Ending::RetryExhausted(_) | Ending::AgentFailure(_)
                 )
             })
             .count();
@@ -702,6 +706,9 @@ impl Report<'_> {
                 ending.phrase(),
                 ticket.verification_gate.trim(),
             ));
+            if let Ending::GateFailed(output) | Ending::RetryExhausted(output) = ending {
+                push_gate_output(&mut text, output);
+            }
         }
         text
     }
@@ -817,13 +824,62 @@ fn retry_once(
         },
         Err(output) => {
             report_gate_output(&output);
+            let excerpt = gate_failure_excerpt(&output);
             if second.outcome == code::Outcome::Complete {
-                Ending::GateFailed
+                Ending::GateFailed(excerpt)
             } else {
-                Ending::RetryExhausted
+                Ending::RetryExhausted(excerpt)
             }
         }
     }
+}
+
+/// The most Unicode scalar values kept from a failed final gate's output.
+const GATE_EXCERPT_CHARS: usize = 1_200;
+
+/// Trim one final gate's output and keep a bounded tail of it.
+///
+/// An output of at most 1,200 Unicode scalar values is the trimmed text
+/// unchanged; a longer one is `...` followed by exactly the final 1,200
+/// characters. Counting and slicing are on scalar values, so no multibyte
+/// character is ever split.
+fn gate_failure_excerpt(output: &str) -> String {
+    let trimmed = output.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= GATE_EXCERPT_CHARS {
+        return trimmed.to_string();
+    }
+    let tail: String = chars[chars.len() - GATE_EXCERPT_CHARS..].iter().collect();
+    format!("...{tail}")
+}
+
+/// Append the non-empty final-gate excerpt as a safe fenced Markdown block.
+///
+/// The fence is one backtick longer than the longest backtick run in the
+/// excerpt and never shorter than three, so every run inside the gate output
+/// stays content rather than closing the block early.
+fn push_gate_output(text: &mut String, output: &str) {
+    if output.trim().is_empty() {
+        return;
+    }
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for ch in output.chars() {
+        if ch == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    text.push_str("- Gate output:\n");
+    text.push_str(&fence);
+    text.push('\n');
+    text.push_str(output);
+    text.push('\n');
+    text.push_str(&fence);
+    text.push('\n');
 }
 
 /// Print a gate's own output, exactly the diagnostic the queue always showed.
@@ -2696,5 +2752,242 @@ mod lifecycle_tests {
         );
         assert!(result.report.contains("## 1-initial"));
         assert!(result.report.contains("## r1-1-fix"));
+    }
+
+    /// The report for one ticket whose retry attempt is `second` and whose
+    /// authoritative final gate fails with `output`.
+    fn report_for_final_gate(output: &str, second: code::Outcome) -> String {
+        let mut lifecycle = Script::new(
+            vec![code::Outcome::TurnEnd, second],
+            vec![Err(output.to_string())],
+        );
+        let result = run_queue(&mut lifecycle, &one());
+        incomplete(&result);
+        result.report
+    }
+
+    #[test]
+    fn when_gate_output_covers_character_boundaries_given_varied_text_then_excerpt_is_trimmed_and_bounded()
+     {
+        for output in ["", "   ", "\n\t  \n"] {
+            let report = report_for_final_gate(output, code::Outcome::Complete);
+            assert!(report.contains("- Status: failed"), "{report}");
+            assert!(report.contains("- Ended: gate failed"), "{report}");
+            assert!(!report.contains("- Gate output:"), "{report}");
+        }
+
+        let report = report_for_final_gate("  trimmed output  \n", code::Outcome::Complete);
+        assert!(
+            report.contains("- Gate output:\n```\ntrimmed output\n```\n"),
+            "{report}"
+        );
+
+        let report = report_for_final_gate("Z", code::Outcome::Complete);
+        assert!(report.contains("- Gate output:\n```\nZ\n```\n"), "{report}");
+
+        let exact = "B".repeat(1200);
+        let report = report_for_final_gate(&exact, code::Outcome::Complete);
+        assert!(
+            report.contains(&exact),
+            "the whole at-limit excerpt is retained"
+        );
+        assert!(!report.contains("..."), "an at-limit excerpt is unchanged");
+
+        let tail = "C".repeat(1200);
+        let over = format!("HEAD{tail}");
+        let expected = format!("...{tail}");
+        let report = report_for_final_gate(&over, code::Outcome::Complete);
+        assert!(
+            report.contains(&expected),
+            "the over-limit excerpt is ... plus the final 1200 characters"
+        );
+        assert!(!report.contains("HEAD"), "the over-limit prefix is dropped");
+
+        let tail = "é".repeat(1200);
+        let over = format!("Ω{tail}");
+        let expected = format!("...{tail}");
+        let report = report_for_final_gate(&over, code::Outcome::Complete);
+        assert!(
+            report.contains(&expected),
+            "the multibyte excerpt never splits a scalar value"
+        );
+        assert!(
+            !report.contains('Ω'),
+            "the multibyte prefix is dropped whole"
+        );
+    }
+
+    #[test]
+    fn when_gate_output_contains_backticks_given_multiline_text_then_report_fence_keeps_content_inside()
+     {
+        let output = "first\n```\nsecond ```` run\nthird";
+        let report = report_for_final_gate(output, code::Outcome::Complete);
+        let expected = format!("- Gate output:\n`````\n{output}\n`````\n");
+        assert!(report.contains(&expected), "{report}");
+        assert!(
+            report.ends_with(&expected),
+            "the block closes the report: {report}"
+        );
+    }
+
+    #[test]
+    fn when_queue_report_renders_gate_failures_given_empty_and_non_gate_endings_then_existing_report_contract_is_preserved()
+     {
+        let report = report_for_final_gate("", code::Outcome::Complete);
+        assert_eq!(
+            report,
+            "# Ticket queue report\n\n1 ticket: 0 completed, 1 failed, 0 blocked.\n\n## 1-first\n\n- Title: 1-first\n- Status: failed\n- Ended: gate failed\n- Gate: `cargo check`\n"
+        );
+        assert!(!report.contains("- Gate output:"));
+
+        let report = report_for_final_gate("", code::Outcome::TurnEnd);
+        assert!(report.contains("- Status: failed"), "{report}");
+        assert!(
+            report.contains("- Ended: retry exhausted without task_complete"),
+            "{report}"
+        );
+        assert!(!report.contains("- Gate output:"), "{report}");
+
+        let mut lifecycle = Script::new(vec![code::Outcome::Failed(FailureKind::Api)], vec![]);
+        let result = run_queue(&mut lifecycle, &one());
+        incomplete(&result);
+        assert!(
+            result.report.contains("- Status: failed"),
+            "{}",
+            result.report
+        );
+        assert!(
+            !result.report.contains("- Gate output:"),
+            "{}",
+            result.report
+        );
+
+        let mut lifecycle = Script::new(vec![code::Outcome::Complete], vec![Ok(())]);
+        let result = run_queue(&mut lifecycle, &one());
+        resolved(&result);
+        assert!(
+            result.report.contains("- Status: completed"),
+            "{}",
+            result.report
+        );
+        assert!(
+            !result.report.contains("- Gate output:"),
+            "{}",
+            result.report
+        );
+
+        let mut lifecycle = Script::new(vec![code::Outcome::Failed(FailureKind::Api)], vec![]);
+        let result = run_queue(&mut lifecycle, &chain());
+        incomplete(&result);
+        assert!(
+            result.report.contains("- Status: blocked"),
+            "{}",
+            result.report
+        );
+        assert!(
+            !result.report.contains("- Gate output:"),
+            "{}",
+            result.report
+        );
+
+        let mut lifecycle = Script::new(vec![], vec![]).failing_at(0);
+        let result = run_queue(&mut lifecycle, &one());
+        assert!(
+            matches!(result.outcome, Outcome::Stopped { .. }),
+            "{:?}",
+            result.outcome
+        );
+        assert!(
+            result.report.contains("- Status: pending"),
+            "{}",
+            result.report
+        );
+        assert!(
+            !result.report.contains("- Gate output:"),
+            "{}",
+            result.report
+        );
+
+        let set = super::tests::set(&[("1-first", &[]), ("2-second", &[])]);
+        let mut lifecycle = Script::new(
+            vec![
+                code::Outcome::TurnEnd,
+                code::Outcome::Complete,
+                code::Outcome::TurnEnd,
+                code::Outcome::Complete,
+            ],
+            vec![Err("one".to_string()), Err("two".to_string())],
+        );
+        let result = run_queue(&mut lifecycle, &set);
+        incomplete(&result);
+        assert!(
+            result
+                .report
+                .contains("2 tickets: 0 completed, 2 failed, 0 blocked."),
+            "{}",
+            result.report
+        );
+        let first = result
+            .report
+            .find("## 1-first")
+            .expect("the first section is emitted");
+        let second = result
+            .report
+            .find("## 2-second")
+            .expect("the second section is emitted");
+        assert!(
+            first < second,
+            "ticket order is unchanged: {}",
+            result.report
+        );
+        assert!(result.report.ends_with('\n') && !result.report.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn when_second_attempt_ends_given_final_gate_failure_then_ending_phrase_and_diagnostic_match_attempt_outcome()
+     {
+        let output = "AUTHORITATIVE-FINAL-GATE";
+        let report = report_for_final_gate(output, code::Outcome::Complete);
+        assert!(report.contains("- Status: failed"), "{report}");
+        assert!(report.contains("- Ended: gate failed"), "{report}");
+        assert!(report.contains(output), "{report}");
+
+        let report = report_for_final_gate(output, code::Outcome::TurnEnd);
+        assert!(report.contains("- Status: failed"), "{report}");
+        assert!(
+            report.contains("- Ended: retry exhausted without task_complete"),
+            "{report}"
+        );
+        assert!(report.contains(output), "{report}");
+    }
+
+    #[test]
+    fn when_retry_uses_first_gate_output_given_final_gate_also_fails_then_each_phase_receives_its_existing_output()
+     {
+        let mut lifecycle = Script::new(
+            vec![code::Outcome::Complete, code::Outcome::Complete],
+            vec![
+                Err("FIRST-GATE-OUTPUT".to_string()),
+                Err("FINAL-GATE-OUTPUT".to_string()),
+            ],
+        );
+        let result = run_queue(&mut lifecycle, &one());
+        incomplete(&result);
+
+        let handover = lifecycle.handovers[1]
+            .as_deref()
+            .expect("the retry receives the rendered handover");
+        assert!(handover.contains("FIRST-GATE-OUTPUT"), "{handover}");
+        assert!(!handover.contains("FINAL-GATE-OUTPUT"), "{handover}");
+        assert!(
+            result.report.contains("FINAL-GATE-OUTPUT"),
+            "{}",
+            result.report
+        );
+        assert!(
+            !result.report.contains("FIRST-GATE-OUTPUT"),
+            "{}",
+            result.report
+        );
     }
 }

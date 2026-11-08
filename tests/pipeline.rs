@@ -2756,7 +2756,8 @@ fn when_running_the_pipeline_given_three_done_tickets_then_records_completion_an
 }
 
 #[test]
-fn when_triaging_tickets_given_done_dependency_then_preserves_original_artifacts_and_records_each_id_once() {
+fn when_triaging_tickets_given_done_dependency_then_preserves_original_artifacts_and_records_each_id_once()
+ {
     let (step, dir, _transport) = multi_triage_run(common::TriageScript::DoneAt(1));
     assert!(matches!(step, Step::Complete), "{step:?}");
 
@@ -2815,7 +2816,8 @@ fn when_triaging_tickets_given_done_dependency_then_preserves_original_artifacts
 }
 
 #[test]
-fn when_triaging_tickets_given_each_non_authorizing_state_beside_done_and_ready_then_retries_without_execution() {
+fn when_triaging_tickets_given_each_non_authorizing_state_beside_done_and_ready_then_retries_without_execution()
+ {
     for state in [
         TriageState::ReadyForHuman,
         TriageState::NeedsInfo,
@@ -2869,10 +2871,7 @@ fn when_triaging_tickets_given_each_non_authorizing_state_beside_done_and_ready_
         let outcome = downstream_outcome(&transport);
         assert!(outcome.contains("phase: triage"), "{outcome}");
         assert!(
-            outcome.contains(&format!(
-                "2-verify-command-failure ({}):",
-                state.wire()
-            )),
+            outcome.contains(&format!("2-verify-command-failure ({}):", state.wire())),
             "the blocker detail names the non-authorizing ticket: {outcome}"
         );
         assert!(
@@ -2894,7 +2893,8 @@ fn when_triaging_tickets_given_each_non_authorizing_state_beside_done_and_ready_
 }
 
 #[test]
-fn when_recording_done_tickets_given_status_write_failure_then_skips_review_and_summarizes_generated_report() {
+fn when_recording_done_tickets_given_status_write_failure_then_skips_review_and_summarizes_generated_report()
+ {
     let (step, dir, transport) = triage_run_prepared(common::TriageScript::AllDone, |dir| {
         fs::create_dir_all(dir.join("tickets/queue-status.json"))
             .expect("the status path can be planted as a directory");
@@ -2929,7 +2929,8 @@ fn when_recording_done_tickets_given_status_write_failure_then_skips_review_and_
 }
 
 #[test]
-fn when_recording_done_tickets_given_report_write_failure_then_reviews_and_summarizes_generated_report() {
+fn when_recording_done_tickets_given_report_write_failure_then_reviews_and_summarizes_generated_report()
+ {
     let (step, dir, transport) = triage_run_prepared(common::TriageScript::AllDone, |dir| {
         fs::create_dir_all(dir.join("queue-report.md"))
             .expect("the report path can be planted as a directory");
@@ -2958,7 +2959,8 @@ fn when_recording_done_tickets_given_report_write_failure_then_reviews_and_summa
 }
 
 #[test]
-fn when_running_the_pipeline_given_all_ready_tickets_then_preserves_queue_review_and_summary_flow() {
+fn when_running_the_pipeline_given_all_ready_tickets_then_preserves_queue_review_and_summary_flow()
+{
     let (step, dir, transport) = multi_triage_run(common::TriageScript::AllReady);
     assert!(matches!(step, Step::Complete), "{step:?}");
 

@@ -1144,3 +1144,174 @@ fn when_ticket_work_given_exhausted_transport_retries_then_keeps_model_retries_s
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&log_dir);
 }
+
+// -- Gate-failure diagnostics through the shared report context ------------
+
+/// The last request carrying the plan system marker.
+fn last_plan_request(transport: &common::ScriptedTransport) -> serde_json::Value {
+    transport
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .rfind(|body| body.to_string().contains(common::PLAN_MARKER))
+        .cloned()
+        .expect("the second ask made a plan request")
+}
+
+#[test]
+fn when_final_gate_fails_given_distinct_first_and_final_outputs_then_shared_context_uses_final_output()
+ {
+    let repository = common::TempRepo::new();
+    let dir = super::scratch_dir();
+    fs::create_dir_all(&dir).expect("the artifact directory is creatable");
+    let state = dir.join("gate-state");
+    let final_output = format!("FINAL-HEAD-{}-FINAL-TAIL", "x".repeat(700));
+    // Keep both diagnostics out of the gate command itself: the command is
+    // replayed verbatim in the report and the first-attempt handover, so only
+    // the invocations reading these files can put an output in either place.
+    let first_path = dir.join("first-gate-output.txt");
+    fs::write(&first_path, "FIRST-GATE-DIAGNOSTIC").expect("the first gate diagnostic is writable");
+    let final_path = dir.join("final-gate-output.txt");
+    fs::write(&final_path, &final_output).expect("the final gate diagnostic is writable");
+    let script = dir.join("gate.sh");
+    fs::write(
+        &script,
+        format!(
+            "count=$(cat {state} 2>/dev/null || echo 0)\ncount=$((count + 1))\nprintf '%s' \"$count\" > {state}\nif [ \"$count\" -eq 1 ]; then cat {first_path} >&2; exit 1; else cat {final_path} >&2; exit 1; fi\n",
+            state = state.display(),
+            first_path = first_path.display(),
+            final_path = final_path.display(),
+        ),
+    )
+    .expect("the gate script is writable");
+    let gate = format!("sh {}", script.display());
+    let mut replies = Vec::new();
+    for _ in 0..8 {
+        replies.push(common::CodeReply::Complete(None));
+    }
+    let transport = Arc::new(
+        common::ScriptedTransport::new()
+            .with_summary(common::SummaryScript::Summary)
+            .with_review(common::ReviewScript::Pass)
+            .with_code_replies(replies)
+            .with_tickets(tickets_with_gate(&gate))
+            .with_repeating_handoffs(),
+    );
+    let config = config_for(transport.clone());
+    let mut pipeline = Pipeline::new(&config, common::scope(), repository.path());
+
+    let step = pipeline.ask(&common::harmless_plan_request(), &dir);
+    assert!(
+        matches!(step, Step::Retry),
+        "the failed final gate leaves the run retryable: {step:?}"
+    );
+
+    let requests = code_requests(&transport);
+    let handover = retry_handover(&requests);
+    assert!(
+        handover.contains("FIRST-GATE-DIAGNOSTIC"),
+        "the retry handover keeps the first gate: {handover}"
+    );
+    assert!(
+        !handover.contains("FINAL-HEAD-"),
+        "the first handover never sees the final gate: {handover}"
+    );
+
+    let report_text = report(&dir);
+    assert!(
+        report_text.contains(&final_output),
+        "the report keeps the final excerpt: {report_text}"
+    );
+    assert!(
+        !report_text.contains("FIRST-GATE-DIAGNOSTIC"),
+        "the report never keeps the first gate: {report_text}"
+    );
+
+    let summary_requests: Vec<String> = transport
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| body.to_string())
+        .filter(|body| body.contains(common::SUMMARY_MARKER))
+        .collect();
+    assert_eq!(
+        summary_requests.len(),
+        1,
+        "the incomplete queue is summarised once"
+    );
+    assert!(
+        summary_requests[0].contains(&final_output),
+        "the summary input carries the final excerpt"
+    );
+    assert!(
+        !summary_requests[0].contains("FIRST-GATE-DIAGNOSTIC"),
+        "the summary input never carries the first gate"
+    );
+
+    let second = pipeline.ask("please retry the incomplete queue", &dir);
+    assert!(matches!(second, Step::Retry), "{second:?}");
+    let plan = last_plan_request(&transport);
+    let plan_text = plan.to_string();
+    assert!(
+        plan_text.contains("1-verify-command-output"),
+        "the plan context names the failed ticket: {plan_text}"
+    );
+    assert!(
+        plan_text.contains("gate failed"),
+        "the plan context keeps the ending phrase: {plan_text}"
+    );
+    assert!(
+        plan_text.contains("FINAL-HEAD-"),
+        "the plan context keeps the final excerpt head: {plan_text}"
+    );
+    assert!(
+        plan_text.contains("-FINAL-TAIL"),
+        "the plan context keeps the final excerpt tail: {plan_text}"
+    );
+    assert!(
+        !plan_text.contains("FIRST-GATE-DIAGNOSTIC"),
+        "the plan context never carries the first gate: {plan_text}"
+    );
+    let assistant = plan["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message["content"].as_str())
+        .find(|content| content.contains("[DOWNSTREAM RETRY]"))
+        .expect("the plan handover carries the downstream outcome");
+    let detail = assistant
+        .lines()
+        .find_map(|line| line.strip_prefix("outcome: "))
+        .expect("the downstream retry names its outcome");
+    assert!(
+        detail.len() <= 600,
+        "the existing 600-byte downstream cap still bounds the detail: {} bytes",
+        detail.len()
+    );
+    assert!(
+        detail.contains("1-verify-command-output"),
+        "the capped detail keeps the failed ticket: {detail}"
+    );
+    assert!(
+        detail.contains("gate failed"),
+        "the capped detail keeps the ending phrase: {detail}"
+    );
+    assert!(
+        detail.contains("...[omitted]..."),
+        "the capped detail uses the existing truncation marker: {detail}"
+    );
+    assert!(
+        detail.ends_with("-FINAL-TAIL)"),
+        "the capped detail keeps the final excerpt tail: {detail}"
+    );
+    assert!(
+        !detail.contains("FIRST-GATE-DIAGNOSTIC"),
+        "the capped detail never carries the first gate: {detail}"
+    );
+
+    drop(repository);
+    let _ = fs::remove_dir_all(&dir);
+}
