@@ -22,7 +22,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md) | `[x]` Complete (T11 done) | `T11` | `src/tools.rs` |
 | [`09-file-editing-and-patch-matching.md`](./.plans/09-file-editing-and-patch-matching.md) | `[x]` Complete (T12 done) | `T12` | `src/script.rs` |
 | [`12-http-retry-and-overload-resilience.md`](./.plans/12-http-retry-and-overload-resilience.md) | `[x]` Complete (T13 done) | `T13` | `src/retry.rs` |
-| [`07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md) | `[ ]` Pending | `T14`, `T15` | `src/api.rs`, `src/llm/`, `src/loops/agent.rs` |
+| [`07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md) | `[ ] Pending (T14 done; T15 pending)` | `T14`, `T15` | `src/api.rs`, `src/llm/`, `src/loops/agent.rs` |
 | [`PROPOSAL-2-review-pass-retry.md`](./.plans/PROPOSAL-2-review-pass-retry.md) | `[ ]` Pending | `T16` | `src/pipeline.rs` |
 | [`11-context-compaction-and-overflow-recovery.md`](./.plans/11-context-compaction-and-overflow-recovery.md) | `[ ]` Pending | `T17` | `src/loops/agent.rs` |
 | [`08-conversation-trajectory-persistence.md`](./.plans/08-conversation-trajectory-persistence.md) | `[ ]` Pending | `T18` | `src/loops/agent.rs`, `src/tools.rs` |
@@ -75,7 +75,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
       ├──► [x] [T11] 05: Shell process-group kill & timeout spill (src/tools.rs) ──────────────┐
       ├──► [x] [T12] 09: CRLF tools.replace & grep line cap (src/script.rs)                    │
       ├──► [x] [T13] 12: HTTP 408, permanent 429 fast-fail & retry-after hints (src/retry.rs) ─┼──┐
-      ├──► [ ] [T14] 07a: Output-token truncation detection across providers (src/api.rs, llm) │  │
+      ├──► [x] [T14] 07a: Output-token truncation detection across providers (src/api.rs, llm) │  │
       │          │                                                                             │  │
       │          ▼                                                                             │  │
       │        [ ] [T15] 07b: In-loop truncation recovery & tool repetition guard (agent.rs)   │  │
@@ -262,7 +262,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `TODO.md`, mark `T13` complete (`[x]`) in the DAG and ordered backlog and mark `12-http-retry-and-overload-resilience.md` `[x] Complete (T13 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib retry && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T14` — Provider Output-Token Truncation Detection (`Message.truncated`)**
+- [x] **`T14` — Provider Output-Token Truncation Detection (`Message.truncated`)**
   - `depends_on`: `["T06"]`
   - `unblocks`: `["T15"]`
   - `plans`: [`.plans/07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md)

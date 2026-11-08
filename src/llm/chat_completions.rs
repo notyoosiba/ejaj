@@ -115,7 +115,14 @@ impl LlmProvider for ChatProvider {
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message)
+            .map(|choice| {
+                let mut message = choice.message;
+                // Only the provider's exact `length` stop reason flags the
+                // message as truncated; every other metadata shape, absent or
+                // present, leaves it false.
+                message.truncated = choice.finish_reason.as_deref() == Some("length");
+                message
+            })
             .ok_or_else(|| {
                 CallError::Malformed("the response carried no choices[0].message".to_string())
             })
@@ -325,6 +332,181 @@ mod tests {
         assert_eq!(calls[0].kind, "function");
         assert_eq!(calls[0].function.name, "bash");
         assert_eq!(calls[0].function.arguments, r#"{"command":"ls"}"#);
+    }
+
+    /// The exact `length` finish reason marks the selected first choice as
+    /// truncated while everything the provider sent survives: text only, tool
+    /// calls only, and both together.
+    #[test]
+    fn when_first_choice_reports_length_given_text_and_tool_outputs_then_message_is_marked_truncated()
+     {
+        let text_only = r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"a partial answer"}}]}"#;
+        let message = decoded(&provider(None), raw(200, text_only));
+
+        assert!(
+            message.truncated,
+            "an exact length finish must mark the message truncated"
+        );
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.content.as_deref(), Some("a partial answer"));
+        assert!(message.tool_calls.is_none());
+
+        let tool_only = r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#;
+        let message = decoded(&provider(None), raw(200, tool_only));
+
+        assert!(
+            message.truncated,
+            "a tool-only length finish must mark the message truncated"
+        );
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.content, None);
+        let calls = message.tool_calls.expect("the tool calls survive");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call-1");
+        assert_eq!(calls[0].kind, "function");
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"ls"}"#);
+
+        let both = r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"calling a tool","tool_calls":[{"id":"call-2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#;
+        let message = decoded(&provider(None), raw(200, both));
+
+        assert!(
+            message.truncated,
+            "a text-and-tool length finish must mark the message truncated"
+        );
+        assert_eq!(message.content.as_deref(), Some("calling a tool"));
+        let calls = message.tool_calls.expect("the tool calls survive");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call-2");
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    /// An absent or expressly null finish reason is ordinary metadata: the
+    /// first-choice message decodes untouched and is never marked truncated.
+    #[test]
+    fn when_finish_reason_is_missing_or_null_given_a_first_choice_then_message_is_not_truncated() {
+        let missing = r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
+        let null = r#"{"choices":[{"finish_reason":null,"message":{"role":"assistant","content":"hello"}}]}"#;
+
+        for body in [missing, null] {
+            let message = decoded(&provider(None), raw(200, body));
+
+            assert!(!message.truncated, "unexpected truncation for {body}");
+            assert_eq!(message.role, Role::Assistant, "body {body}");
+            assert_eq!(message.content.as_deref(), Some("hello"), "body {body}");
+            assert!(message.tool_calls.is_none(), "body {body}");
+        }
+    }
+
+    /// A finish reason that is not the exact JSON string `length` -- wrongly
+    /// typed, empty, differently cased, or another stop reason -- is ignored.
+    #[test]
+    fn when_finish_reason_is_wrong_shaped_or_nonmatching_given_a_first_choice_then_message_is_not_truncated()
+     {
+        for finish in [
+            r#"7"#,
+            r#"true"#,
+            r#"{"reason":"length"}"#,
+            r#"["length"]"#,
+            r#""""#,
+            r#""stop""#,
+            r#""tool_calls""#,
+            r#""LENGTH""#,
+            r#""lengths""#,
+            r#"" length""#,
+        ] {
+            let body = format!(
+                r#"{{"choices":[{{"finish_reason":{finish},"message":{{"role":"assistant","content":"hello"}}}}]}}"#
+            );
+            let message = decoded(&provider(None), raw(200, &body));
+
+            assert!(!message.truncated, "unexpected truncation for {finish}");
+            assert_eq!(message.role, Role::Assistant, "finish {finish}");
+            assert_eq!(message.content.as_deref(), Some("hello"), "finish {finish}");
+        }
+    }
+
+    /// Only the selected first choice decides truncation: a later choice's
+    /// length finish never leaks onto the returned message.
+    #[test]
+    fn when_a_later_choice_reports_length_given_a_complete_first_choice_then_the_first_choice_is_returned_untruncated()
+     {
+        let body = r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"first"}},{"finish_reason":"length","message":{"role":"assistant","content":"second"}}]}"#;
+        let message = decoded(&provider(None), raw(200, body));
+
+        assert!(!message.truncated);
+        assert_eq!(message.content.as_deref(), Some("first"));
+    }
+
+    /// A rejected call keeps its API error classification and message even when
+    /// the payload also carries length finish metadata.
+    #[test]
+    fn when_provider_rejects_given_unauthorized_or_forbidden_responses_with_truncation_metadata_then_api_errors_are_preserved()
+     {
+        for (status, expected_message) in [(401, "invalid api key"), (403, "forbidden")] {
+            let body = format!(
+                r#"{{"error":{{"message":"{expected_message}"}},"choices":[{{"finish_reason":"length","message":{{"role":"assistant","content":"partial"}}}}]}}"#
+            );
+
+            match decode_error(&provider(None), raw(status, &body)) {
+                CallError::Api {
+                    status: reported_status,
+                    message: reported_message,
+                } => {
+                    assert_eq!(reported_status, status);
+                    assert_eq!(reported_message, expected_message);
+                }
+                other => panic!("expected an API error for {status}, got {}", other),
+            }
+        }
+    }
+
+    /// Truncation metadata never rescues a response that was already an error:
+    /// the no-choice, malformed-choice, invalid-JSON and 2xx error-body
+    /// classifications survive exactly as before.
+    #[test]
+    fn when_decoding_given_error_or_choice_free_bodies_with_length_metadata_then_preserves_each_original_error()
+     {
+        match decode_error(
+            &provider(None),
+            raw(
+                200,
+                r#"{"error":{"message":"overloaded"},"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"partial"}}]}"#,
+            ),
+        ) {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 200);
+                assert_eq!(message, "overloaded");
+            }
+            other => panic!("expected an API error, got {}", other),
+        }
+
+        match decode_error(&provider(None), raw(200, r#"{"choices":[]}"#)) {
+            CallError::Malformed(message) => {
+                assert_eq!(message, "the response carried no choices[0].message");
+            }
+            other => panic!("expected a malformed error, got {}", other),
+        }
+
+        match decode_error(
+            &provider(None),
+            raw(200, r#"{"choices":[{"finish_reason":"length"}]}"#),
+        ) {
+            CallError::Transport(message) => assert!(
+                message.starts_with("invalid JSON response (HTTP 200): "),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected a transport error, got {}", other),
+        }
+
+        match decode_error(&provider(None), raw(200, "not json")) {
+            CallError::Transport(message) => assert!(
+                message.starts_with("invalid JSON response (HTTP 200): "),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected a transport error, got {}", other),
+        }
     }
 
     /// A body that is not JSON is a transport error naming the status.

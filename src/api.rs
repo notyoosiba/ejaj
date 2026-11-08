@@ -36,6 +36,10 @@ pub struct Message {
     /// Any other field the provider sent, preserved verbatim.
     #[serde(flatten, default)]
     pub extra: Map<String, serde_json::Value>,
+    /// Internal state: whether a provider stopped this message at an output
+    /// limit. Never part of the wire and never counted by context sizing.
+    #[serde(skip)]
+    pub truncated: bool,
 }
 
 impl Message {
@@ -59,6 +63,7 @@ impl Message {
             tool_call_id: None,
             reasoning_content: None,
             extra: Map::new(),
+            truncated: false,
         }
     }
 
@@ -71,6 +76,7 @@ impl Message {
             tool_call_id: Some(tool_call_id.to_string()),
             reasoning_content: None,
             extra: Map::new(),
+            truncated: false,
         }
     }
 }
@@ -168,6 +174,24 @@ pub struct ChatCompletionResponse {
 #[derive(Deserialize)]
 pub struct Choice {
     pub message: Message,
+    /// The provider's stop reason, retained as optional metadata. A wire that
+    /// omits the field, sends `null`, or sends a value that is not a string
+    /// must still decode, so anything but a JSON string becomes `None`.
+    #[serde(default, deserialize_with = "finish_reason")]
+    pub finish_reason: Option<String>,
+}
+
+/// Decode the optional `finish_reason` metadata tolerantly: an absent, `null`,
+/// or wrongly typed value is `None` rather than a decoding failure, so a
+/// provider's stray metadata never discards an otherwise usable response.
+fn finish_reason<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        Some(serde_json::Value::String(reason)) => Ok(Some(reason)),
+        _ => Ok(None),
+    }
 }
 
 /// An API error body: `{"error": {...}}` or the rarer `{"error": "..."}`.
@@ -391,6 +415,125 @@ mod tests {
         assert_ne!(
             first, second,
             "a mutated request must report a new context length"
+        );
+    }
+
+    /// Core entry-point behavior at the minimum valid boundary: every public
+    /// constructor yields an untruncated message.
+    #[test]
+    fn when_messages_are_constructed_given_public_message_helpers_then_truncation_defaults_to_false()
+     {
+        assert!(
+            !Message::system("you are a helpful agent").truncated,
+            "a system message starts untruncated"
+        );
+        assert!(
+            !Message::user("run the tests").truncated,
+            "a user message starts untruncated"
+        );
+        assert!(
+            !Message::assistant("all green").truncated,
+            "an assistant message starts untruncated"
+        );
+        assert!(
+            !Message::tool("call-1", "all green").truncated,
+            "a tool message starts untruncated"
+        );
+    }
+
+    /// Empty/nil boundary: legacy wire JSON carries no internal state field, and
+    /// decoding it must still produce an untruncated message.
+    #[test]
+    fn when_legacy_message_json_is_deserialized_given_no_internal_state_field_then_message_is_untruncated()
+     {
+        let message: Message =
+            serde_json::from_str(r#"{"role":"assistant","content":"legacy reply"}"#)
+                .expect("the legacy wire shape decodes");
+
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.content.as_deref(), Some("legacy reply"));
+        assert!(
+            !message.truncated,
+            "a message without the internal field is untruncated"
+        );
+    }
+
+    /// Malformed/invalid boundary: the internal flag is serde-skipped, so neither
+    /// value changes the wire JSON, which stays exactly the legacy shape.
+    #[test]
+    fn when_truncation_changes_given_a_message_is_encoded_then_wire_json_is_unchanged() {
+        let expected_wire = serde_json::json!({
+            "role": "tool",
+            "content": "all green",
+            "tool_call_id": "call-1",
+        });
+        let mut message = Message::tool("call-1", "all green");
+
+        assert!(!message.truncated);
+        assert_eq!(
+            serde_json::to_value(&message).unwrap(),
+            expected_wire,
+            "an untruncated message keeps the legacy wire shape"
+        );
+
+        message.truncated = true;
+
+        assert_eq!(
+            serde_json::to_value(&message).unwrap(),
+            expected_wire,
+            "a truncated message keeps the legacy wire shape"
+        );
+        assert!(
+            serde_json::to_value(&message)
+                .unwrap()
+                .get("truncated")
+                .is_none(),
+            "the internal flag must never be emitted on the wire"
+        );
+    }
+
+    /// Maximum/upper boundary: toggling the internal flag changes neither the
+    /// encoded transcript nor the context size derived from it.
+    #[test]
+    fn when_truncation_changes_given_a_transcript_is_sized_then_context_bytes_are_unchanged() {
+        const EXPECTED_TRANSCRIPT: &str = concat!(
+            r#"[{"role":"system","content":"you are a helpful agent"},"#,
+            r#"{"role":"user","content":"run the tests"},"#,
+            r#"{"role":"tool","content":"all green","tool_call_id":"call-1"}]"#,
+        );
+        let messages = vec![
+            Message::system("you are a helpful agent"),
+            Message::user("run the tests"),
+            Message::tool("call-1", "all green"),
+        ];
+        let untruncated = request(messages.clone(), Vec::new());
+        let untruncated_context = untruncated.context_len();
+
+        let mut truncated_messages = messages;
+        for message in &mut truncated_messages {
+            message.truncated = true;
+        }
+        let truncated = request(truncated_messages, Vec::new());
+        let truncated_context = truncated.context_len();
+
+        assert_eq!(
+            serde_json::to_string(&untruncated.messages).unwrap(),
+            EXPECTED_TRANSCRIPT,
+            "the untruncated transcript encodes to the known wire shape"
+        );
+        assert_eq!(
+            serde_json::to_string(&truncated.messages).unwrap(),
+            EXPECTED_TRANSCRIPT,
+            "the truncated transcript encodes to the same known wire shape"
+        );
+        assert_eq!(
+            untruncated_context,
+            EXPECTED_TRANSCRIPT.len(),
+            "the context size is the known transcript length"
+        );
+        assert_eq!(
+            truncated_context, untruncated_context,
+            "toggling the internal flag must not change the context size"
         );
     }
 

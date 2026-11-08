@@ -139,9 +139,18 @@ impl LlmProvider for AnthropicProvider {
             });
         }
 
+        // Only Anthropic's exact output-limit signal marks a message
+        // truncated. Every other stop reason -- absent, null, non-string,
+        // empty or a different string -- keeps the ordinary behavior.
+        let truncated = object.get("stop_reason").and_then(Value::as_str) == Some("max_tokens");
+
         let blocks = match object.get("content") {
             Some(Value::Array(blocks)) => blocks,
             Some(_) => return Err(malformed("the response content was not an array")),
+            // A response that stopped at the output limit before emitting a
+            // content array still carries useful state: the loop must see an
+            // empty assistant turn rather than a malformed response.
+            None if truncated => return Ok(empty_assistant(true)),
             None => return Err(no_usable_content(object)),
         };
 
@@ -171,6 +180,9 @@ impl LlmProvider for AnthropicProvider {
         let content = (!text.is_empty()).then_some(text);
         let tool_calls = (!calls.is_empty()).then_some(calls);
         if content.is_none() && tool_calls.is_none() {
+            if truncated {
+                return Ok(empty_assistant(true));
+            }
             return Err(no_usable_content(object));
         }
 
@@ -181,7 +193,23 @@ impl LlmProvider for AnthropicProvider {
             tool_call_id: None,
             reasoning_content: None,
             extra: Map::new(),
+            truncated,
         })
+    }
+}
+
+/// The assistant turn an output-limit stop produces when nothing replayable
+/// came back. It keeps the wire's role so the loop can treat it as a normal
+/// reply that merely ran out of budget.
+fn empty_assistant(truncated: bool) -> Message {
+    Message {
+        role: Role::Assistant,
+        content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+        extra: Map::new(),
+        truncated,
     }
 }
 
@@ -560,6 +588,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: Map::new(),
+            truncated: false,
         }
     }
 
@@ -1653,10 +1682,10 @@ mod tests {
             r#"the response carried no usable content (stop_reason="end_turn"; content_types=["thinking","redacted_thinking"])"#
         );
 
-        let stop_only = decoded_error_detail(r#"{"stop_reason":"max_tokens"}"#);
+        let stop_only = decoded_error_detail(r#"{"stop_reason":"end_turn"}"#);
         assert_eq!(
             stop_only,
-            r#"the response carried no usable content (stop_reason="max_tokens")"#
+            r#"the response carried no usable content (stop_reason="end_turn")"#
         );
 
         let content_only = decoded_error_detail(r#"{"content":[]}"#);
@@ -1672,10 +1701,10 @@ mod tests {
             r#"the response carried no usable content (content_types=["thinking"])"#
         );
 
-        let empty_array = decoded_error_detail(r#"{"stop_reason":"max_tokens","content":[]}"#);
+        let empty_array = decoded_error_detail(r#"{"stop_reason":"end_turn","content":[]}"#);
         assert_eq!(
             empty_array,
-            r#"the response carried no usable content (stop_reason="max_tokens"; content_types=[])"#
+            r#"the response carried no usable content (stop_reason="end_turn"; content_types=[])"#
         );
 
         for body in [r#"{}"#, r#"{"stop_reason":null}"#] {
@@ -1838,6 +1867,7 @@ mod tests {
         assert!(text.tool_call_id.is_none());
         assert!(text.reasoning_content.is_none());
         assert!(text.extra.is_empty());
+        assert!(!text.truncated, "an end_turn reply is not truncated");
 
         let tool = decoded(
             &provider(),
@@ -1855,6 +1885,7 @@ mod tests {
         assert_eq!(calls[0].function.name, "bash");
         assert_eq!(calls[0].function.arguments, r#"{"command":"ls"}"#);
         assert!(tool.extra.is_empty());
+        assert!(!tool.truncated, "a tool_use reply is not truncated");
 
         match decode_error(&provider(), raw(200, "not json")) {
             CallError::Transport(message) => assert!(
@@ -1964,14 +1995,14 @@ mod tests {
             .iter()
             .map(|block_type| json!({ "type": block_type }))
             .collect();
-        let body = json!({"stop_reason": "max_tokens", "content": blocks}).to_string();
+        let body = json!({"stop_reason": "end_turn", "content": blocks}).to_string();
         let expected_types = serde_json::to_string(&types).expect("the types encode as JSON");
 
         let detail = decoded_error_detail(&body);
         assert_eq!(
             detail,
             format!(
-                r#"the response carried no usable content (stop_reason="max_tokens"; content_types={expected_types})"#
+                r#"the response carried no usable content (stop_reason="end_turn"; content_types={expected_types})"#
             )
         );
         assert_eq!(detail.matches("block_type_").count(), 32);
@@ -2009,6 +2040,201 @@ mod tests {
                 "the response content was not an array",
                 "body {body}"
             );
+        }
+    }
+
+    /// Core entry-point behavior at the minimum valid boundary: the exact
+    /// `max_tokens` stop reason preserves usable text, valid tool calls and
+    /// their combination, and marks the message truncated.
+    #[test]
+    fn when_output_stops_at_max_tokens_given_usable_text_or_tool_calls_then_content_is_preserved_and_marked_truncated()
+     {
+        let text = decoded(
+            &provider(),
+            raw(
+                200,
+                r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"partial answer"}]}"#,
+            ),
+        );
+        assert_eq!(text.role, Role::Assistant);
+        assert_eq!(text.content.as_deref(), Some("partial answer"));
+        assert!(text.tool_calls.is_none());
+        assert!(text.truncated, "the text reply stops at the output limit");
+
+        let tool = decoded(
+            &provider(),
+            raw(
+                200,
+                r#"{"stop_reason":"max_tokens","content":[{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"ls"}}]}"#,
+            ),
+        );
+        assert_eq!(tool.role, Role::Assistant);
+        assert!(tool.content.is_none());
+        let calls = tool.tool_calls.expect("the tool call survives");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "toolu_1");
+        assert_eq!(calls[0].kind, "function");
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"ls"}"#);
+        assert!(tool.truncated, "the tool reply stops at the output limit");
+
+        let mixed = decoded(
+            &provider(),
+            raw(
+                200,
+                r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"toolu_2","name":"bash","input":{"command":"pwd"}}]}"#,
+            ),
+        );
+        assert_eq!(mixed.role, Role::Assistant);
+        assert_eq!(mixed.content.as_deref(), Some("checking"));
+        let calls = mixed.tool_calls.expect("the mixed call survives");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "toolu_2");
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"pwd"}"#);
+        assert!(mixed.truncated, "the mixed reply stops at the output limit");
+    }
+
+    /// Empty/zero/nil boundary: the exact stop signal with absent or unusable
+    /// array content yields an empty assistant message instead of an error.
+    #[test]
+    fn when_output_stops_at_max_tokens_given_absent_or_unusable_array_content_then_an_empty_assistant_message_is_returned()
+     {
+        for body in [
+            r#"{"stop_reason":"max_tokens"}"#,
+            r#"{"stop_reason":"max_tokens","content":[]}"#,
+            r#"{"stop_reason":"max_tokens","content":[{"type":"thinking","thinking":"quiet"}]}"#,
+            r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":""}]}"#,
+            r#"{"stop_reason":"max_tokens","content":[{"type":"tool_use","id":"","name":""}]}"#,
+        ] {
+            let message = decoded(&provider(), raw(200, body));
+            assert_eq!(message.role, Role::Assistant, "body {body}");
+            assert!(message.content.is_none(), "body {body}");
+            assert!(message.tool_calls.is_none(), "body {body}");
+            assert!(message.tool_call_id.is_none(), "body {body}");
+            assert!(message.reasoning_content.is_none(), "body {body}");
+            assert!(message.extra.is_empty(), "body {body}");
+            assert!(message.truncated, "body {body}");
+        }
+    }
+
+    /// Malformed/invalid payload boundary: present non-array content keeps the
+    /// exact malformed classification even with the `max_tokens` stop reason.
+    #[test]
+    fn when_content_is_not_an_array_given_max_tokens_stop_reason_then_existing_malformed_detail_is_preserved()
+     {
+        for body in [
+            r#"{"stop_reason":"max_tokens","content":null}"#,
+            r#"{"stop_reason":"max_tokens","content":"text"}"#,
+            r#"{"stop_reason":"max_tokens","content":42}"#,
+            r#"{"stop_reason":"max_tokens","content":{}}"#,
+        ] {
+            match decode_error(&provider(), raw(200, body)) {
+                CallError::Malformed(detail) => assert_eq!(
+                    detail, "the response content was not an array",
+                    "body {body}"
+                ),
+                other => panic!("body {body}: expected a malformed error, got {}", other),
+            }
+        }
+    }
+
+    /// Maximum limit boundary: both fixed Anthropic output budgets survive the
+    /// truncation detection change unchanged.
+    #[test]
+    fn when_output_stops_at_max_tokens_given_anthropic_budgets_are_checked_then_token_limits_remain_unchanged()
+     {
+        assert_eq!(MAX_TOKENS, 4096);
+        assert_eq!(SUMMARY_MAX_TOKENS, 16384);
+
+        let provider = provider();
+        let ordinary = provider.prepare(&[Message::user("hi")], Phase::Code);
+        assert_eq!(ordinary.outgoing.body["max_tokens"], json!(4096));
+        let summary = provider.prepare(&[Message::user("hi")], Phase::Summary);
+        assert_eq!(summary.outgoing.body["max_tokens"], json!(16384));
+    }
+
+    /// Regression boundary: unauthorized, forbidden and nested API errors stay
+    /// API errors even when the body also carries truncation metadata.
+    #[test]
+    fn when_provider_rejects_given_unauthorized_or_forbidden_responses_with_truncation_metadata_then_api_errors_are_preserved()
+     {
+        for (status, message) in [(401, "invalid x-api-key"), (403, "forbidden")] {
+            let body = json!({
+                "type": "error",
+                "error": {"type": "authentication_error", "message": message},
+                "stop_reason": "max_tokens",
+            })
+            .to_string();
+            match decode_error(&provider(), raw(status, &body)) {
+                CallError::Api {
+                    status: actual_status,
+                    message: actual_message,
+                } => {
+                    assert_eq!(actual_status, status);
+                    assert_eq!(actual_message, message);
+                }
+                other => panic!("status {status}: expected an API error, got {}", other),
+            }
+        }
+
+        let embedded = json!({
+            "type": "error",
+            "error": {"message": "overloaded"},
+            "stop_reason": "max_tokens",
+            "content": [{"type": "text", "text": "partial"}],
+        })
+        .to_string();
+        match decode_error(&provider(), raw(200, &embedded)) {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 200);
+                assert_eq!(message, "overloaded");
+            }
+            other => panic!("expected an API error, got {}", other),
+        }
+
+        let invalid = decode_error(&provider(), raw(200, r#"{"stop_reason":"max_tokens""#));
+        assert!(matches!(invalid, CallError::Transport(_)));
+
+        let server_error = decode_error(
+            &provider(),
+            raw(
+                500,
+                r#"{"stop_reason":"max_tokens","type":"error","error":{"message":"boom"}}"#,
+            ),
+        );
+        match server_error {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected an API error, got {}", other),
+        }
+    }
+
+    /// Empty/zero/nil table: a missing or non-matching stop reason never marks
+    /// a message truncated and keeps the existing unusable-content error.
+    #[test]
+    fn when_stop_reason_is_missing_or_not_max_tokens_given_unusable_content_then_existing_error_is_preserved()
+     {
+        for body in [
+            r#"{}"#,
+            r#"{"stop_reason":null}"#,
+            r#"{"stop_reason":7}"#,
+            r#"{"stop_reason":true}"#,
+            r#"{"stop_reason":""}"#,
+            r#"{"stop_reason":"end_turn"}"#,
+            r#"{"stop_reason":"MAX_TOKENS"}"#,
+            r#"{"stop_reason":"max_tokens "}"#,
+            r#"{"stop_reason":"max_token"}"#,
+        ] {
+            match decode_error(&provider(), raw(200, body)) {
+                CallError::Malformed(detail) => assert!(
+                    detail.starts_with("the response carried no usable content"),
+                    "body {body}: unexpected detail {detail}"
+                ),
+                other => panic!("body {body}: expected a malformed error, got {}", other),
+            }
         }
     }
 }

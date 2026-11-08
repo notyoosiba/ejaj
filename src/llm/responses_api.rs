@@ -19,16 +19,21 @@ use crate::api::{self, ApiError, CallError, Message, Outgoing, RawResponse, Role
 use crate::llm::{LlmProvider, Prepared, factory};
 use crate::tools::{Phase, Tool};
 
-/// The decoded shape of a responses body: the `output` item array and the
-/// optional `error` object. `output` items are left as raw JSON because the
-/// wire mixes known and unknown item types, and a degenerate item must never
-/// panic the decoder.
+/// The decoded shape of a responses body: the `output` item array, the
+/// optional `error` object, and the completion metadata. `output` items and
+/// the metadata are left as raw JSON because the wire mixes known and unknown
+/// item types and shapes, and degenerate metadata must never invalidate an
+/// otherwise decodable reply.
 #[derive(Deserialize)]
 struct ResponsesResponse {
     #[serde(default)]
     output: Option<Vec<Value>>,
     #[serde(default)]
     error: Option<ApiError>,
+    #[serde(default)]
+    status: Option<Value>,
+    #[serde(default)]
+    incomplete_details: Option<Value>,
 }
 
 /// A provider that speaks OpenAI's `/v1/responses` wire format.
@@ -128,7 +133,21 @@ impl LlmProvider for ResponsesProvider {
             });
         }
 
-        let output = response.output.ok_or_else(no_output_items)?;
+        // Only the wire's exact incomplete/max-output-token pair marks the
+        // turn truncated: an absent, null, or differently shaped status or
+        // reason is ordinary metadata and never changes decoding.
+        let truncated = reached_max_output_tokens(
+            response.status.as_ref(),
+            response.incomplete_details.as_ref(),
+        );
+        // The exact signal is the only case where the provider may legitimately
+        // send nothing to replay: an absent or empty output then decodes to an
+        // empty assistant turn instead of the ordinary no-output error.
+        let output = match response.output {
+            Some(output) => output,
+            None if truncated => Vec::new(),
+            None => return Err(no_output_items()),
+        };
 
         let mut text = String::new();
         let mut calls = Vec::new();
@@ -151,7 +170,7 @@ impl LlmProvider for ResponsesProvider {
 
         let content = (!text.is_empty()).then_some(text);
         let tool_calls = (!calls.is_empty()).then_some(calls);
-        if content.is_none() && tool_calls.is_none() {
+        if content.is_none() && tool_calls.is_none() && !truncated {
             return Err(no_output_items());
         }
 
@@ -162,8 +181,21 @@ impl LlmProvider for ResponsesProvider {
             tool_call_id: None,
             reasoning_content: None,
             extra: Map::new(),
+            truncated,
         })
     }
+}
+
+/// Whether the response reports the one exact output-limit signal: a status
+/// string of `incomplete` and an `incomplete_details.reason` string of
+/// `max_output_tokens`. Every other metadata shape -- absent, `null`, a
+/// different type, or a different value -- is not the signal.
+fn reached_max_output_tokens(status: Option<&Value>, incomplete_details: Option<&Value>) -> bool {
+    status.and_then(Value::as_str) == Some("incomplete")
+        && incomplete_details
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str)
+            == Some("max_output_tokens")
 }
 
 /// The one malformed-response message, shared by a missing `output` and an
@@ -349,6 +381,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: Map::new(),
+            truncated: false,
         }
     }
 
@@ -377,6 +410,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: Map::new(),
+            truncated: false,
         }];
         let prepared = provider(None).prepare(&messages, Phase::Code);
 
@@ -461,6 +495,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: Some("hidden chain of thought".to_string()),
             extra: serde_json::from_value(json!({"foo": "bar", "tool_call_id": "nope"})).unwrap(),
+            truncated: false,
         };
         let prepared = provider(None).prepare(&[assistant], Phase::Code);
         let serialized = serde_json::to_string(&prepared.outgoing.body["input"]).unwrap();
@@ -790,6 +825,220 @@ mod tests {
         assert_eq!(calls[0].id, "");
         assert_eq!(calls[0].function.name, "");
         assert_eq!(calls[0].function.arguments, "");
+    }
+
+    /// The exact `incomplete` / `max_output_tokens` pair marks the assistant
+    /// message truncated while every usable output it carried survives: text
+    /// only, a valid function call only, and both together.
+    #[test]
+    fn when_output_is_limited_given_exact_metadata_and_usable_text_or_calls_then_outputs_are_preserved()
+     {
+        let text_only = r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"a partial answer"}]}]}"#;
+        let message = decoded(&provider(None), raw(200, text_only));
+
+        assert!(
+            message.truncated,
+            "an exact limit signal must mark the message truncated"
+        );
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.content.as_deref(), Some("a partial answer"));
+        assert!(message.tool_calls.is_none());
+
+        let call_only = r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"function_call","call_id":"call-1","name":"bash","arguments":"{\"command\":\"ls\"}"}]}"#;
+        let message = decoded(&provider(None), raw(200, call_only));
+
+        assert!(
+            message.truncated,
+            "a call-only limit signal must mark the message truncated"
+        );
+        assert_eq!(message.role, Role::Assistant);
+        assert!(message.content.is_none());
+        let calls = message.tool_calls.expect("the tool calls survive");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call-1");
+        assert_eq!(calls[0].kind, "function");
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"ls"}"#);
+
+        let both = r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"calling a tool"}]},{"type":"function_call","call_id":"call-2","name":"bash","arguments":"{\"command\":\"pwd\"}"}]}"#;
+        let message = decoded(&provider(None), raw(200, both));
+
+        assert!(
+            message.truncated,
+            "a text-and-call limit signal must mark the message truncated"
+        );
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.content.as_deref(), Some("calling a tool"));
+        let calls = message.tool_calls.expect("the tool calls survive");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call-2");
+        assert_eq!(calls[0].kind, "function");
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    /// The exact limit pair is the only case that permits a marked assistant
+    /// turn with nothing to replay: an absent, null or empty `output` and an
+    /// array carrying no usable text or call all decode to an empty truncated
+    /// assistant message instead of the ordinary no-output error.
+    #[test]
+    fn when_output_is_limited_given_missing_or_unusable_output_then_an_empty_assistant_message_is_returned()
+     {
+        for body in [
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}"#,
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":null}"#,
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}"#,
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"reasoning","summary":[]}]}"#,
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":""}]}]}"#,
+        ] {
+            let message = decoded(&provider(None), raw(200, body));
+
+            assert!(message.truncated, "body {body}");
+            assert_eq!(message.role, Role::Assistant, "body {body}");
+            assert!(message.content.is_none(), "body {body}");
+            assert!(message.tool_calls.is_none(), "body {body}");
+            assert!(message.tool_call_id.is_none(), "body {body}");
+            assert!(message.reasoning_content.is_none(), "body {body}");
+            assert!(message.extra.is_empty(), "body {body}");
+        }
+    }
+
+    /// Anything short of the exact pair -- a missing or null field, a
+    /// differently shaped value, or a nonmatching status or reason -- is
+    /// ordinary metadata: the output still decodes and is never truncated.
+    #[test]
+    fn when_metadata_is_not_the_exact_pair_given_ordinary_output_then_message_is_not_truncated() {
+        let metadata = |meta: &str| {
+            format!(
+                r#"{{{meta}"output":[{{"type":"message","content":[{{"type":"output_text","text":"hello"}}]}}]}}"#
+            )
+        };
+
+        for meta in [
+            "",
+            r#""status":null,"incomplete_details":null,"#,
+            r#""status":"incomplete","#,
+            r#""incomplete_details":{"reason":"max_output_tokens"},"#,
+            r#""status":"complete","incomplete_details":{"reason":"max_output_tokens"},"#,
+            r#""status":"in_progress","incomplete_details":{"reason":"max_output_tokens"},"#,
+            r#""status":"incomplete","incomplete_details":{"reason":"content_filter"},"#,
+            r#""status":"incomplete","incomplete_details":{},"#,
+            r#""status":"incomplete","incomplete_details":{"reason":null},"#,
+            r#""status":"incomplete","incomplete_details":{"reason":"MAX_OUTPUT_TOKENS"},"#,
+            r#""status":"incomplete","incomplete_details":"max_output_tokens","#,
+            r#""status":"incomplete","incomplete_details":["max_output_tokens"],"#,
+            r#""status":"incomplete","incomplete_details":7,"#,
+            r#""status":"incomplete","incomplete_details":{"reason":{"value":"max_output_tokens"}},"#,
+            r#""status":["incomplete"],"incomplete_details":{"reason":"max_output_tokens"},"#,
+            r#""status":7,"incomplete_details":{"reason":"max_output_tokens"},"#,
+            r#""status":" incomplete","incomplete_details":{"reason":"max_output_tokens"},"#,
+        ] {
+            let message = decoded(&provider(None), raw(200, &metadata(meta)));
+
+            assert!(!message.truncated, "unexpected truncation for {meta:?}");
+            assert_eq!(message.role, Role::Assistant, "meta {meta:?}");
+            assert_eq!(message.content.as_deref(), Some("hello"), "meta {meta:?}");
+            assert!(message.tool_calls.is_none(), "meta {meta:?}");
+        }
+    }
+
+    /// Truncation metadata never rescues a body that was already unreadable:
+    /// malformed envelopes and output shapes stay transport errors, and a
+    /// missing or unusable output without the exact pair stays the ordinary
+    /// no-output error.
+    #[test]
+    fn when_output_is_malformed_given_truncation_metadata_then_existing_malformed_errors_are_preserved()
+     {
+        for body in [
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":"nope"}"#,
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":{}}"#,
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":7}"#,
+        ] {
+            match decode_error(&provider(None), raw(200, body)) {
+                CallError::Transport(message) => assert!(
+                    message.starts_with("invalid JSON response (HTTP 200): "),
+                    "body {body}: unexpected message: {message}"
+                ),
+                other => panic!("body {body}: expected a transport error, got {}", other),
+            }
+        }
+
+        for body in [
+            r#"{"id":"resp_1"}"#,
+            r#"{"status":"completed"}"#,
+            r#"{"status":"incomplete"}"#,
+            r#"{"incomplete_details":{"reason":"max_output_tokens"}}"#,
+            r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}"#,
+            r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}"#,
+            r#"{"status":"completed","output":[{"type":"reasoning","summary":[]}]}"#,
+        ] {
+            match decode_error(&provider(None), raw(200, body)) {
+                CallError::Malformed(message) => {
+                    assert_eq!(
+                        message, "the response carried no output items",
+                        "body {body}"
+                    );
+                }
+                other => panic!("body {body}: expected a malformed error, got {}", other),
+            }
+        }
+
+        match decode_error(
+            &provider(None),
+            raw(
+                200,
+                r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}"#,
+            ),
+        ) {
+            CallError::Transport(message) => assert!(
+                message.starts_with("invalid JSON response (HTTP 200): "),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected a transport error, got {}", other),
+        }
+    }
+
+    /// A rejected call keeps its API error classification and message even when
+    /// the payload also carries the exact limit metadata, and a 2xx body
+    /// carrying an error object is still an API error.
+    #[test]
+    fn when_provider_rejects_given_unauthorized_or_forbidden_responses_with_truncation_metadata_then_api_errors_are_preserved()
+     {
+        for (status, expected_message) in [(401, "invalid api key"), (403, "forbidden")] {
+            let body = format!(
+                r#"{{"status":"incomplete","incomplete_details":{{"reason":"max_output_tokens"}},"error":{{"message":"{expected_message}"}}}}"#
+            );
+
+            match decode_error(&provider(None), raw(status, &body)) {
+                CallError::Api {
+                    status: reported_status,
+                    message: reported_message,
+                } => {
+                    assert_eq!(reported_status, status);
+                    assert_eq!(reported_message, expected_message);
+                }
+                other => panic!("expected an API error for {status}, got {}", other),
+            }
+        }
+
+        let unauthorized =
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}"#;
+        match decode_error(&provider(None), raw(401, unauthorized)) {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 401);
+                assert_eq!(message, unauthorized);
+            }
+            other => panic!("expected an API error, got {}", other),
+        }
+
+        let overloaded = r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"error":{"message":"overloaded"}}"#;
+        match decode_error(&provider(None), raw(200, overloaded)) {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 200);
+                assert_eq!(message, "overloaded");
+            }
+            other => panic!("expected an API error, got {}", other),
+        }
     }
 
     /// The provider's name is stable and used by the factory.

@@ -272,6 +272,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: Some("private plan reasoning".to_string()),
             extra: extra.clone(),
+            truncated: false,
         };
         session.messages.push(earlier.clone());
 

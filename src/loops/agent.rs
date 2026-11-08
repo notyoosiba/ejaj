@@ -1368,6 +1368,7 @@ fn request_handover_summary(
         tool_call_id: None,
         reasoning_content: None,
         extra: serde_json::Map::new(),
+        truncated: false,
     })
 }
 
@@ -1717,6 +1718,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: Some(format!("reasoning {index}")),
                 extra: serde_json::Map::new(),
+                truncated: false,
             },
             Message::tool(&call_id, result),
         ]
@@ -1742,6 +1744,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: Some("reasoning".to_string()),
             extra: serde_json::Map::new(),
+            truncated: false,
         }
     }
 
@@ -1792,6 +1795,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: Some("older reasoning".to_string()),
                 extra: serde_json::Map::new(),
+                truncated: false,
             },
             Message::user("m".repeat(500 * 1024)),
         ];
@@ -6438,6 +6442,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: serde_json::Map::new(),
+            truncated: false,
         });
         let original = messages.clone();
 
@@ -6477,6 +6482,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: serde_json::Map::new(),
+            truncated: false,
         });
         let original = messages.clone();
 
@@ -6632,6 +6638,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: serde_json::Map::new(),
+            truncated: false,
         });
 
         let mut unanswered = plan_transcript();
