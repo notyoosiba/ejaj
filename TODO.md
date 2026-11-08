@@ -8,7 +8,7 @@ Tracks the implementation status of active proposals in [`.plans/`](./.plans/REA
 
 | Proposal | Status | Mapped DAG Task | Target Modules |
 | --- | --- | --- | --- |
-| [`PROPOSAL-17-high-signal-bash-failure-digest.md`](./.plans/PROPOSAL-17-high-signal-bash-failure-digest.md) | `[ ]` Pending | `T20` | `src/tools.rs` |
+| [`PROPOSAL-17-high-signal-bash-failure-digest.md`](./.plans/PROPOSAL-17-high-signal-bash-failure-digest.md) | `[x]` Complete (T20 done) | `T20` | `src/tools.rs` |
 | [`PROPOSAL-16-ticket-test-cap-and-batched-tdd.md`](./.plans/PROPOSAL-16-ticket-test-cap-and-batched-tdd.md) | `[ ]` Pending | `T21` | `src/prompts/tickets.rs`, `src/prompts/code.rs` |
 | [`PROPOSAL-15-ticket-criteria-validation.md`](./.plans/PROPOSAL-15-ticket-criteria-validation.md) | `[ ]` Pending | `T22` | `src/tickets.rs`, `src/tools.rs` |
 | [`PROPOSAL-18-spec-and-tickets-story-slicing.md`](./.plans/PROPOSAL-18-spec-and-tickets-story-slicing.md) | `[ ]` Pending | `T23` | `src/prompts/spec.rs`, `src/prompts/tickets.rs`, `tests/prompt_contract.rs` |
@@ -20,14 +20,14 @@ Tracks the implementation status of active proposals in [`.plans/`](./.plans/REA
 
 The pending tasks form a strictly ordered, serialized pipeline designed to stay well within the 100 tool-call ceiling per ticket:
 
-1. **`T20` (Diagnostics First):** Hardens `form_bash_digest` in `src/tools.rs` so any test or compiler failure in subsequent tasks receives an immediate, high-signal summary at the top of the digest instead of being buried under passing-test `[ERROR]` logs.
+1. **`T20` (Diagnostics First) — `[x]` Complete (T20 done):** Hardens `form_bash_digest` in `src/tools.rs` so any test or compiler failure in subsequent tasks receives an immediate, high-signal summary at the top of the digest instead of being buried under passing-test `[ERROR]` logs.
 2. **`T21` (Discipline Second):** Caps per-ticket test functions at 3–6 in `TICKETS_SYSTEM_PROMPT` and introduces batched TDD / early full-suite execution in `CODE_TDD_DISCIPLINE` so ticket execution avoids tool-call expansion.
 3. **`T22` (Data Model Third):** Enforces duplicate criterion rejection in `TicketSet::validate` and clarifies multi-ticket error messaging in `missing_criteria_error` before phase prompts teach models the rule.
 4. **`T23` (Story Slicing Prompts Fourth):** Guides upstream authoring in `SPEC_SYSTEM_PROMPT` (vertical slices, explicit tracker paths) and `TICKETS_SYSTEM_PROMPT` (authorized tracker folding, verbatim slice criteria distribution).
 5. **`T24` (Triage Brief Narrowing Fifth):** Guides downstream triage in `TRIAGE_SYSTEM_PROMPT` to narrow `Agent Brief` criteria for shared-story slices without blocking with `needs-info`.
 
 ```text
-[T20] PROPOSAL-17: High-signal test/compiler failure extraction in form_bash_digest (src/tools.rs)
+[T20] [x] Complete (T20 done) PROPOSAL-17: High-signal test/compiler failure extraction in form_bash_digest (src/tools.rs)
   │
   ▼
 [T21] PROPOSAL-16: Consolidate boundary test_expectations & batch TDD slice runs (src/prompts/{tickets,code}.rs)
@@ -46,7 +46,7 @@ The pending tasks form a strictly ordered, serialized pipeline designed to stay 
 
 ## 3. Ordered Task Backlog
 
-- [ ] **`T20` — High-Signal Test and Compiler Failure Extraction in `form_bash_digest`**
+- [x] **`T20` — High-Signal Test and Compiler Failure Extraction in `form_bash_digest`**
   - `depends_on`: `[]`
   - `unblocks`: `["T21"]`
   - `plans`: [`.plans/PROPOSAL-17-high-signal-bash-failure-digest.md`](./.plans/PROPOSAL-17-high-signal-bash-failure-digest.md)

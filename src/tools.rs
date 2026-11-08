@@ -1517,47 +1517,139 @@ fn step_warning_reserve(step: usize) -> usize {
     }
 }
 
-/// Extract the nonblank diagnostic blocks from the rendered output in original
-/// order, de-duplicated. The extraction is deliberately lexical: the model
-/// gets the lines that already name a failure, not a reinterpretation of them.
+/// The inclusive line count one diagnostic block may carry, counting its
+/// starter.
+const DIAGNOSTIC_BLOCK_MAX_LINES: usize = 25;
+/// The most bytes one extracted diagnostic line may carry, including the
+/// ellipsis that marks shortening.
+const DIAGNOSTIC_LINE_MAX_BYTES: usize = 512;
+
+/// Which priority group a diagnostic block belongs to. Primary test and
+/// compiler failures are rendered before secondary log lines so a noisy
+/// passing test can never crowd a real failure out of the digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticPriority {
+    Primary,
+    Secondary,
+}
+
+/// Extract the nonblank diagnostic blocks from the rendered output,
+/// de-duplicated, with every primary block before every secondary block. The
+/// extraction is deliberately lexical: the model gets the lines that already
+/// name a failure, not a reinterpretation of them.
 fn diagnostic_text(rendered: &str) -> String {
     let lines: Vec<&str> = rendered.lines().collect();
-    let mut blocks: Vec<String> = Vec::new();
+    let mut primary: Vec<String> = Vec::new();
+    let mut secondary: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut index = 0;
 
     while index < lines.len() {
-        if lines[index].trim().is_empty() || !is_diagnostic_line(lines[index]) {
+        let Some(priority) = diagnostic_priority(lines[index]) else {
             index += 1;
             continue;
+        };
+
+        let single_line = is_failed_test_record(lines[index]);
+        let start = index;
+        index += 1;
+        if !single_line {
+            let mut block_lines = 1;
+            while index < lines.len() && block_lines < DIAGNOSTIC_BLOCK_MAX_LINES {
+                if lines[index].trim().is_empty() || is_diagnostic_progress_line(lines[index]) {
+                    break;
+                }
+                index += 1;
+                block_lines += 1;
+            }
         }
 
-        let start = index;
-        while index < lines.len() && !lines[index].trim().is_empty() {
-            index += 1;
-        }
-        let block = lines[start..index].join("\n");
-        if seen.insert(block.clone()) {
-            blocks.push(block);
+        // Identity comes from the collected source lines, before any
+        // shortening, so distinct long messages never collapse into one
+        // merely because their visible prefixes match.
+        let source_block = lines[start..index].join("\n");
+        if seen.insert(source_block) {
+            let block = lines[start..index]
+                .iter()
+                .map(|line| shorten_diagnostic_line(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            match priority {
+                DiagnosticPriority::Primary => primary.push(block),
+                DiagnosticPriority::Secondary => secondary.push(block),
+            }
         }
     }
 
-    blocks.join("\n")
+    primary.extend(secondary);
+    primary.join("\n")
 }
 
-/// Whether a line starts a diagnostic block the model should see. Matching is
-/// case-insensitive, and Cargo's `---- <test> stdout ----` section marker is
-/// recognised alongside the ordinary failure words.
-fn is_diagnostic_line(line: &str) -> bool {
+/// Classify one line as a primary failure starter, a secondary diagnostic
+/// starter, or ordinary output. Primary classification always wins.
+fn diagnostic_priority(line: &str) -> Option<DiagnosticPriority> {
+    if is_primary_diagnostic_line(line) {
+        Some(DiagnosticPriority::Primary)
+    } else if is_secondary_diagnostic_line(line) {
+        Some(DiagnosticPriority::Secondary)
+    } else {
+        None
+    }
+}
+
+/// Whether a line is a Cargo test record ending in a failure verdict.
+fn is_failed_test_record(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("test ") && trimmed.ends_with(" ... FAILED")
+}
+
+/// Whether a line starts a high-signal test, panic or compiler failure block.
+fn is_primary_diagnostic_line(line: &str) -> bool {
     let trimmed = line.trim();
     let lowered = trimmed.to_ascii_lowercase();
-    lowered.contains("[error")
-        || lowered.contains("error:")
-        || lowered.contains("failed")
-        || lowered.contains("failures:")
+    is_failed_test_record(line)
+        || trimmed == "failures:"
+        || trimmed.starts_with("test result: FAILED")
+        || (trimmed.starts_with("---- ") && trimmed.ends_with(" stdout ----"))
         || lowered.contains("panicked at")
         || lowered.contains("panic:")
-        || (trimmed.starts_with("---- ") && trimmed.ends_with(" stdout ----"))
+        || lowered.starts_with("error[")
+        || lowered.starts_with("error:")
+        || lowered.starts_with("[error:")
+}
+
+/// Whether a line starts a secondary diagnostic block. A harness warning is
+/// never a diagnostic, even when its text contains `failed`.
+fn is_secondary_diagnostic_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.starts_with("[WARN") {
+        return false;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    lowered.contains("[error") || lowered.contains("error:") || lowered.contains("failed")
+}
+
+/// Whether a line is routine progress that ends the block before it. A
+/// passing test record and every harness progress marker must not be annexed
+/// by a preceding diagnostic.
+fn is_diagnostic_progress_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("#thinking ")
+        || trimmed.starts_with("[INFO] ")
+        || trimmed.starts_with("[WARN] ")
+        || trimmed.starts_with("=== ")
+        || (trimmed.starts_with("test ") && trimmed.ends_with(" ... ok"))
+}
+
+/// Bound one extracted line at the diagnostic maximum, marking a shortened
+/// line with an ellipsis that is itself inside the limit. The cut lands on a
+/// UTF-8 character boundary, so multi-byte text is never split.
+fn shorten_diagnostic_line(line: &str) -> String {
+    if line.len() <= DIAGNOSTIC_LINE_MAX_BYTES {
+        return line.to_string();
+    }
+    let prefix = truncate_utf8_prefix(line, DIAGNOSTIC_LINE_MAX_BYTES - 3);
+    format!("{prefix}...")
 }
 
 /// The longest prefix of `text` of at most `max_bytes`, cut on a UTF-8
@@ -2223,6 +2315,423 @@ mod tests {
         bytes.extend_from_slice(b"\n\nOutput:\n");
         bytes.extend_from_slice(output);
         bytes
+    }
+
+    /// A realistic digest footer, used to locate the diagnostic section from
+    /// known byte counts rather than by re-running the implementation under
+    /// test.
+    const DIGEST_FOOTER: &str = "[full output saved to .ejaj/run/tools-output/step-90-call-1.log; inspect it with tools.read through execute_script]";
+
+    /// Build rendered output whose diagnostics sit between two oversized filler
+    /// regions, so no marker under test can appear in the digest's head or tail.
+    fn rendered_with_diagnostics(diagnostics: &str) -> String {
+        format!(
+            "{}\n{}\n\n{}",
+            "H".repeat(BASH_DIGEST_HEAD_BYTES + 64),
+            diagnostics,
+            "T".repeat(BASH_DIGEST_TAIL_BYTES + 64)
+        )
+    }
+
+    /// The exact diagnostic section of a digest formed through the formatter
+    /// seam. The ASCII filler tail is exactly the tail budget, so the section
+    /// ends that many bytes plus one newline before the footer.
+    fn diagnostic_section<'a>(digest: &'a str, footer: &str) -> &'a str {
+        let marker = "[diagnostics]\n";
+        let start = digest
+            .find(marker)
+            .unwrap_or_else(|| panic!("no diagnostic section in {digest:?}"))
+            + marker.len();
+        let end = digest.len() - footer.len() - 1 - BASH_DIGEST_TAIL_BYTES - 1;
+        assert!(
+            start <= end,
+            "the diagnostic section boundaries are malformed in {digest:?}"
+        );
+        &digest[start..end]
+    }
+
+    /// Core entry-point behavior: Cargo failure records, panic and compiler
+    /// diagnostics are primary blocks, and their source order holds even when
+    /// secondary `[ERROR]` logs are interleaved around them.
+    #[test]
+    fn when_failure_records_given_interleaved_cargo_panic_compiler_and_error_logs_then_primary_blocks_precede_secondary_blocks()
+     {
+        let diagnostics = [
+            "[ERROR] secondary first",
+            "",
+            "test when_alpha_fails ... FAILED",
+            "",
+            "thread 'worker' panicked at src/lib.rs:42:5",
+            "",
+            "error[E0308]: mismatched types",
+            "",
+            "failures:",
+            "",
+            "---- when_beta_fails stdout ----",
+            "",
+            "test result: FAILED. 1 passed; 1 failed",
+            "",
+            "[ERROR] secondary second",
+        ]
+        .join("\n");
+        let rendered = rendered_with_diagnostics(&diagnostics);
+        let digest = form_bash_digest(
+            &rendered,
+            DIGEST_FOOTER,
+            4,
+            crate::script::OUTPUT_LIMIT_BYTES,
+        );
+        let section = diagnostic_section(&digest, DIGEST_FOOTER);
+        let expected = [
+            "test when_alpha_fails ... FAILED",
+            "thread 'worker' panicked at src/lib.rs:42:5",
+            "error[E0308]: mismatched types",
+            "failures:",
+            "---- when_beta_fails stdout ----",
+            "test result: FAILED. 1 passed; 1 failed",
+            "[ERROR] secondary first",
+            "[ERROR] secondary second",
+        ];
+        let mut previous = None;
+        for marker in expected {
+            let position = section
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing {marker:?} in {section:?}"));
+            if let Some(previous) = previous {
+                assert!(
+                    position > previous,
+                    "expected {marker:?} after the previous block: {section:?}"
+                );
+            }
+            previous = Some(position);
+        }
+    }
+
+    /// Edge-case table: empty, unmatched, passing-test and failure-worded
+    /// warning inputs carry no diagnostic starter and render no diagnostic
+    /// section at all.
+    #[test]
+    fn when_diagnostic_input_given_empty_unmatched_and_progress_only_logs_then_no_diagnostic_section_is_rendered()
+     {
+        let cases = [
+            ("empty", String::new()),
+            (
+                "unmatched",
+                rendered_with_diagnostics("ordinary output\n{\"broken\": true}\nstill fine"),
+            ),
+            (
+                "passing-tests",
+                rendered_with_diagnostics("test when_pass ... ok\ntest when_other_pass ... ok"),
+            ),
+            (
+                "warning-failure",
+                rendered_with_diagnostics("[WARN] attempt 1/3 failed: transient outage"),
+            ),
+        ];
+        for (label, rendered) in cases {
+            let digest = form_bash_digest(
+                &rendered,
+                DIGEST_FOOTER,
+                4,
+                crate::script::OUTPUT_LIMIT_BYTES,
+            );
+            assert!(
+                !digest.contains("[diagnostics]"),
+                "the {label} case must render no diagnostic section: {digest:?}"
+            );
+        }
+    }
+
+    /// Edge-case table: every routine progress line and a blank line stops a
+    /// multi-line block, and a later diagnostic starter is processed on its own.
+    #[test]
+    fn when_failure_blocks_given_blank_and_progress_boundaries_then_continuations_stop_before_boundary()
+     {
+        let boundaries = [
+            ("blank", ""),
+            ("thinking", "#thinking still working"),
+            ("info", "[INFO] still working"),
+            ("warn", "[WARN] transient failed attempt"),
+            ("section", "=== next section ==="),
+            ("passing", "test when_passing ... ok"),
+        ];
+        for (label, boundary) in boundaries {
+            let diagnostics =
+                format!("error: start-{label}\nKEPT-{label}\n{boundary}\nerror: later-{label}");
+            let rendered = rendered_with_diagnostics(&diagnostics);
+            let digest = form_bash_digest(
+                &rendered,
+                DIGEST_FOOTER,
+                4,
+                crate::script::OUTPUT_LIMIT_BYTES,
+            );
+            let section = diagnostic_section(&digest, DIGEST_FOOTER);
+            let start = format!("error: start-{label}");
+            let continued = format!("KEPT-{label}");
+            let later = format!("error: later-{label}");
+            assert!(
+                section.contains(&start),
+                "the {label} case must keep its starter: {section:?}"
+            );
+            assert!(
+                section.contains(&continued),
+                "the {label} case must keep the continuation before the boundary: {section:?}"
+            );
+            assert!(
+                section.contains(&later),
+                "the {label} case must process the later starter independently: {section:?}"
+            );
+            assert!(
+                section.find(&start) < section.find(&continued)
+                    && section.find(&continued) < section.find(&later),
+                "the {label} case must preserve source order: {section:?}"
+            );
+            if !boundary.is_empty() {
+                assert!(
+                    !section.contains(boundary),
+                    "the {label} boundary line must not enter a block: {section:?}"
+                );
+            }
+        }
+    }
+
+    /// Edge-case boundary: the 25-line maximum counts the starter, so the
+    /// twenty-sixth non-progress line is excluded.
+    #[test]
+    fn when_failure_blocks_given_twenty_five_and_twenty_six_lines_then_only_the_inclusive_limit_is_retained()
+     {
+        let mut diagnostics = vec!["error: twenty-five-line-start".to_string()];
+        for index in 2..=26 {
+            diagnostics.push(format!("BOUND-LINE-{index:02}"));
+        }
+        let rendered = rendered_with_diagnostics(&diagnostics.join("\n"));
+        let digest = form_bash_digest(
+            &rendered,
+            DIGEST_FOOTER,
+            4,
+            crate::script::OUTPUT_LIMIT_BYTES,
+        );
+        let section = diagnostic_section(&digest, DIGEST_FOOTER);
+        let lines: Vec<&str> = section.lines().collect();
+        assert_eq!(
+            lines.len(),
+            25,
+            "the block must retain exactly twenty-five lines: {section:?}"
+        );
+        assert_eq!(lines[0], "error: twenty-five-line-start");
+        assert_eq!(lines[24], "BOUND-LINE-25");
+        assert!(
+            !section.contains("BOUND-LINE-26"),
+            "the twenty-sixth line must be excluded: {section:?}"
+        );
+    }
+
+    /// Edge-case boundary: exactly 512 bytes are unchanged, oversized lines
+    /// end in an ellipsis inside 512 bytes, and multi-byte text is never split.
+    #[test]
+    fn when_diagnostic_lines_given_exact_and_oversized_utf8_boundaries_then_lines_are_bounded_without_splitting_characters()
+     {
+        let exact = format!("error:{}", "a".repeat(512 - "error:".len()));
+        assert_eq!(exact.len(), 512);
+        let oversized = format!("error:{}", "b".repeat(600));
+        let multibyte = format!("error:{}", "\u{e9}".repeat(300));
+        let diagnostics = [exact.clone(), oversized, multibyte].join("\n\n");
+        let rendered = rendered_with_diagnostics(&diagnostics);
+        let digest = form_bash_digest(
+            &rendered,
+            DIGEST_FOOTER,
+            4,
+            crate::script::OUTPUT_LIMIT_BYTES,
+        );
+        let section = diagnostic_section(&digest, DIGEST_FOOTER);
+        let lines: Vec<&str> = section.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected three diagnostic lines: {section:?}"
+        );
+        assert_eq!(
+            lines[0], exact,
+            "an exactly 512-byte line must be unchanged"
+        );
+        assert_eq!(
+            lines[1],
+            format!("error:{}...", "b".repeat(512 - 3 - "error:".len())),
+            "an oversized ASCII line must be shortened to the 512-byte maximum"
+        );
+        assert_eq!(
+            lines[1].len(),
+            512,
+            "the ellipsis must be inside the 512-byte maximum"
+        );
+        assert_eq!(
+            lines[2],
+            format!(
+                "error:{}...",
+                "\u{e9}".repeat((512 - 3 - "error:".len()) / 2)
+            ),
+            "multi-byte text must be cut only on a character boundary"
+        );
+        assert!(
+            lines[2].len() <= 512,
+            "the shortened multi-byte line must stay within the maximum: {}",
+            lines[2].len()
+        );
+        assert!(lines[2].ends_with("..."));
+        assert!(
+            !lines[2].contains('\u{fffd}'),
+            "multi-byte shortening must not introduce a replacement character"
+        );
+    }
+
+    /// Contract and invariant: duplicate collected blocks appear once at their
+    /// first priority and source position, `[ERROR]` stays eligible as a
+    /// secondary diagnostic, warnings and passing records stay out, and a
+    /// failed Cargo record never annexes the next line.
+    #[test]
+    fn when_failure_records_given_duplicates_and_passing_tests_then_blocks_are_deduplicated_and_failed_records_stay_single_line()
+     {
+        let diagnostics = [
+            "test when_dup ... FAILED",
+            "ABSORB-SHOULD-NOT-APPEAR",
+            "",
+            "[ERROR] repeated-log",
+            "[WARN] attempt 1/3 failed: transient",
+            "test when_pass ... ok",
+            "",
+            "[ERROR] repeated-log",
+            "",
+            "test when_dup ... FAILED",
+            "",
+            "[ERROR] unique-log",
+        ]
+        .join("\n");
+        let rendered = rendered_with_diagnostics(&diagnostics);
+        let digest = form_bash_digest(
+            &rendered,
+            DIGEST_FOOTER,
+            4,
+            crate::script::OUTPUT_LIMIT_BYTES,
+        );
+        let section = diagnostic_section(&digest, DIGEST_FOOTER);
+        let lines: Vec<&str> = section.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "test when_dup ... FAILED",
+                "[ERROR] repeated-log",
+                "[ERROR] unique-log",
+            ],
+            "duplicates must appear once, primary first, in source order: {section:?}"
+        );
+        assert!(
+            !section.contains("ABSORB-SHOULD-NOT-APPEAR"),
+            "a failed record must not absorb a continuation line: {section:?}"
+        );
+        assert!(
+            !section.contains("[WARN]") && !section.contains("when_pass"),
+            "warnings and passing records must not enter diagnostics: {section:?}"
+        );
+    }
+
+    /// Regression: two distinct oversized diagnostic source lines that shorten
+    /// to the same visible text must both survive, because identity belongs to
+    /// the collected source block rather than its shortened rendering. Both
+    /// primary occurrences keep their source order ahead of later primary and
+    /// secondary blocks.
+    #[test]
+    fn when_long_diagnostic_blocks_given_identical_shortened_prefixes_then_distinct_source_blocks_are_retained()
+     {
+        // Both long lines share their first 509 bytes and differ only in the
+        // tail that shortening removes.
+        let first = format!("error:{}FIRST-SOURCE-TAIL", "p".repeat(600));
+        let second = format!("error:{}SECOND-SOURCE-TAIL", "p".repeat(600));
+        assert_ne!(first, second, "the two source lines must be distinct");
+        let shortened = format!("error:{}...", "p".repeat(503));
+        let diagnostics = [
+            "[ERROR] secondary-after",
+            "",
+            first.as_str(),
+            "",
+            second.as_str(),
+            "",
+            "error: later-primary",
+        ]
+        .join("\n");
+        let rendered = rendered_with_diagnostics(&diagnostics);
+        let digest = form_bash_digest(
+            &rendered,
+            DIGEST_FOOTER,
+            4,
+            crate::script::OUTPUT_LIMIT_BYTES,
+        );
+        let section = diagnostic_section(&digest, DIGEST_FOOTER);
+        let lines: Vec<&str> = section.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                shortened.as_str(),
+                shortened.as_str(),
+                "error: later-primary",
+                "[ERROR] secondary-after",
+            ],
+            "both distinct source blocks must survive, primary first, in source order: {section:?}"
+        );
+    }
+
+    /// Regression: an oversized rendered output keeps all primary diagnostic
+    /// text ahead of secondary logs inside the unchanged diagnostic budget,
+    /// and still fits the delivery cap beside the step warning reserve.
+    #[test]
+    fn when_oversized_bash_output_given_primary_and_secondary_diagnostics_then_delivery_preserves_priority_and_warning_reserve()
+     {
+        let mut diagnostics = String::new();
+        diagnostics.push_str("---- when_regression_fails stdout ----\n");
+        diagnostics.push_str("thread 'main' panicked at src/lib.rs:7:9\n");
+        diagnostics.push_str("PRIMARY-REGRESSION-MARK\n\n");
+        for index in 0..200 {
+            diagnostics.push_str(&format!(
+                "[ERROR] secondary-{index:03}-{}\n\n",
+                "s".repeat(120)
+            ));
+        }
+        let rendered = rendered_with_diagnostics(&diagnostics);
+        let digest = form_bash_digest(
+            &rendered,
+            DIGEST_FOOTER,
+            90,
+            crate::script::OUTPUT_LIMIT_BYTES,
+        );
+        let section = diagnostic_section(&digest, DIGEST_FOOTER);
+        let primary = section
+            .find("PRIMARY-REGRESSION-MARK")
+            .unwrap_or_else(|| panic!("the primary failure text is missing: {section:?}"));
+        let secondary = section
+            .find("[ERROR] secondary-000")
+            .unwrap_or_else(|| panic!("the first secondary diagnostic is missing: {section:?}"));
+        assert!(
+            primary < secondary,
+            "primary diagnostic text must precede secondary diagnostics: {section:?}"
+        );
+        assert!(
+            section.contains("---- when_regression_fails stdout ----"),
+            "the primary section marker must survive: {section:?}"
+        );
+        assert!(
+            section.len() <= BASH_DIGEST_DIAGNOSTIC_BYTES,
+            "the diagnostic section must stay within the unchanged budget: {}",
+            section.len()
+        );
+        let warning = "[WARN: step 90/100; 10 steps remaining before the step limit]";
+        assert!(
+            digest.len() + warning.len() <= crate::script::OUTPUT_LIMIT_BYTES,
+            "the digest plus the step warning must fit the delivery cap: {}",
+            digest.len()
+        );
+        assert!(
+            std::str::from_utf8(digest.as_bytes()).is_ok(),
+            "the delivered digest must remain valid UTF-8"
+        );
     }
 
     /// Core entry-point behavior: a real Bash command over the delivery cap
