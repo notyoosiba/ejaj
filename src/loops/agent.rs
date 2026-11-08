@@ -63,7 +63,7 @@ const HANDOVER_SUMMARY_LABELS: [&str; 4] = [
 /// The instruction appended to the compacted history for the one tool-free
 /// handover-summary request. The request advertises no tools, so the model can
 /// answer with text only.
-const HANDOVER_SUMMARY_INSTRUCTION: &str = "[HANDOVER SUMMARY REQUEST] The transcript above has been compacted. Write one concise handover summary so the same agent can continue the work without re-reading it. Begin the reply with `[HANDOVER SUMMARY]` and use these labeled lines: `Completed/work context:`, `Decisions:`, `Unresolved work/blockers:`, `Relevant findings:`. Do not call tools; reply with text only.";
+const HANDOVER_SUMMARY_INSTRUCTION: &str = "[HANDOVER SUMMARY REQUEST] The transcript above has been compacted. Write one concise handover summary so the same agent can continue the work without re-reading it. If the transcript already contains an earlier `[HANDOVER SUMMARY]`, merge its still-relevant context into a single consolidated summary rather than copying it verbatim. Begin the reply with `[HANDOVER SUMMARY]` and use these labeled lines: `Completed/work context:`, `Decisions:`, `Unresolved work/blockers:`, `Relevant findings:`. Do not call tools; reply with text only.";
 
 /// How many consecutive truncation recoveries one invocation may request
 /// before a still-truncated tool-free reply is accepted as the turn's end.
@@ -141,6 +141,38 @@ pub enum Stop {
     /// The code agent called `task_complete`: the only end state that counts as
     /// a finished ticket.
     Complete,
+}
+
+/// Subdirectory under the active session directory where conversation
+/// trajectories (`<phase>.traj.json`) are persisted.
+const TRAJECTORY_DIRECTORY: &str = "trajectories";
+
+/// Serializable snapshot of one agent-loop invocation's final transcript and
+/// exit metadata.
+#[derive(serde::Serialize)]
+struct TrajectorySnapshot<'a> {
+    phase: &'static str,
+    role: &'static str,
+    model: &'a str,
+    steps_taken: usize,
+    exit_status: &'static str,
+    messages: &'a [Message],
+}
+
+impl Stop {
+    fn exit_status_label(&self) -> &'static str {
+        match self {
+            Stop::TurnEnd => "turn_end",
+            Stop::Summary(_) => "summary",
+            Stop::Failed(kind) => kind.label(),
+            Stop::Handoff(_) => "handoff",
+            Stop::Spec(_) => "spec",
+            Stop::Tickets(_) => "tickets",
+            Stop::Review(_) => "review",
+            Stop::Triage(_) => "triage",
+            Stop::Complete => "complete",
+        }
+    }
 }
 
 /// What went wrong, for the caller's one-line summary.
@@ -389,7 +421,7 @@ fn send_turn_with_retry(
     report: &TurnReport<'_>,
     status: &mut status::Status,
     mut contributions: Option<&mut crate::timing::QueueContributions>,
-) -> Result<Message, Stop> {
+) -> Result<Message, CallError> {
     let mut attempt = 1;
     loop {
         status.set(&status::thinking_label(
@@ -436,7 +468,7 @@ fn send_turn_with_retry(
                     std::thread::sleep(delay);
                     attempt += 1;
                 }
-                None => return Err(report_call_error(status, error)),
+                None => return Err(error),
             },
         }
     }
@@ -726,9 +758,33 @@ fn run_agent_loop_capturing(
     phase: Phase,
     source: Source<'_>,
     invocation: InvocationContext<'_>,
-    mut contributions: Option<&mut crate::timing::QueueContributions>,
+    contributions: Option<&mut crate::timing::QueueContributions>,
     last_narration: &mut Option<String>,
 ) -> Stop {
+    let (stop, steps_taken) = run_agent_loop_inner(
+        messages,
+        config,
+        phase,
+        source,
+        invocation,
+        contributions,
+        last_narration,
+    );
+    if let Err(error) = save_trajectory(invocation, config, phase, steps_taken, &stop, messages) {
+        let _ = status::shared().stderr_log(&format!("[WARN] could not persist trajectory: {error}"));
+    }
+    stop
+}
+
+fn run_agent_loop_inner(
+    messages: &mut Vec<Message>,
+    config: &Config,
+    phase: Phase,
+    source: Source<'_>,
+    invocation: InvocationContext<'_>,
+    mut contributions: Option<&mut crate::timing::QueueContributions>,
+    last_narration: &mut Option<String>,
+) -> (Stop, usize) {
     // Drawn before every blocking operation below and erased before every
     // write; Drop covers the error returns and the final break. The size shown
     // comes from the request about to be sent.
@@ -750,9 +806,9 @@ fn run_agent_loop_capturing(
         // ceiling before any send. The check recurs every turn, so a transcript
         // that grows past a watermark later is handled again rather than only
         // once.
-        let prepared = match prepare_for_send(messages, config, phase, provider.as_ref()) {
+        let mut prepared = match prepare_for_send(messages, config, phase, provider.as_ref()) {
             Ok(prepared) => prepared,
-            Err(detail) => return context_guard_stop(&detail),
+            Err(detail) => return (context_guard_stop(&detail), step_idx),
         };
         // The role, model, input rate and canonical phase label named on every
         // report and status line for this turn. Config resolves all of them
@@ -784,7 +840,34 @@ fn run_agent_loop_capturing(
             contributions.as_deref_mut(),
         ) {
             Ok(assistant) => assistant,
-            Err(stop) => return stop,
+            Err(error) if is_context_overflow_error(&error) => {
+                match force_compact_on_overflow(messages, config, phase, provider.as_ref(), &error)
+                {
+                    Ok(Some(compacted_prepared)) => {
+                        let _ = status::shared().stderr_log(&format!(
+                            "[WARN] turn failed with context overflow ({error}); compacted history and retrying once."
+                        ));
+                        prepared = compacted_prepared;
+                        match send_turn_with_retry(
+                            config,
+                            phase,
+                            provider.as_ref(),
+                            &prepared,
+                            &report,
+                            &mut status,
+                            contributions.as_deref_mut(),
+                        ) {
+                            Ok(assistant) => assistant,
+                            Err(retry_error) => {
+                                return (report_call_error(&mut status, retry_error), step);
+                            }
+                        }
+                    }
+                    Ok(None) => return (report_call_error(&mut status, error), step),
+                    Err(detail) => return (context_guard_stop(&detail), step),
+                }
+            }
+            Err(error) => return (report_call_error(&mut status, error), step),
         };
 
         // Whether this reply is the model speaking to the user or, in the
@@ -839,7 +922,7 @@ fn run_agent_loop_capturing(
             // The response is already received, but none of its calls may run:
             // no result is appended and no further request is sent.
             let _ = status::shared().stderr_log(REPEATED_TOOL_CALL_ABORT_WARNING);
-            return Stop::Failed(FailureKind::StepLimit);
+            return (Stop::Failed(FailureKind::StepLimit), step);
         }
         messages.push(assistant);
         // Where that message landed. Its tool results are appended after it, so
@@ -867,9 +950,9 @@ fn run_agent_loop_capturing(
             // written, and normalized and validated there.
             if phase == Phase::Summary {
                 let answer = messages[assistant_index].content.clone();
-                return Stop::Summary(answer);
+                return (Stop::Summary(answer), step);
             }
-            return Stop::TurnEnd;
+            return (Stop::TurnEnd, step);
         }
 
         // Any tool-call reply -- truncated or not -- shows the model resumed
@@ -894,19 +977,86 @@ fn run_agent_loop_capturing(
             annotate_last_tool_result(messages, assistant_index, &tool_turn_signature(&tool_calls));
         }
         if let CallOutcome::Stop(stop) = outcome {
-            return stop;
+            return (stop, step);
         }
 
         if waiting {
             // The reply asked the user something, so the turn belongs to the
             // user: return to the plan prompt and let the answer come back as
             // the next user message.
-            return Stop::TurnEnd;
+            return (Stop::TurnEnd, step);
         }
     }
 
     let _ = status::shared().stderr_log("[WARN] step limit reached; the task may be incomplete");
-    Stop::Failed(FailureKind::StepLimit)
+    (Stop::Failed(FailureKind::StepLimit), MAX_STEPS)
+}
+
+/// Persist the conversation trajectory to `<session-dir>/trajectories/<phase>.traj.json`
+/// when an `.ejaj/` session directory is supplied.
+fn save_trajectory(
+    invocation: InvocationContext<'_>,
+    config: &Config,
+    phase: Phase,
+    steps_taken: usize,
+    stop: &Stop,
+    messages: &[Message],
+) -> Result<(), String> {
+    if phase == Phase::Plan && !matches!(stop, Stop::Handoff(_)) {
+        return Ok(());
+    }
+    let Some(session_dir) = invocation.session_dir else {
+        return Ok(());
+    };
+    let base = match invocation.root {
+        Some(root) if !session_dir.is_absolute() => root.join(session_dir),
+        _ => session_dir.to_path_buf(),
+    };
+    if crate::tools::ejaj_ancestor(&base).is_none() {
+        return Ok(());
+    }
+    let directory = base.join(TRAJECTORY_DIRECTORY);
+    std::fs::create_dir_all(&directory)
+        .map_err(|e| format!("could not create the trajectories directory: {e}"))?;
+    crate::tools::ignore_run_artifacts(&directory)
+        .map_err(|e| format!("could not prepare the self-ignoring .ejaj directory: {e}"))?;
+
+    let snapshot = TrajectorySnapshot {
+        phase: phase.label(),
+        role: config.provider_role(phase),
+        model: config.provider_model(phase),
+        steps_taken,
+        exit_status: stop.exit_status_label(),
+        messages,
+    };
+    let encoded = serde_json::to_vec_pretty(&snapshot)
+        .map_err(|e| format!("could not serialize trajectory JSON: {e}"))?;
+
+    let phase_label = phase.label();
+    for suffix in 0..10_000usize {
+        let file_name = if suffix == 0 {
+            format!("{phase_label}.traj.json")
+        } else {
+            format!("{phase_label}-{suffix}.traj.json")
+        };
+        let path = directory.join(&file_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = std::io::Write::write_all(&mut file, &encoded) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("could not write trajectory file: {e}"));
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("could not create trajectory file: {e}")),
+        }
+    }
+    Err("could not create a unique trajectory file after 10000 attempts".to_string())
 }
 
 /// Erase the status line, print the failure exactly as it was before the
@@ -1533,12 +1683,7 @@ fn request_handover_summary(
         ));
     }
 
-    let raw = config
-        .send(&prepared.outgoing)
-        .map_err(|error| format!("the handover summary request failed: {error}"))?;
-    let message = provider
-        .decode(raw)
-        .map_err(|error| format!("the handover summary response could not be decoded: {error}"))?;
+    let message = send_summary_with_retry(config, provider, &prepared.outgoing)?;
 
     if message
         .tool_calls
@@ -1575,6 +1720,146 @@ fn request_handover_summary(
         extra: serde_json::Map::new(),
         truncated: false,
     })
+}
+
+/// Detect whether an API error from a provider is a context-window, payload-size,
+/// or post-Tier-1 reasoning-field rejection that full compaction can recover from.
+fn is_context_overflow_error(error: &CallError) -> bool {
+    let CallError::Api { status, message } = error else {
+        return false;
+    };
+    if *status == 413 {
+        return true;
+    }
+    if !matches!(*status, 400 | 422) {
+        return false;
+    }
+    let lowered = message.to_ascii_lowercase();
+    const OVERFLOW_MARKERS: [&str; 8] = [
+        "context_length_exceeded",
+        "model_context_window_exceeded",
+        "maximum context length",
+        "prompt is too long",
+        "context window",
+        "too many tokens",
+        "request_too_large",
+        "missing reasoning_content",
+    ];
+    OVERFLOW_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// Send the tool-free handover summary request with transient retry support.
+fn send_summary_with_retry(
+    config: &Config,
+    provider: &dyn crate::llm::LlmProvider,
+    outgoing: &crate::api::Outgoing,
+) -> Result<Message, String> {
+    let mut attempt = 1;
+    loop {
+        let result = match config.send(outgoing) {
+            Ok(raw) => {
+                let status = raw.status;
+                match provider.decode(raw) {
+                    Ok(message) => Ok(message),
+                    Err(CallError::Transport(detail)) if (200..300).contains(&status) => {
+                        return Err(format!(
+                            "the handover summary response could not be decoded: transport error: {detail}"
+                        ));
+                    }
+                    Err(error) => Err((true, error)),
+                }
+            }
+            Err(error) => Err((false, error)),
+        };
+        match result {
+            Ok(message) => return Ok(message),
+            Err((from_decode, error)) => match retry::should_retry(&error, attempt) {
+                Some(delay) => {
+                    let _ = status::shared().stderr_log(&format!(
+                        "[WARN] handover summary attempt {attempt}/{} failed: {error}; retrying.",
+                        retry::MAX_ATTEMPTS
+                    ));
+                    std::thread::sleep(delay);
+                    attempt += 1;
+                }
+                None => {
+                    if from_decode {
+                        return Err(format!(
+                            "the handover summary response could not be decoded: {error}"
+                        ));
+                    }
+                    return Err(format!("the handover summary request failed: {error}"));
+                }
+            },
+        }
+    }
+}
+
+/// Reactively compact `messages` once after a provider context-overflow or
+/// post-Tier-1 reasoning-field error. Returns `Ok(None)` when the transcript
+/// cannot be compacted any further, `Ok(Some(prepared))` when a smaller or
+/// summarized transcript was prepared, or `Err(detail)` when compaction or
+/// summary validation fails.
+fn force_compact_on_overflow(
+    messages: &mut Vec<Message>,
+    config: &Config,
+    phase: Phase,
+    provider: &dyn crate::llm::LlmProvider,
+    error: &CallError,
+) -> Result<Option<crate::llm::Prepared>, String> {
+    let before_bytes = provider.prepare(messages, phase).context_bytes;
+    let CompactedHistory {
+        messages: compacted,
+        prefix_end,
+        tail_start,
+    } = compact_history(messages)?;
+    let after_tier_one = provider.prepare(&compacted, phase);
+    if !fits_hard_body_guard(&after_tier_one.outgoing.body) {
+        return Err(format!(
+            "the encoded request body is still over the {CONTEXT_GUARD_BYTES}-byte hard guard after Tier 1 compaction"
+        ));
+    }
+
+    let needs_summary = match error {
+        CallError::Api { message, .. }
+            if message
+                .to_ascii_lowercase()
+                .contains("missing reasoning_content") =>
+        {
+            true
+        }
+        _ => {
+            after_tier_one.context_bytes > TIER_TWO_CONTEXT_BYTES
+                || after_tier_one.context_bytes >= before_bytes
+        }
+    };
+
+    if needs_summary {
+        if tail_start <= prefix_end {
+            return Ok(None);
+        }
+        let summary = request_handover_summary(&compacted, config, phase, provider)?;
+        let replaced = replacement_history(&compacted, prefix_end, tail_start, summary)?;
+        let prepared = provider.prepare(&replaced, phase);
+        if prepared.context_bytes > TIER_TWO_CONTEXT_BYTES {
+            return Err(format!(
+                "the handover summary left the prepared context at {} bytes, over the {TIER_TWO_CONTEXT_BYTES}-byte Tier 2 watermark",
+                prepared.context_bytes
+            ));
+        }
+        if !fits_hard_body_guard(&prepared.outgoing.body) {
+            return Err(format!(
+                "the encoded request body is still over the {CONTEXT_GUARD_BYTES}-byte hard guard after the handover summary"
+            ));
+        }
+        *messages = replaced;
+        return Ok(Some(prepared));
+    }
+
+    *messages = compacted;
+    Ok(Some(after_tier_one))
 }
 
 /// Replace only the compacted middle with the accepted summary. The pinned
@@ -8277,5 +8562,242 @@ mod tests {
                 "an API failure never enters repetition processing"
             );
         }
+    }
+
+    #[test]
+    fn when_summarizing_given_transient_503_on_first_summary_attempt_then_retries_and_succeeds() {
+        let script = Script::with_replies(vec![
+            Reply::Error(CallError::Api {
+                status: 503,
+                message: "service temporarily unavailable".to_string(),
+            }),
+            Reply::Body(reply(Some(HANDOVER_REPLY), &[])),
+            Reply::Body(reply(Some("done"), &[])),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = summary_history();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(
+            script.requests(),
+            3,
+            "one failed summary attempt, one retried summary attempt, then one ordinary request"
+        );
+    }
+
+    #[test]
+    fn when_summarizing_given_prior_handover_checkpoint_then_instruction_requires_single_consolidated_summary()
+     {
+        assert!(HANDOVER_SUMMARY_INSTRUCTION.contains(HANDOVER_SUMMARY_MARKER));
+        assert!(HANDOVER_SUMMARY_INSTRUCTION.contains("consolidated summary"));
+        for label in HANDOVER_SUMMARY_LABELS {
+            assert!(HANDOVER_SUMMARY_INSTRUCTION.contains(label));
+        }
+    }
+
+    #[test]
+    fn when_sending_turn_given_http_400_context_length_exceeded_below_watermark_then_compacts_and_retries()
+     {
+        let script = Script::with_replies(vec![
+            Reply::Error(CallError::Api {
+                status: 400,
+                message: "context_length_exceeded: maximum context length is 32768 tokens"
+                    .to_string(),
+            }),
+            Reply::Body(reply(Some("done"), &[])),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = tier_one_history(8, 16 * 1024);
+        assert!(
+            context_bytes(&settings, &messages, Phase::Code) <= TIER_ONE_CONTEXT_BYTES,
+            "the transcript starts below the 400 KiB Tier 1 watermark"
+        );
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(
+            script.requests(),
+            2,
+            "the overflowed turn is compacted and retried once"
+        );
+        let retried = recorded_messages(&script.sent()[1], "messages");
+        assert!(
+            retried.iter().any(|message| {
+                message.role == Role::Tool
+                    && message
+                        .content
+                        .as_deref()
+                        .is_some_and(is_tool_result_stub)
+            }),
+            "older tool results were stubbed before the retry"
+        );
+    }
+
+    #[test]
+    fn when_sending_turn_given_missing_reasoning_content_after_tier_one_then_summarizes_middle_and_retries()
+     {
+        let script = Script::with_replies(vec![
+            Reply::Error(CallError::Api {
+                status: 400,
+                message:
+                    "Missing reasoning_content field in the assistant message at message index 2"
+                        .to_string(),
+            }),
+            Reply::Body(reply(Some(HANDOVER_REPLY), &[])),
+            Reply::Body(reply(Some("done"), &[])),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = pad_to_context(
+            &settings,
+            tier_one_history(8, 150 * 1024),
+            TIER_ONE_CONTEXT_BYTES + 1,
+            Phase::Code,
+        );
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &settings, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(
+            script.requests(),
+            3,
+            "Tier 1 send rejected by DeepSeek, one summary request, then one ordinary retry"
+        );
+        let retried = recorded_messages(&script.sent()[2], "messages");
+        assert_eq!(retried[2].content.as_deref(), Some(HANDOVER_REPLY));
+        for message in &retried[3..] {
+            if message.role == Role::Assistant {
+                assert!(
+                    message.reasoning_content.is_some(),
+                    "every retained tool-call assistant message after the summary keeps reasoning_content"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn when_loop_finishes_given_ejaj_session_dir_then_writes_numbered_traj_json_under_trajectories()
+     {
+        let root = std::env::temp_dir().join(format!(
+            "ejaj-traj-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session_dir = root.join(".ejaj").join("20261108-190000");
+        let script = Script::new(vec![
+            reply(None, &[("task_complete", "{}".to_string())]),
+            reply(Some("stopped without task_complete"), &[]),
+        ]);
+        let settings = config(script);
+
+        let mut first_messages = vec![
+            Message::system("system prompt"),
+            Message::user("first ticket"),
+        ];
+        let first_stop = run_agent_loop_with_context(
+            &mut first_messages,
+            &settings,
+            Phase::Code,
+            Source::None,
+            InvocationContext::new(&root, &session_dir),
+        );
+        assert!(matches!(first_stop, Stop::Complete));
+
+        let mut second_messages = vec![
+            Message::system("system prompt"),
+            Message::user("second attempt"),
+        ];
+        let second_stop = run_agent_loop_with_context(
+            &mut second_messages,
+            &settings,
+            Phase::Code,
+            Source::None,
+            InvocationContext::new(&root, &session_dir),
+        );
+        assert!(matches!(second_stop, Stop::TurnEnd));
+
+        let traj_dir = session_dir.join("trajectories");
+        let first_path = traj_dir.join("code.traj.json");
+        let second_path = traj_dir.join("code-1.traj.json");
+        assert!(first_path.is_file(), "first trajectory file must exist");
+        assert!(second_path.is_file(), "second trajectory file must exist");
+        assert!(
+            root.join(".ejaj").join(".gitignore").is_file(),
+            ".ejaj/.gitignore must be prepared"
+        );
+
+        let first_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&first_path).unwrap()).unwrap();
+        assert_eq!(first_json["phase"], "code");
+        assert_eq!(first_json["role"], "mid");
+        assert_eq!(first_json["model"], "test-model");
+        assert_eq!(first_json["steps_taken"], 1);
+        assert_eq!(first_json["exit_status"], "complete");
+        assert!(first_json["messages"].is_array());
+
+        let second_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&second_path).unwrap()).unwrap();
+        assert_eq!(second_json["phase"], "code");
+        assert_eq!(second_json["steps_taken"], 1);
+        assert_eq!(second_json["exit_status"], "turn_end");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn when_loop_finishes_given_no_session_dir_or_plan_turn_end_then_writes_no_trajectory_file() {
+        let root = std::env::temp_dir().join(format!(
+            "ejaj-traj-skip-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ejaj_session = root.join(".ejaj").join("plan-turn-end");
+        let non_ejaj_session = root.join("artifacts");
+        let script = Script::new(vec![
+            reply(Some("What scope should we use?"), &[]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script);
+
+        let mut plan_messages = vec![Message::system("plan"), Message::user("ask")];
+        let plan_stop = run_agent_loop_with_context(
+            &mut plan_messages,
+            &settings,
+            Phase::Plan,
+            Source::None,
+            InvocationContext::new(&root, &ejaj_session),
+        );
+        assert!(matches!(plan_stop, Stop::TurnEnd));
+        assert!(
+            !ejaj_session.exists(),
+            "a plan turn end must not create the session directory"
+        );
+
+        let mut code_messages = vec![Message::system("code"), Message::user("work")];
+        let code_stop = run_agent_loop_with_context(
+            &mut code_messages,
+            &settings,
+            Phase::Code,
+            Source::None,
+            InvocationContext::new(&root, &non_ejaj_session),
+        );
+        assert!(matches!(code_stop, Stop::TurnEnd));
+        assert!(
+            !non_ejaj_session.join("trajectories").exists(),
+            "a session directory outside .ejaj/ must not get trajectories/"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

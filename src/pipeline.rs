@@ -29,7 +29,44 @@
 
 use crate::Config;
 use crate::git;
-use crate::loops::{InvocationContext, plan, review, spec, summary, tickets, triage};
+use crate::loops::{
+    FailureKind, InvocationContext, plan, review, spec, summary, tickets, triage,
+};
+
+/// Whether one non-handoff outcome is an unattended early stop the pipeline
+/// retries once in a fresh session.
+fn retries_after_unattended_stop(kind: Option<FailureKind>) -> bool {
+    matches!(
+        kind,
+        None | Some(FailureKind::Malformed | FailureKind::StepLimit | FailureKind::ContextGuard)
+    )
+}
+
+/// Run one pass attempt and, after an eligible unattended early stop, one
+/// fresh-session retry. Both attempts run inside the caller's single timed
+/// closure; `stopped` maps a non-handoff outcome to its failure kind, with
+/// `None` standing for `TurnEnd`.
+fn attempt_with_fresh_session_retry<O>(
+    pass: &str,
+    mut attempt: impl FnMut() -> O,
+    stopped: impl Fn(&O) -> Option<Option<FailureKind>>,
+) -> O {
+    let first = attempt();
+    let Some(kind) = stopped(&first) else {
+        return first;
+    };
+    if !retries_after_unattended_stop(kind) {
+        return first;
+    }
+    let reason = match kind {
+        Some(kind) => format!("ended early ({})", kind.label()),
+        None => "ended its turn".to_string(),
+    };
+    let _ = status::shared().stderr_log(&format!(
+        "[WARN] {pass} {reason}; the next attempt is a fresh-session retry."
+    ));
+    attempt()
+}
 use crate::orchestrator;
 use crate::plan_document::Plan;
 use crate::review::{ReviewReport, render_reviews};
@@ -294,7 +331,15 @@ impl Pipeline {
         // No user turn happens in between.
         let _ = status::shared().stdout_log("\n=== Spec agent ===\n");
         match status::timed("spec pass", || {
-            spec::to_spec_in(&self.config, &self.scope, plan, invocation)
+            attempt_with_fresh_session_retry(
+                "spec pass",
+                || spec::to_spec_in(&self.config, &self.scope, plan, invocation),
+                |outcome| match outcome {
+                    spec::Outcome::Handoff(_) => None,
+                    spec::Outcome::TurnEnd => Some(None),
+                    spec::Outcome::Failed(kind) => Some(Some(*kind)),
+                },
+            )
         }) {
             spec::Outcome::Handoff(specification) => {
                 // The specification artifact is the object's rendering, on the
@@ -347,7 +392,15 @@ impl Pipeline {
         // specification-to-code path any more.
         let _ = status::shared().stdout_log("\n=== Tickets agent ===\n");
         match status::timed("tickets pass", || {
-            tickets::to_tickets_in(&self.config, &self.scope, specification, invocation)
+            attempt_with_fresh_session_retry(
+                "tickets pass",
+                || tickets::to_tickets_in(&self.config, &self.scope, specification, invocation),
+                |outcome| match outcome {
+                    tickets::Outcome::Handoff(_) => None,
+                    tickets::Outcome::TurnEnd => Some(None),
+                    tickets::Outcome::Failed(kind) => Some(Some(*kind)),
+                },
+            )
         }) {
             tickets::Outcome::Handoff(set) => Ok(set),
             tickets::Outcome::TurnEnd => {
@@ -394,7 +447,15 @@ impl Pipeline {
         // pass is offered no `bash` and its scripts run read-only.
         let _ = status::shared().stdout_log("\n=== Triage agent ===\n");
         let report = match status::timed("triage pass", || {
-            triage::audit_in(&self.config, &self.scope, specification, set, invocation)
+            attempt_with_fresh_session_retry(
+                "triage pass",
+                || triage::audit_in(&self.config, &self.scope, specification, set, invocation),
+                |outcome| match outcome {
+                    triage::Outcome::Handoff(_) => None,
+                    triage::Outcome::TurnEnd => Some(None),
+                    triage::Outcome::Failed(kind) => Some(Some(*kind)),
+                },
+            )
         }) {
             triage::Outcome::Handoff(report) => report,
             // No report exists, so the draft set was not audited and the queue
@@ -697,18 +758,29 @@ impl Pipeline {
         // original queue's review is round one, and every review-generated fix
         // queue adds exactly one more.
         let round = progress.review_round;
-        let review_report = match status::timed(&format!("review round {round}"), || {
-            review::audit_in(
-                &self.config,
-                review::ReviewInputs {
-                    scope: &self.scope,
-                    specification,
-                    tickets: &progress.all_tickets,
-                    report: queue_report,
-                    prior_reviews: &progress.reviews,
-                    existing_ticket_ids: &existing_ids,
+        let label = format!("review round {round}");
+        let review_report = match status::timed(&label, || {
+            attempt_with_fresh_session_retry(
+                &label,
+                || {
+                    review::audit_in(
+                        &self.config,
+                        review::ReviewInputs {
+                            scope: &self.scope,
+                            specification,
+                            tickets: &progress.all_tickets,
+                            report: queue_report,
+                            prior_reviews: &progress.reviews,
+                            existing_ticket_ids: &existing_ids,
+                        },
+                        invocation,
+                    )
                 },
-                invocation,
+                |outcome| match outcome {
+                    review::Outcome::Handoff(_) => None,
+                    review::Outcome::TurnEnd => Some(None),
+                    review::Outcome::Failed(kind) => Some(Some(*kind)),
+                },
             )
         }) {
             review::Outcome::Handoff(report) => report,
@@ -2303,5 +2375,33 @@ mod tests {
             detail,
             "drained without completing every ticket (1-first: gate failed; 2-second: retry exhausted; gate output: ## 3-trap\n\n- Title: Trap\n- Status: failed\nsecond diagnostic)"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod unattended_retry_tests {
+    use super::retries_after_unattended_stop;
+    use crate::loops::FailureKind;
+
+    #[test]
+    fn when_classifying_stop_given_each_failure_kind_then_only_eligible_kinds_retry() {
+        assert!(retries_after_unattended_stop(None), "TurnEnd is eligible");
+        for kind in [
+            FailureKind::Malformed,
+            FailureKind::StepLimit,
+            FailureKind::ContextGuard,
+        ] {
+            assert!(
+                retries_after_unattended_stop(Some(kind)),
+                "{kind:?} is eligible"
+            );
+        }
+        for kind in [FailureKind::Api, FailureKind::Transport] {
+            assert!(
+                !retries_after_unattended_stop(Some(kind)),
+                "{kind:?} is not eligible"
+            );
+        }
     }
 }

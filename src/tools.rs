@@ -1423,7 +1423,7 @@ fn save_spill(
 /// repaired or overwritten; any other entry at that path makes creation fail.
 /// The spill directory must already exist, so the ignore file is created after
 /// it and before the exclusive spill log.
-fn ignore_run_artifacts(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn ignore_run_artifacts(dir: &Path) -> std::io::Result<()> {
     let Some(ejaj) = ejaj_ancestor(dir) else {
         return Ok(());
     };
@@ -1436,7 +1436,7 @@ fn ignore_run_artifacts(dir: &Path) -> std::io::Result<()> {
 
 /// The path through the exact `.ejaj` component of `dir`, resolved from the
 /// path components so relative and absolute destinations behave alike.
-fn ejaj_ancestor(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn ejaj_ancestor(dir: &Path) -> Option<PathBuf> {
     let mut ancestor = PathBuf::new();
     for component in dir.components() {
         ancestor.push(component.as_os_str());

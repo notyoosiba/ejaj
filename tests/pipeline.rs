@@ -2459,12 +2459,13 @@ fn when_triaging_tickets_given_wontfix_then_does_not_claim_completion() {
 
 #[test]
 fn when_triaging_tickets_given_missing_or_invalid_handoff_then_returns_retry_without_queue() {
-    for (case, script) in [
+    for (case, script, expected_requests) in [
         (
             "a turn that ends without finish_triage",
             common::TriageScript::TurnEnd,
+            5,
         ),
-        ("a refused triage request", common::TriageScript::ApiError),
+        ("a refused triage request", common::TriageScript::ApiError, 4),
     ] {
         let (step, dir, transport) = triage_run(script);
 
@@ -2476,8 +2477,8 @@ fn when_triaging_tickets_given_missing_or_invalid_handoff_then_returns_retry_wit
         assert_no_queue(&dir, &transport);
         assert_eq!(
             transport.urls_called.lock().unwrap().len(),
-            4,
-            "{case}: the three handoff steps and the one triage attempt"
+            expected_requests,
+            "{case}: three handoff steps plus the triage attempt(s)"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -11189,6 +11190,7 @@ fn when_resuming_plan_given_recoverable_downstream_return_then_sends_canonical_p
             )],
         ),
         HandoverReply::assistant(Some("The specification cannot continue."), None, &[]),
+        HandoverReply::assistant(Some("The specification cannot continue."), None, &[]),
         HandoverReply::silent(),
     ]);
     let HandoverRun {
@@ -11213,10 +11215,10 @@ fn when_resuming_plan_given_recoverable_downstream_return_then_sends_canonical_p
     let requests = transport.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "plan, specification, then the resumed plan"
+        4,
+        "plan, two specification attempts, then the resumed plan"
     );
-    let messages = sent_messages(&requests[2]);
+    let messages = sent_messages(&requests[3]);
     assert_eq!(
         messages.len(),
         3,
@@ -11319,6 +11321,7 @@ fn when_plan_resumes_given_empty_reasoning_or_narration_then_avoids_fabricated_h
             )],
         ),
         HandoverReply::assistant(Some("   "), Some(""), &[]),
+        HandoverReply::assistant(Some("   "), Some(""), &[]),
         HandoverReply::silent(),
     ]);
     let HandoverRun {
@@ -11333,7 +11336,7 @@ fn when_plan_resumes_given_empty_reasoning_or_narration_then_avoids_fabricated_h
     assert!(matches!(pipeline.ask("second", &artifacts), Step::Retry));
 
     let requests = transport.requests();
-    let messages = sent_messages(&requests[2]);
+    let messages = sent_messages(&requests[3]);
     let handover = messages[1]["content"]
         .as_str()
         .expect("the downstream handover carries text");
@@ -11604,6 +11607,7 @@ fn when_plan_handoff_given_minimal_valid_plan_then_uses_canonical_plan_rendering
             )],
         ),
         HandoverReply::assistant(Some("No specification follows."), None, &[]),
+        HandoverReply::assistant(Some("No specification follows."), None, &[]),
         HandoverReply::silent(),
     ]);
     let HandoverRun {
@@ -11624,7 +11628,7 @@ fn when_plan_handoff_given_minimal_valid_plan_then_uses_canonical_plan_rendering
     ));
 
     let requests = transport.requests();
-    let messages = sent_messages(&requests[2]);
+    let messages = sent_messages(&requests[3]);
     let handover = messages[1]["content"]
         .as_str()
         .expect("the handover carries the minimal plan");
@@ -12445,6 +12449,7 @@ fn when_recovering_given_missing_blocker_detail_then_records_an_explicit_outcome
         HandoverReply::tool("finish_triage", triage.to_string()),
         HandoverReply::silent(),
         HandoverReply::silent(),
+        HandoverReply::silent(),
     ]);
     let HandoverRun {
         mut pipeline,
@@ -12467,8 +12472,8 @@ fn when_recovering_given_missing_blocker_detail_then_records_an_explicit_outcome
     let requests = transport.requests();
     assert_eq!(
         requests.len(),
-        6,
-        "plan, spec, tickets, rejected triage, triage turn end and the resumed plan"
+        7,
+        "plan, spec, tickets, rejected triage, triage turn end, triage retry and the resumed plan"
     );
     let rejected = sent_messages(&requests[4])
         .iter()
@@ -12480,7 +12485,7 @@ fn when_recovering_given_missing_blocker_detail_then_records_an_explicit_outcome
         "the refusal names the missing blocker detail: {rejected}"
     );
 
-    let handover = sent_messages(&requests[5])[1]["content"]
+    let handover = sent_messages(&requests[6])[1]["content"]
         .as_str()
         .expect("the triage handover carries text");
     assert!(handover.starts_with(&plan_markdown));
@@ -12511,6 +12516,7 @@ fn when_resuming_plan_given_provider_denies_next_request_then_keeps_canonical_pl
     let plan_markdown = plan.to_markdown();
     let run = handover_run(vec![
         finish_plan_reply(&plan_markdown),
+        HandoverReply::silent(),
         HandoverReply::silent(),
         HandoverReply::Error(CallError::Api {
             status: 403,
@@ -12543,10 +12549,10 @@ fn when_resuming_plan_given_provider_denies_next_request_then_keeps_canonical_pl
     let requests = transport.requests();
     assert_eq!(
         requests.len(),
-        4,
+        5,
         "the refusal is attempted once, then the next user turn is sent"
     );
-    let refused = sent_messages(&requests[2]);
+    let refused = sent_messages(&requests[3]);
     assert_eq!(
         refused.len(),
         3,
@@ -12562,7 +12568,7 @@ fn when_resuming_plan_given_provider_denies_next_request_then_keeps_canonical_pl
         .expect("the assistant handover carries text");
     assert_eq!(
         handover,
-        sent_messages(&requests[3])[1]["content"],
+        sent_messages(&requests[4])[1]["content"],
         "the fatal API failure does not overwrite the canonical plan handover"
     );
     assert!(
@@ -14369,4 +14375,406 @@ fn when_transition_gate_fails_once_given_project_test_suite_then_queues_repair_t
     );
 
     let _ = fs::remove_dir_all(repository.path());
+}
+
+
+// -- Unattended handoff retry ----------------------------------------------
+
+/// Every request one run sent for the pass identified by `marker`.
+fn unattended_requests(
+    transport: &common::ScriptedTransport,
+    marker: &str,
+) -> Vec<serde_json::Value> {
+    transport
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| body.to_string().contains(marker))
+        .cloned()
+        .collect()
+}
+
+/// One scripted pipeline run over a disposable repository.
+fn unattended_run(
+    transport: common::ScriptedTransport,
+) -> (Step, PathBuf, Arc<common::ScriptedTransport>) {
+    let transport = Arc::new(transport);
+    let config = common::scripted_pipeline_with_transport(transport.clone());
+    let dir = scratch_dir();
+    let repository = common::TempRepo::at(dir.clone());
+    repository.commit_baseline();
+    let mut pipeline = Pipeline::new(&config, common::scope(), repository.path());
+    let step = pipeline.ask(&common::harmless_plan_request(), &dir);
+    repository.keep();
+    (step, dir, transport)
+}
+
+fn turn_end_then_handoff() -> common::HandoffScript {
+    common::HandoffScript::Turns(&[
+        common::HandoffReply::TurnEnd,
+        common::HandoffReply::Handoff,
+    ])
+}
+
+#[test]
+fn when_eligible_stop_given_each_unattended_pass_then_fresh_handoff_continues_normal_path() {
+    {
+        let (step, dir, transport) =
+            unattended_run(common::ScriptedTransport::new().with_spec(turn_end_then_handoff()));
+        assert!(matches!(step, Step::Complete), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::SPEC_MARKER).len(),
+            2,
+            "the spec pass retried once"
+        );
+        assert!(dir.join("spec.md").is_file());
+        assert!(dir.join("tickets/1-verify-command-output.md").is_file());
+        assert!(dir.join("ticket-triage.md").is_file());
+        assert!(dir.join("review.md").is_file());
+        assert!(dir.join("change-summary.md").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new().with_tickets_handoff(turn_end_then_handoff()),
+        );
+        assert!(matches!(step, Step::Complete), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::TICKETS_MARKER).len(),
+            2,
+            "the tickets pass retried once"
+        );
+        assert!(dir.join("tickets/1-verify-command-output.md").is_file());
+        assert!(dir.join("ticket-triage.md").is_file());
+        assert!(dir.join("change-summary.md").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new().with_triage(common::TriageScript::Turns(&[
+                common::HandoffReply::TurnEnd,
+                common::HandoffReply::Handoff,
+            ])),
+        );
+        assert!(matches!(step, Step::Complete), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::TRIAGE_MARKER).len(),
+            2,
+            "the triage pass retried once"
+        );
+        assert!(dir.join("ticket-triage.md").is_file());
+        assert!(dir.join("tickets/queue-status.json").is_file());
+        assert!(dir.join("change-summary.md").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new().with_review(common::ReviewScript::Turns(&[
+                common::HandoffReply::TurnEnd,
+                common::HandoffReply::Handoff,
+            ])),
+        );
+        assert!(matches!(step, Step::Complete), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::REVIEW_MARKER).len(),
+            2,
+            "the review round retried once"
+        );
+        assert!(dir.join("review.md").is_file());
+        assert!(dir.join("change-summary.md").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn when_eligible_stop_given_second_attempt_stops_then_preserves_failure_without_third_attempt() {
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new()
+                .with_spec(common::HandoffScript::Turns(&[common::HandoffReply::TurnEnd])),
+        );
+        assert!(matches!(step, Step::Retry), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::SPEC_MARKER).len(),
+            2
+        );
+        assert!(!dir.join("spec.md").exists());
+        assert!(!dir.join("tickets/1-verify-command-output.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new().with_tickets_handoff(
+                common::HandoffScript::Turns(&[common::HandoffReply::TurnEnd]),
+            ),
+        );
+        assert!(matches!(step, Step::Retry), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::TICKETS_MARKER).len(),
+            2
+        );
+        assert!(dir.join("spec.md").is_file());
+        assert!(!dir.join("tickets/1-verify-command-output.md").exists());
+        assert!(!dir.join("ticket-triage.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new()
+                .with_triage(common::TriageScript::Turns(&[common::HandoffReply::TurnEnd])),
+        );
+        assert!(matches!(step, Step::Retry), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::TRIAGE_MARKER).len(),
+            2
+        );
+        assert!(!dir.join("ticket-triage.md").exists());
+        assert!(!dir.join("tickets/queue-status.json").exists());
+        assert!(!dir.join("review.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new()
+                .with_review(common::ReviewScript::Turns(&[common::HandoffReply::TurnEnd])),
+        );
+        assert!(matches!(step, Step::Retry), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::REVIEW_MARKER).len(),
+            2
+        );
+        assert!(!dir.join("review.md").exists());
+        assert!(dir.join("change-summary.md").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn when_retrying_given_api_or_transport_failure_on_second_attempt_then_stops_without_third_attempt() {
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new().with_spec(common::HandoffScript::Turns(&[
+                common::HandoffReply::TurnEnd,
+                common::HandoffReply::ApiError,
+            ])),
+        );
+        assert!(matches!(step, Step::Retry), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::SPEC_MARKER).len(),
+            2
+        );
+        assert!(!dir.join("spec.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new().with_spec(common::HandoffScript::Turns(&[
+                common::HandoffReply::TurnEnd,
+                common::HandoffReply::TransportError,
+            ])),
+        );
+        assert!(matches!(step, Step::Retry), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::SPEC_MARKER).len(),
+            4,
+            "one ended turn plus the loop's three transport attempts"
+        );
+        assert!(!dir.join("spec.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn when_recovering_given_turn_end_then_retries_once_without_unusable_artifact() {
+    let (step, dir, transport) =
+        unattended_run(common::ScriptedTransport::new().with_spec(turn_end_then_handoff()));
+    assert!(matches!(step, Step::Complete), "{step:?}");
+    assert_eq!(
+        unattended_requests(&transport, common::SPEC_MARKER).len(),
+        2
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("spec.md")).expect("the spec artifact is readable"),
+        Specification::from_markdown(common::harmless_spec_markdown())
+            .expect("the harmless spec fixture is valid")
+            .to_markdown()
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_recovering_given_malformed_stop_then_valid_retry_handoff_follows_normal_path() {
+    let (step, dir, transport) = unattended_run(
+        common::ScriptedTransport::new().with_spec(common::HandoffScript::Turns(&[
+            common::HandoffReply::Malformed,
+            common::HandoffReply::Handoff,
+        ])),
+    );
+    assert!(matches!(step, Step::Complete), "{step:?}");
+    assert_eq!(
+        unattended_requests(&transport, common::SPEC_MARKER).len(),
+        2
+    );
+    assert!(dir.join("spec.md").is_file());
+    assert!(dir.join("tickets/1-verify-command-output.md").is_file());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_recovering_given_two_eligible_stops_then_stops_after_two_attempts() {
+    let (step, dir, transport) = unattended_run(
+        common::ScriptedTransport::new()
+            .with_triage(common::TriageScript::Turns(&[common::HandoffReply::TurnEnd])),
+    );
+    assert!(matches!(step, Step::Retry), "{step:?}");
+    assert_eq!(
+        unattended_requests(&transport, common::TRIAGE_MARKER).len(),
+        2
+    );
+    assert!(!dir.join("ticket-triage.md").exists());
+    assert_no_queue(&dir, &transport);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_recovering_given_exhausted_malformed_response_then_retries_only_after_agent_loop_stops() {
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new()
+                .with_triage(common::TriageScript::Turns(&[common::HandoffReply::Malformed])),
+        );
+        assert!(matches!(step, Step::Retry), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::TRIAGE_MARKER).len(),
+            2
+        );
+        assert!(!dir.join("ticket-triage.md").exists());
+        assert_no_queue(&dir, &transport);
+        let _ = fs::remove_dir_all(&dir);
+    }
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new()
+                .with_triage(common::TriageScript::RejectedOnceThenReady),
+        );
+        assert!(matches!(step, Step::Complete), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::TRIAGE_MARKER).len(),
+            2,
+            "the first rejected handoff is corrected in the same attempt"
+        );
+        assert!(dir.join("ticket-triage.md").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn when_handling_given_api_or_transport_stop_then_preserves_failure_without_outer_retry() {
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new()
+                .with_spec(common::HandoffScript::Turns(&[common::HandoffReply::ApiError])),
+        );
+        assert!(matches!(step, Step::Retry), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::SPEC_MARKER).len(),
+            1,
+            "an HTTP 400 refusal is not retried outside the loop"
+        );
+        assert!(!dir.join("spec.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new()
+                .with_spec(common::HandoffScript::Turns(&[common::HandoffReply::Forbidden])),
+        );
+        assert!(matches!(step, Step::Retry), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::SPEC_MARKER).len(),
+            1,
+            "an HTTP 403 refusal is not retried outside the loop"
+        );
+        assert!(!dir.join("spec.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+    {
+        let (step, dir, transport) = unattended_run(
+            common::ScriptedTransport::new().with_spec(common::HandoffScript::Turns(&[
+                common::HandoffReply::TransportError,
+            ])),
+        );
+        assert!(matches!(step, Step::Retry), "{step:?}");
+        assert_eq!(
+            unattended_requests(&transport, common::SPEC_MARKER).len(),
+            3,
+            "only the loop's three transport attempts run, with no outer retry"
+        );
+        assert!(!dir.join("spec.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+const RETRY_TRANSCRIPT_TEST: &str =
+    "when_recovering_given_eligible_stop_then_logs_reason_and_keeps_one_timing_interval";
+const RETRY_TRANSCRIPT_CHILD: &str = "EJAJ_RETRY_TRANSCRIPT_CHILD";
+const RETRY_TRANSCRIPT_REASON: &str = "EJAJ_RETRY_TRANSCRIPT_REASON";
+
+#[test]
+fn when_recovering_given_eligible_stop_then_logs_reason_and_keeps_one_timing_interval() {
+    if std::env::var_os(RETRY_TRANSCRIPT_CHILD).is_some() {
+        let malformed = std::env::var(RETRY_TRANSCRIPT_REASON).ok().as_deref() == Some("malformed");
+        let transport = if malformed {
+            common::ScriptedTransport::new().with_triage(common::TriageScript::Turns(&[
+                common::HandoffReply::Malformed,
+                common::HandoffReply::Handoff,
+            ]))
+        } else {
+            common::ScriptedTransport::new().with_triage(common::TriageScript::Turns(&[
+                common::HandoffReply::TurnEnd,
+                common::HandoffReply::Handoff,
+            ]))
+        };
+        let (step, dir, _) = unattended_run(transport);
+        assert!(matches!(step, Step::Complete), "{step:?}");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let turn_end = common::captured_transcript(
+        RETRY_TRANSCRIPT_TEST,
+        &[
+            (RETRY_TRANSCRIPT_CHILD, "1"),
+            (RETRY_TRANSCRIPT_REASON, "turn-end"),
+        ],
+    );
+    assert!(
+        turn_end.contains("[WARN] triage pass ended its turn"),
+        "{turn_end}"
+    );
+    assert!(turn_end.contains("fresh-session retry"), "{turn_end}");
+    assert_eq!(
+        turn_end.matches("triage pass elapsed:").count(),
+        1,
+        "both attempts share one timing interval: {turn_end}"
+    );
+
+    let malformed = common::captured_transcript(
+        RETRY_TRANSCRIPT_TEST,
+        &[
+            (RETRY_TRANSCRIPT_CHILD, "1"),
+            (RETRY_TRANSCRIPT_REASON, "malformed"),
+        ],
+    );
+    assert!(
+        malformed.contains("[WARN] triage pass ended early (malformed response)"),
+        "{malformed}"
+    );
+    assert!(malformed.contains("fresh-session retry"), "{malformed}");
+    assert_eq!(
+        malformed.matches("triage pass elapsed:").count(),
+        1,
+        "both attempts share one timing interval: {malformed}"
+    );
 }

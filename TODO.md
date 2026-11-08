@@ -23,10 +23,12 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`09-file-editing-and-patch-matching.md`](./.plans/09-file-editing-and-patch-matching.md) | `[x]` Complete (T12 done) | `T12` | `src/script.rs` |
 | [`12-http-retry-and-overload-resilience.md`](./.plans/12-http-retry-and-overload-resilience.md) | `[x]` Complete (T13 done) | `T13` | `src/retry.rs` |
 | [`07-in-loop-truncation-and-tool-recovery.md`](./.plans/07-in-loop-truncation-and-tool-recovery.md) | `[x] Complete (T14, T15 done)` | `T14`, `T15` | `src/api.rs`, `src/llm/`, `src/loops/agent.rs` |
-| [`PROPOSAL-2-review-pass-retry.md`](./.plans/PROPOSAL-2-review-pass-retry.md) | `[ ]` Pending | `T16` | `src/pipeline.rs` |
-| [`11-context-compaction-and-overflow-recovery.md`](./.plans/11-context-compaction-and-overflow-recovery.md) | `[ ]` Pending | `T17` | `src/loops/agent.rs` |
-| [`08-conversation-trajectory-persistence.md`](./.plans/08-conversation-trajectory-persistence.md) | `[ ]` Pending | `T18` | `src/loops/agent.rs`, `src/tools.rs` |
+| [`PROPOSAL-2-review-pass-retry.md`](./.plans/PROPOSAL-2-review-pass-retry.md) | `[x] Complete (T16 done)` | `T16` | `src/pipeline.rs` |
+| [`11-context-compaction-and-overflow-recovery.md`](./.plans/11-context-compaction-and-overflow-recovery.md) | `[x] Complete (T17 done)` | `T17` | `src/loops/agent.rs` |
+| [`08-conversation-trajectory-persistence.md`](./.plans/08-conversation-trajectory-persistence.md) | `[x] Complete (T18 done)` | `T18` | `src/loops/agent.rs`, `src/tools.rs` |
 | [`PROPOSAL-15-ticket-slicing-and-triage-alignment.md`](./.plans/PROPOSAL-15-ticket-slicing-and-triage-alignment.md) | `[ ]` Pending | `T20` | `src/prompts/{spec,tickets,triage}.rs`, `src/tickets.rs`, `src/tools.rs` |
+| [`PROPOSAL-16-ticket-test-cap-and-batched-tdd.md`](./.plans/PROPOSAL-16-ticket-test-cap-and-batched-tdd.md) | `[ ]` Pending | `T21` | `src/prompts/tickets.rs`, `src/prompts/code.rs` |
+| [`PROPOSAL-17-high-signal-bash-failure-digest.md`](./.plans/PROPOSAL-17-high-signal-bash-failure-digest.md) | `[ ]` Pending | `T22` | `src/tools.rs` |
 
 ### Completed Baseline Proposals (Already in `git` History)
 
@@ -81,13 +83,15 @@ Tracks the implementation status of all specifications and proposals in [`.plans
       │        [x] [T15] 07b: In-loop truncation recovery & tool repetition guard (agent.rs)   │  │
       │          ├──────────────────────────┐                                                  │  │
       │          ▼                          ▼                                                  │  │
-      │        [ ] [T16] PROPOSAL-2:      [ ] [T17] 11: Compaction retry, summary merge        │  │
+      │        [x] [T16] PROPOSAL-2:      [x] [T17] 11: Compaction retry, summary merge        │  │
       │          Outer retry for            & HTTP 400/413/422 overflow recovery (agent.rs) ◄──┼──┘
       │          unattended passes          │                                                  │
       │          (src/pipeline.rs)          ▼                                                  │
-      │                                   [ ] [T18] 08: Conversation trajectory persistence ◄──┘
+      │                                   [x] [T18] 08: Conversation trajectory persistence ◄──┘
       │                                     (.traj.json in src/loops/agent.rs, src/tools.rs)
-      └──► [ ] [T20] PROPOSAL-15: Multi-ticket story slicing, duplicate criteria check & Triage brief narrowing
+      ├──► [ ] [T20] PROPOSAL-15: Multi-ticket story slicing, duplicate criteria check & Triage brief narrowing
+      ├──► [ ] [T21] PROPOSAL-16: Consolidate boundary test_expectations & batch TDD slice runs (prompts/{tickets,code}.rs)
+      └──► [ ] [T22] PROPOSAL-17: High-signal test/compiler failure extraction in form_bash_digest (src/tools.rs)
 ```
 
 ---
@@ -289,7 +293,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 ### Wave 3: Outer Pass Retries, Compaction Recovery, Trajectory Persistence, & Ticket-Slicing Hardening
 
-- [ ] **`T16` — Outer Single-Pass Retry for Unattended Handoff Passes (`spec_pass`, `tickets_pass`, `triage_pass`, `review_round`)**
+- [x] **`T16` — Outer Single-Pass Retry for Unattended Handoff Passes (`spec_pass`, `tickets_pass`, `triage_pass`, `review_round`)**
   - `depends_on`: `["T10", "T15"]`
   - `unblocks`: `[]`
   - `plans`: [`.plans/PROPOSAL-2-review-pass-retry.md`](./.plans/PROPOSAL-2-review-pass-retry.md)
@@ -300,7 +304,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `TODO.md` only (do not edit `.plans/PROPOSAL-2-review-pass-retry.md`), mark `T16` complete (`[x]`) in the DAG and ordered backlog and update the `PROPOSAL-2-review-pass-retry.md` row in the `TODO.md` status matrix to `[x] Complete (T16 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib pipeline && cargo test --test pipeline && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T17` — Context Compaction Resilience, Prior-Summary Consolidation, & HTTP 400/413/422 Overflow Recovery**
+- [x] **`T17` — Context Compaction Resilience, Prior-Summary Consolidation, & HTTP 400/413/422 Overflow Recovery**
   - `depends_on`: `["T13", "T15"]`
   - `unblocks`: `["T18"]`
   - `plans`: [`.plans/11-context-compaction-and-overflow-recovery.md`](./.plans/11-context-compaction-and-overflow-recovery.md)
@@ -312,7 +316,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `TODO.md` only (do not edit `.plans/11-context-compaction-and-overflow-recovery.md`), mark `T17` complete (`[x]`) in the DAG and ordered backlog and update the `11-context-compaction-and-overflow-recovery.md` row in the `TODO.md` status matrix to `[x] Complete (T17 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib loops::agent && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T18` — Per-Loop Conversation Trajectory Persistence (`.traj.json`)**
+- [x] **`T18` — Per-Loop Conversation Trajectory Persistence (`.traj.json`)**
   - `depends_on`: `["T11", "T17"]`
   - `unblocks`: `[]`
   - `plans`: [`.plans/08-conversation-trajectory-persistence.md`](./.plans/08-conversation-trajectory-persistence.md)
@@ -335,3 +339,25 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `TRIAGE_SYSTEM_PROMPT` (`src/prompts/triage.rs`, preserving all `REQUIRED_NEEDLES` and existing test substrings), update Step 2 so that when a shared specification story spans multiple draft tickets and a ticket carries a sibling ticket's verbatim criterion from that shared story while its own `scope_of_changes`, `test_expectations`, and `verification_gate` define a self-contained slice, Triage narrows `acceptance_criteria` in the `Agent Brief` and records the audit note rather than blocking the ticket as `needs-info` or `ready-for-human`.
     - In `TODO.md` only (do not edit `.plans/PROPOSAL-15-ticket-slicing-and-triage-alignment.md`), mark `T20` complete (`[x]`) in the DAG and ordered backlog and update the `PROPOSAL-15-ticket-slicing-and-triage-alignment.md` row in the `TODO.md` status matrix to `[x] Complete (T20 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib prompts && cargo test --lib tickets && cargo test --lib tools && cargo test --test prompt_contract && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T21` — Consolidate Per-Ticket Boundary `test_expectations` & Batch TDD Slice Execution**
+  - `depends_on`: `["T04", "T06"]`
+  - `unblocks`: `[]`
+  - `plans`: [`.plans/PROPOSAL-16-ticket-test-cap-and-batched-tdd.md`](./.plans/PROPOSAL-16-ticket-test-cap-and-batched-tdd.md)
+  - `files`: `src/prompts/tickets.rs`, `src/prompts/code.rs`, `TODO.md`
+  - `tasks`:
+    - In `TICKETS_SYSTEM_PROMPT` (`src/prompts/tickets.rs`, preserving the 11 `- `<field>`: ` bullets in order, single-source `expand, migrate, contract`, and all existing test needles), instruct `- test_expectations:` to consolidate applicable 5-dimension boundary cases into table-driven `Edge-Case Tables` test functions rather than emitting separate duplicate per-dimension `Boundary Matrix` test functions for the same behavior, keeping each ticket to a compact set of distinct test functions (typically 3–6 `when_<action>_given_<context>_then_<outcome>` tests) and splitting into an additional ticket when more test functions are genuinely needed.
+    - In `CODE_TDD_DISCIPLINE` (`src/prompts/code.rs`, keeping `CODE_SYSTEM_PROMPT` byte-identical and preserving `DISCIPLINE_LITERAL_PREFIX` and all existing test needles), update Step 1 and Step 9 to batch multiple `## Test Expectations` entries that exercise the same public seam and test harness into a single slice edit, and to run the full target test suite early (before tracker edits) so regressions in existing tests are caught and updated in one pass.
+    - In `TODO.md` only (do not edit `.plans/PROPOSAL-16-ticket-test-cap-and-batched-tdd.md`), mark `T21` complete (`[x]`) in the DAG and ordered backlog and update the `PROPOSAL-16-ticket-test-cap-and-batched-tdd.md` row in the `TODO.md` status matrix to `[x] Complete (T21 done)` right before running `verification_gate`.
+  - `verification_gate`: `cargo test --lib prompts::tickets && cargo test --lib prompts::code && cargo test --lib prompts::review && cargo test --test prompt_contract && cargo test --test llm_wire && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
+
+- [ ] **`T22` — High-Signal Test and Compiler Failure Extraction in `form_bash_digest`**
+  - `depends_on`: `["T11"]`
+  - `unblocks`: `[]`
+  - `plans`: [`.plans/PROPOSAL-17-high-signal-bash-failure-digest.md`](./.plans/PROPOSAL-17-high-signal-bash-failure-digest.md)
+  - `files`: `src/tools.rs`, `TODO.md`
+  - `tasks`:
+    - In `src/tools.rs` (`diagnostic_text` / `is_diagnostic_line`), separate primary test/compiler failure blocks (`test ... ... FAILED`, `failures:`, `test result: FAILED`, `---- <test> stdout ----`, `panicked at`, `panic:`, `error[`, `error:`, `[error:`) from secondary `[ERROR]`/failure log lines while excluding `[WARN` lines, and order primary failure blocks ahead of secondary blocks so Cargo's failure summary is never crowded out by passing-test `[ERROR]` logs.
+    - Bound multi-line diagnostic blocks at `DIAGNOSTIC_BLOCK_MAX_LINES = 25` lines and stop block continuation at routine harness/test progress lines (`#thinking `, `[INFO] `, `[WARN] `, `=== `, `test ... ... ok`), treat `test ... ... FAILED` as a single-line record, and cap individual diagnostic lines at `DIAGNOSTIC_LINE_MAX_BYTES = 512` UTF-8 bytes so a multi-kilobyte single-line panic payload cannot exhaust `BASH_DIGEST_DIAGNOSTIC_BYTES` (`8 KiB`).
+    - In `TODO.md` only (do not edit `.plans/PROPOSAL-17-high-signal-bash-failure-digest.md`), mark `T22` complete (`[x]`) in the DAG and ordered backlog and update the `PROPOSAL-17-high-signal-bash-failure-digest.md` row in the `TODO.md` status matrix to `[x] Complete (T22 done)` right before running `verification_gate`.
+  - `verification_gate`: `cargo test --lib tools && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`

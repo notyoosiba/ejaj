@@ -589,7 +589,7 @@ pub const SUMMARY_MARKER: &str = "Write the change summary for the run that just
 /// A phrase only the review prompt carries. The scripted transport reads it
 /// out of the request body to answer each review round on the review phase's
 /// own terms.
-const REVIEW_MARKER: &str = "Audit the completed ticket queue against the technical specification and test design blueprint";
+pub const REVIEW_MARKER: &str = "Audit the completed ticket queue against the technical specification and test design blueprint";
 
 /// The verification gate the scripted ticket carries. The gate is the one thing
 /// the queue's outcome hangs on, so a test picks the queue outcome from here.
@@ -670,6 +670,134 @@ pub const CODE_MARKER: &str = "this session's entire task";
 /// The plan system prompt's stable marker.
 pub const PLAN_MARKER: &str = "Interview the user to align on core architectural";
 
+/// A phrase only the spec kickoff carries.
+pub const SPEC_MARKER: &str = "The user has confirmed the design";
+
+/// A phrase only the tickets kickoff carries.
+pub const TICKETS_MARKER: &str = "Turn it into the ordered ticket set";
+
+/// One scripted reply to an unattended spec, tickets, triage or review attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HandoffReply {
+    /// Hand over the pass's valid typed artifact.
+    Handoff,
+    /// End the turn without the control tool.
+    TurnEnd,
+    /// Return a 2xx body the wire format cannot decode.
+    Malformed,
+    /// Refuse the request with HTTP 400.
+    ApiError,
+    /// Forbid the request with HTTP 403.
+    Forbidden,
+    /// Fail in the transport before any response exists.
+    TransportError,
+}
+
+/// An ordered script of replies for one unattended pass. The last reply
+/// repeats, so an exhausted pass keeps being answered instead of running out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HandoffScript {
+    /// The normal valid handoff.
+    Handoff,
+    /// Replies served one per attempt, the last one repeating.
+    Turns(&'static [HandoffReply]),
+}
+
+impl HandoffScript {
+    fn reply(self, turn: usize) -> HandoffReply {
+        match self {
+            HandoffScript::Handoff => HandoffReply::Handoff,
+            HandoffScript::Turns(turns) => handoff_reply_at(turns, turn),
+        }
+    }
+}
+
+/// The last scripted reply repeats.
+fn handoff_reply_at(turns: &[HandoffReply], turn: usize) -> HandoffReply {
+    turns
+        .get(turn)
+        .copied()
+        .unwrap_or_else(|| *turns.last().expect("a scripted handoff has at least one reply"))
+}
+
+/// One tool-free assistant turn.
+fn turn_end_response(outgoing: &api::Outgoing, text: &str) -> RawResponse {
+    let body = if outgoing.url.contains("responses") {
+        serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": text }]
+            }]
+        })
+        .to_string()
+    } else {
+        assistant_body(Some(text), None).body
+    };
+    RawResponse { status: 200, body }
+}
+
+/// One assistant turn that calls a tool with `arguments`.
+fn function_call_response(
+    outgoing: &api::Outgoing,
+    name: &str,
+    arguments: String,
+    call_id: &str,
+) -> RawResponse {
+    let body = if outgoing.url.contains("responses") {
+        serde_json::json!({
+            "output": [{
+                "type": "function_call",
+                "name": name,
+                "call_id": call_id,
+                "arguments": arguments,
+            }]
+        })
+        .to_string()
+    } else {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments }
+                    }]
+                }
+            }]
+        })
+        .to_string()
+    };
+    RawResponse { status: 200, body }
+}
+
+/// One scripted non-handoff reply for a spec or tickets attempt.
+fn scripted_stop_response(
+    outgoing: &api::Outgoing,
+    reply: HandoffReply,
+) -> Result<RawResponse, CallError> {
+    match reply {
+        HandoffReply::Handoff => unreachable!("the handoff reply is built before this helper"),
+        HandoffReply::TurnEnd => Ok(turn_end_response(outgoing, "Notes without a handoff.")),
+        HandoffReply::Malformed => Ok(RawResponse {
+            status: 200,
+            body: "{}".to_string(),
+        }),
+        HandoffReply::ApiError => Err(CallError::Api {
+            status: 400,
+            message: "the endpoint refused the pass".to_string(),
+        }),
+        HandoffReply::Forbidden => Err(CallError::Api {
+            status: 403,
+            message: "the provider forbade the pass".to_string(),
+        }),
+        HandoffReply::TransportError => Err(CallError::Transport(
+            "scripted transport failure".to_string(),
+        )),
+    }
+}
+
 /// How the scripted transport answers the one triage pass between the ticket
 /// writes and the queue.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -702,6 +830,8 @@ pub enum TriageScript {
     /// hands over the valid report: the rejected call is a correction, not a
     /// failure.
     RejectedOnceThenReady,
+    /// Replies served one per triage turn, the last one repeating.
+    Turns(&'static [HandoffReply]),
     /// Every triage turn hands over a report the boundary rejects, so the pass
     /// can only end on its step limit.
     AlwaysRejected,
@@ -879,6 +1009,8 @@ pub enum ReviewScript {
     TurnEnd,
     /// Refuse the review request with an HTTP 400 API error.
     ApiError,
+    /// Replies served one per review attempt, the last one repeating.
+    Turns(&'static [HandoffReply]),
 }
 
 /// Which invalid `finish_review` payload the scripted review hands over. Every
@@ -1050,6 +1182,14 @@ pub struct ScriptedTransport {
     review: ReviewScript,
     /// How many review rounds have been requested so far.
     review_round: Mutex<usize>,
+    /// How the spec pass is answered, including a first-attempt stop and retry.
+    spec_script: HandoffScript,
+    /// How many spec attempts have been requested so far.
+    spec_turn: Mutex<usize>,
+    /// How the tickets pass is answered, including a first-attempt stop and retry.
+    tickets_script: HandoffScript,
+    /// How many tickets attempts have been requested so far.
+    tickets_turn: Mutex<usize>,
     /// The command the code agent's own `bash` step runs, when a test needs a
     /// real repository mutation rather than the fixed harmless `echo`.
     bash_command: Option<String>,
@@ -1086,6 +1226,10 @@ impl ScriptedTransport {
             summary_turn: Mutex::new(0),
             review: ReviewScript::Pass,
             review_round: Mutex::new(0),
+            spec_script: HandoffScript::Handoff,
+            spec_turn: Mutex::new(0),
+            tickets_script: HandoffScript::Handoff,
+            tickets_turn: Mutex::new(0),
             bash_command: None,
             code: CodeScript::Scripted,
             code_replies: None,
@@ -1111,6 +1255,18 @@ impl ScriptedTransport {
     /// Answer the review phase the way the given script says.
     pub fn with_review(mut self, review: ReviewScript) -> Self {
         self.review = review;
+        self
+    }
+
+    /// Answer the spec pass the way the given handoff script says.
+    pub fn with_spec(mut self, spec: HandoffScript) -> Self {
+        self.spec_script = spec;
+        self
+    }
+
+    /// Answer the tickets pass the way the given handoff script says.
+    pub fn with_tickets_handoff(mut self, tickets: HandoffScript) -> Self {
+        self.tickets_script = tickets;
         self
     }
 
@@ -1231,26 +1387,14 @@ impl ScriptedTransport {
         };
         let is_responses = outgoing.url.contains("responses");
 
-        if matches!(self.triage, TriageScript::ApiError) {
-            return Err(CallError::Api {
-                status: 400,
-                message: "the endpoint refused the triage request".to_string(),
-            });
-        }
-        if matches!(self.triage, TriageScript::TurnEnd) {
-            let body = if is_responses {
-                serde_json::json!({
-                    "output": [{
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{ "type": "output_text", "text": "Triage notes without a handoff." }]
-                    }]
-                })
-                .to_string()
-            } else {
-                assistant_body(Some("Triage notes without a handoff."), None).body
-            };
-            return Ok(RawResponse { status: 200, body });
+        let reply = match self.triage {
+            TriageScript::TurnEnd => HandoffReply::TurnEnd,
+            TriageScript::ApiError => HandoffReply::ApiError,
+            TriageScript::Turns(turns) => handoff_reply_at(turns, turn),
+            _ => HandoffReply::Handoff,
+        };
+        if reply != HandoffReply::Handoff {
+            return scripted_stop_response(outgoing, reply);
         }
 
         let reject = match self.triage {
@@ -1285,6 +1429,15 @@ impl ScriptedTransport {
             *r
         };
         let is_responses = outgoing.url.contains("responses");
+        let reply = match self.review {
+            ReviewScript::TurnEnd => HandoffReply::TurnEnd,
+            ReviewScript::ApiError => HandoffReply::ApiError,
+            ReviewScript::Turns(turns) => handoff_reply_at(turns, round - 1),
+            _ => HandoffReply::Handoff,
+        };
+        if reply != HandoffReply::Handoff {
+            return scripted_stop_response(outgoing, reply);
+        }
         let args_json = match self.review {
             ReviewScript::Pass => passing_review_json(),
             ReviewScript::FixOnceThenPass => {
@@ -1321,26 +1474,9 @@ impl ScriptedTransport {
                 }
             }
             ReviewScript::AlwaysInvalid(case) => invalid_review_json(case),
-            ReviewScript::TurnEnd => {
-                let body = if is_responses {
-                    serde_json::json!({
-                        "output": [{
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{ "type": "output_text", "text": "Review notes without tool call." }]
-                        }]
-                    })
-                    .to_string()
-                } else {
-                    assistant_body(Some("Review notes without tool call."), None).body
-                };
-                return Ok(RawResponse { status: 200, body });
-            }
-            ReviewScript::ApiError => {
-                return Err(CallError::Api {
-                    status: 400,
-                    message: "the endpoint refused the review request".to_string(),
-                });
+            ReviewScript::Turns(_) => passing_review_json(),
+            ReviewScript::TurnEnd | ReviewScript::ApiError => {
+                unreachable!("the non-handoff reply is served before the handoff payload")
             }
         };
 
@@ -1708,6 +1844,8 @@ impl Transport for ScriptedTransport {
         if self.repeating_handoffs && outgoing.body.to_string().contains(PLAN_MARKER) {
             *self.step.lock().unwrap() = 0;
             *self.plan_turn.lock().unwrap() = 0;
+            *self.spec_turn.lock().unwrap() = 0;
+            *self.tickets_turn.lock().unwrap() = 0;
         }
 
         // A plan script is one extra tool turn inside the plan conversation:
@@ -1741,6 +1879,49 @@ impl Transport for ScriptedTransport {
                 }
                 return Ok(assistant_body(None, Some(("execute_script", arguments))));
             }
+        }
+
+        // The spec and tickets passes are answered on their own terms, so a
+        // stopped first attempt and its fresh retry see the same pass script.
+        if outgoing.body.to_string().contains(SPEC_MARKER) {
+            let turn = {
+                let mut t = self.spec_turn.lock().unwrap();
+                let cur = *t;
+                *t += 1;
+                cur
+            };
+            let reply = self.spec_script.reply(turn);
+            if reply == HandoffReply::Handoff {
+                *self.step.lock().unwrap() = 2;
+                let arguments = serde_json::json!({ "spec": harmless_spec_markdown() }).to_string();
+                return Ok(function_call_response(
+                    outgoing,
+                    "finish_spec",
+                    arguments,
+                    &format!("call_spec_{turn}"),
+                ));
+            }
+            return scripted_stop_response(outgoing, reply);
+        }
+
+        if outgoing.body.to_string().contains(TICKETS_MARKER) {
+            let turn = {
+                let mut t = self.tickets_turn.lock().unwrap();
+                let cur = *t;
+                *t += 1;
+                cur
+            };
+            let reply = self.tickets_script.reply(turn);
+            if reply == HandoffReply::Handoff {
+                *self.step.lock().unwrap() = 3;
+                return Ok(function_call_response(
+                    outgoing,
+                    "finish_tickets",
+                    self.tickets_json(),
+                    &format!("call_tickets_{turn}"),
+                ));
+            }
+            return scripted_stop_response(outgoing, reply);
         }
 
         // The queue's own steps, in order.
