@@ -4126,6 +4126,20 @@ None.
         }
     }
 
+    /// One completed classification the contract accepts: the ticket is already
+    /// implemented and covered, so it carries an explanation and no brief.
+    fn triage_done_ticket(id: &str, title: &str, explanation: &str) -> TriageTicket {
+        TriageTicket {
+            ticket_id: id.to_string(),
+            ticket_title: title.to_string(),
+            category: TriageCategory::Bug,
+            state: TriageState::Done,
+            notes: vec!["The repository already implements and tests the ticket.".to_string()],
+            blocker_explanation: Some(explanation.to_string()),
+            agent_brief: None,
+        }
+    }
+
     /// The typed triage source: the specification the draft set was sliced from
     /// and the original draft tickets a report must classify exactly once.
     fn triage_source<'a>(specification: &'a Specification, tickets: &'a TicketSet) -> Source<'a> {
@@ -4328,6 +4342,88 @@ None.
         );
     }
 
+    /// Contract: the advertised handoff schema is derived from the typed models
+    /// and pins exactly the two category wire values and five state wire values,
+    /// including done, with no parallel hand-maintained enum.
+    #[test]
+    fn when_generating_triage_handoff_given_supported_models_then_exposes_closed_enum_values() {
+        let definition = Tool::definitions(Phase::Triage)
+            .into_iter()
+            .find(|definition| definition.function.name == "finish_triage")
+            .expect("the triage phase offers its handoff tool");
+        let schema = serde_json::to_value(&definition.function.parameters)
+            .expect("the handoff schema serializes");
+
+        let mut constants = Vec::new();
+        schema_constants(&schema, &mut constants);
+        constants.sort();
+        constants.dedup();
+        let values: Vec<&str> = constants.iter().map(String::as_str).collect();
+        assert_eq!(
+            values,
+            [
+                "bug",
+                "done",
+                "enhancement",
+                "needs-info",
+                "ready-for-agent",
+                "ready-for-human",
+                "wontfix",
+            ],
+            "the schema must pin exactly the supported category and state values: {schema}"
+        );
+
+        for retired in ["feature", "completed", "wont-fit", "ready_for_agent"] {
+            assert!(
+                !values.contains(&retired),
+                "the schema must not advertise the retired value {retired}: {schema}"
+            );
+        }
+    }
+
+    /// Core entry-point behavior: a completed classification is accepted at the
+    /// real handoff boundary against an in-memory triage source, and the typed
+    /// report keeps the done state, its explanation and no Agent Brief.
+    #[test]
+    fn when_handing_off_completed_work_given_valid_triage_source_then_accepts_done_report() {
+        let tickets = triage_draft_tickets();
+        let specification = covering_specification();
+        let source = triage_source(&specification, &tickets);
+        let explanation = "src/triage.rs already implements the state contract and the triage \
+                           tests cover it.";
+        let report = TriageReport {
+            tickets: vec![
+                triage_ready_ticket("1-first", "First slice", &[]),
+                triage_done_ticket("2-second", "Second slice", explanation),
+            ],
+        };
+
+        match Tool::parse(
+            "finish_triage",
+            &finish_triage_arguments(&report),
+            Phase::Triage,
+            source,
+        ) {
+            Ok(Tool::FinishTriage(parsed)) => {
+                assert_eq!(parsed, report);
+                assert_eq!(parsed.tickets[1].state, TriageState::Done);
+                assert!(
+                    parsed.tickets[1].agent_brief.is_none(),
+                    "a done handoff carries no Agent Brief"
+                );
+                assert_eq!(
+                    parsed.tickets[1].blocker_explanation.as_deref(),
+                    Some(explanation)
+                );
+            }
+            Err(error) => panic!("a valid done handoff must parse: {error}"),
+            Ok(other) => panic!(
+                "expected the triage handoff, got a different tool: {}",
+                other.target()
+            ),
+        }
+    }
+
     /// The pass is offered no bash at all, and a bash call is refused on the way
     /// in, so the read-only boundary is enforced on both sides.
     #[test]
@@ -4416,7 +4512,21 @@ None.
             .expect("the helper carries a brief")
             .blocked_by = vec!["1-first".to_string(), "2-second".to_string()];
 
-        let cases: [(&str, TriageTicket, &str); 10] = [
+        let done_explanation =
+            "src/triage.rs already implements the state contract and its tests cover it.";
+
+        let mut done_without_explanation =
+            triage_done_ticket("2-second", "Second slice", done_explanation);
+        done_without_explanation.blocker_explanation = None;
+
+        let mut done_with_blank_explanation =
+            triage_done_ticket("2-second", "Second slice", done_explanation);
+        done_with_blank_explanation.blocker_explanation = Some("  \n".to_string());
+
+        let mut done_with_brief = triage_done_ticket("2-second", "Second slice", done_explanation);
+        done_with_brief.agent_brief = second.agent_brief.clone();
+
+        let cases: [(&str, TriageTicket, &str); 13] = [
             (
                 "a ready classification that carries a blocker explanation",
                 ready_with_explanation,
@@ -4466,6 +4576,21 @@ None.
                 "a brief that widens the dependency list",
                 extra_dependency,
                 "dependencies",
+            ),
+            (
+                "a done classification without an explanation",
+                done_without_explanation,
+                "explanation",
+            ),
+            (
+                "a done classification with a blank explanation",
+                done_with_blank_explanation,
+                "explanation",
+            ),
+            (
+                "a done classification that carries a brief",
+                done_with_brief,
+                "Agent Brief",
             ),
         ];
 
@@ -5529,9 +5654,8 @@ None.
     fn when_shell_command_given_large_output_on_both_streams_then_captures_without_blocking() {
         let root = scratch_dir("shell-large-streams");
         let bytes = 256 * 1024;
-        let command = format!(
-            "printf '%{bytes}s' '' | tr ' ' 'o'; printf '%{bytes}s' '' | tr ' ' 'e' >&2"
-        );
+        let command =
+            format!("printf '%{bytes}s' '' | tr ' ' 'o'; printf '%{bytes}s' '' | tr ' ' 'e' >&2");
 
         let output = shell_output_with_timeout(&root, &command, SHELL_TIMEOUT)
             .expect("a command that fills both pipes must complete instead of deadlocking");

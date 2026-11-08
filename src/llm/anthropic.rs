@@ -1359,11 +1359,18 @@ mod tests {
         assert_eq!(should_retry(&empty, 2), Some(Duration::from_secs(2)));
         assert_eq!(should_retry(&empty, 3), None);
 
-        for body in [r#"{"content":"text"}"#, r#"{"content":null}"#, r#"{"content":1}"#] {
+        for body in [
+            r#"{"content":"text"}"#,
+            r#"{"content":null}"#,
+            r#"{"content":1}"#,
+        ] {
             let error = decode_error(&provider(), raw(200, body));
             match &error {
                 CallError::Malformed(detail) => {
-                    assert_eq!(detail, "the response content was not an array", "body {body}")
+                    assert_eq!(
+                        detail, "the response content was not an array",
+                        "body {body}"
+                    )
                 }
                 other => panic!("body {body}: expected a malformed error, got {}", other),
             }

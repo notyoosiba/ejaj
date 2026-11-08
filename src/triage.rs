@@ -2,11 +2,14 @@
 //!
 //! Triaging runs after the tickets handoff and before the ticket queue: for
 //! each draft ticket the tickets agent emitted, the triage pass records a
-//! category (bug or enhancement), one of four states (ready-for-agent,
-//! ready-for-human, needs-info or wontfix), at least one audit note and --
-//! when the ticket is ready for the code agent -- an [AgentBrief] restating the
-//! target behavior, its machine-verifiable acceptance criteria, the boundaries
-//! the agent must not cross, and the dependencies the draft ticket declared.
+//! category (bug or enhancement), one of five states (ready-for-agent, done,
+//! ready-for-human, needs-info or wontfix), and at least one audit note. A
+//! ready-for-agent classification additionally carries an [AgentBrief]
+//! restating the target behavior, its machine-verifiable acceptance criteria,
+//! the boundaries the agent must not cross, and the dependencies the draft
+//! ticket declared. Every other state carries a blocker explanation instead: a
+//! done classification names the existing implementation and tests that already
+//! satisfy the ticket.
 //!
 //! Markdown is only a rendering of the type: [TriageReport::to_markdown]
 //! produces the ticket-triage.md artifact from the typed report, in
@@ -74,16 +77,23 @@ impl TriageCategory {
 
 /// What the triage pass decided about a draft ticket.
 ///
-/// The set is closed and its four wire values are distinct. ready-for-agent is
-/// the only state that lets the queue run the ticket; the other three each carry
-/// their own reading -- a human decision, a missing answer, or work this run
-/// will not do -- and each one blocks the whole set.
+/// The set is closed and its five wire values are distinct. ready-for-agent and
+/// done authorize the queue: ready-for-agent runs the ticket, and done records
+/// that the repository already implements and covers it, so dependent work may
+/// proceed. ready-for-human, needs-info and wontfix each carry their own
+/// reading -- a human decision, a missing answer, or work this run will not do --
+/// and each one blocks the whole set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum TriageState {
     /// The ticket is self-contained: the code agent can implement it now, so
     /// the classification carries an [AgentBrief] and no blocker explanation.
     ReadyForAgent,
+    /// The ticket's target behavior is already implemented and covered in the
+    /// repository, so no code agent needs to run it and dependent work may
+    /// proceed. The classification carries a blocker explanation naming the
+    /// existing implementation and tests, and no brief.
+    Done,
     /// The ticket needs a human decision or human work before an agent can run
     /// it, so the classification carries a blocker explanation and no brief.
     ReadyForHuman,
@@ -91,16 +101,16 @@ pub enum TriageState {
     /// agent can run it, so the classification carries a blocker explanation and
     /// no brief.
     NeedsInfo,
-    /// The ticket is redundant, already implemented or out of scope, so this run
-    /// will not execute it: the classification carries a blocker explanation and
-    /// no brief.
+    /// The ticket is redundant or out of scope, so this run will not execute
+    /// it: the classification carries a blocker explanation and no brief.
     Wontfix,
 }
 
 impl TriageState {
     /// Every state, in the order they are documented.
-    pub const ALL: [TriageState; 4] = [
+    pub const ALL: [TriageState; 5] = [
         TriageState::ReadyForAgent,
+        TriageState::Done,
         TriageState::ReadyForHuman,
         TriageState::NeedsInfo,
         TriageState::Wontfix,
@@ -110,6 +120,7 @@ impl TriageState {
     pub fn wire(self) -> &'static str {
         match self {
             TriageState::ReadyForAgent => "ready-for-agent",
+            TriageState::Done => "done",
             TriageState::ReadyForHuman => "ready-for-human",
             TriageState::NeedsInfo => "needs-info",
             TriageState::Wontfix => "wontfix",
@@ -120,6 +131,14 @@ impl TriageState {
     /// explanation.
     pub fn is_ready(self) -> bool {
         matches!(self, TriageState::ReadyForAgent)
+    }
+
+    /// Whether this state authorizes the queue to make progress: a ready ticket
+    /// runs, and a done ticket is already implemented and covered, so neither
+    /// blocks the draft set. The other three states each block every dependent
+    /// ticket until a human or a corrected ticket resolves them.
+    pub fn authorizes_queue(self) -> bool {
+        matches!(self, TriageState::ReadyForAgent | TriageState::Done)
     }
 }
 
@@ -468,7 +487,8 @@ fn check_classification(
         return Err(format!(
             "[ERROR] the triage classification for {draft_id} is {} without a blocker \
              explanation; every non-ready classification must explain what blocks the code agent \
-             -- ready-for-human and needs-info say what must be answered, and wontfix says why \
+             -- done names the existing implementation and tests that satisfy the ticket, \
+             ready-for-human and needs-info say what must be answered, and wontfix says why \
              the run will not execute the ticket",
             classification.state.wire()
         ));
@@ -914,6 +934,281 @@ mod tests {
                 "{case}: must name the field: {error}"
             );
         }
+    }
+
+    // -- Completed work -----------------------------------------------------
+
+    #[test]
+    fn when_classifying_completed_work_given_covered_behavior_then_accepts_done_without_agent_brief()
+     {
+        let tickets = two_ticket_draft();
+        let explanation =
+            "src/triage.rs already implements the state contract and the triage tests cover it.";
+        let report = report_of(vec![
+            ready_classification("1-first", "First slice", &[]),
+            blocked_classification("2-second", "Second slice", TriageState::Done, explanation),
+        ]);
+
+        assert_eq!(report.validate_against(&specification(), &tickets), Ok(()));
+
+        let done = &report.tickets[1];
+        assert_eq!(done.state, TriageState::Done);
+        assert!(
+            done.agent_brief.is_none(),
+            "a done classification carries no Agent Brief"
+        );
+        assert_eq!(done.blocker_explanation.as_deref(), Some(explanation));
+
+        let markdown = report.to_markdown(&tickets);
+        let done_block = markdown
+            .split("## 2-second: Second slice")
+            .nth(1)
+            .expect("the completed ticket has its own block");
+        assert!(
+            done_block.contains("- **State:** done"),
+            "the artifact records the done state: {done_block}"
+        );
+        assert!(
+            done_block.contains(&format!("- **Blocker explanation:** {explanation}")),
+            "the artifact names the existing implementation and tests: {done_block}"
+        );
+        assert!(
+            !done_block.contains(BRIEF_HEADING),
+            "a done classification renders no Agent Brief: {done_block}"
+        );
+    }
+
+    #[test]
+    fn when_classifying_completed_work_given_one_audit_note_and_valid_done_explanation_then_accepts_report()
+     {
+        let tickets = one_ticket_draft();
+        let report = report_of(vec![TriageTicket {
+            ticket_id: "1-only".to_string(),
+            ticket_title: "Only slice".to_string(),
+            category: TriageCategory::Bug,
+            state: TriageState::Done,
+            notes: vec!["src/triage.rs already implements the contract.".to_string()],
+            blocker_explanation: Some(
+                "The existing implementation in src/triage.rs and its triage-module tests satisfy                  the ticket."
+                    .to_string(),
+            ),
+            agent_brief: None,
+        }]);
+
+        assert_eq!(report.validate_against(&specification(), &tickets), Ok(()));
+    }
+
+    #[test]
+    fn when_classifying_completed_work_given_empty_notes_or_missing_explanation_then_rejects_report()
+     {
+        let tickets = one_ticket_draft();
+        let specification = specification();
+        let valid = blocked_classification(
+            "1-only",
+            "Only slice",
+            TriageState::Done,
+            "The existing implementation in src/triage.rs and its tests satisfy the ticket.",
+        );
+        assert_eq!(
+            report_of(vec![valid.clone()]).validate_against(&specification, &tickets),
+            Ok(()),
+            "the minimum done payload needs a note and an explanation"
+        );
+
+        let mut no_notes = valid.clone();
+        no_notes.notes.clear();
+
+        let mut blank_notes = valid.clone();
+        blank_notes.notes = vec![
+            "  ".to_string(),
+            "	
+"
+            .to_string(),
+        ];
+
+        let mut missing_explanation = valid;
+        missing_explanation.blocker_explanation = None;
+
+        let cases: [(&str, TriageTicket, &str); 3] = [
+            ("no audit note at all", no_notes, "note"),
+            ("audit notes that are blank", blank_notes, "note"),
+            (
+                "a done classification without an explanation",
+                missing_explanation,
+                "explanation",
+            ),
+        ];
+
+        for (case, classification, expected) in cases {
+            let error = report_of(vec![classification])
+                .validate_against(&specification, &tickets)
+                .expect_err(case);
+            assert!(
+                error.contains("1-only"),
+                "{case}: must name the ticket: {error}"
+            );
+            assert!(
+                error.contains(expected),
+                "{case}: must name the failing field: {error}"
+            );
+        }
+
+        let error = report_of(Vec::new())
+            .validate_against(&specification, &tickets)
+            .expect_err("a nonempty draft set still needs a classification");
+        assert!(error.contains("no triage classification"), "{error}");
+    }
+
+    #[test]
+    fn when_classifying_completed_work_given_blank_explanation_or_agent_brief_then_rejects_report()
+    {
+        let tickets = one_ticket_draft();
+        let specification = specification();
+        let valid = blocked_classification(
+            "1-only",
+            "Only slice",
+            TriageState::Done,
+            "The existing implementation in src/triage.rs and its tests satisfy the ticket.",
+        );
+        let brief = ready_classification("1-only", "Only slice", &[])
+            .agent_brief
+            .clone();
+
+        let mut blank_explanation = valid.clone();
+        blank_explanation.blocker_explanation = Some(
+            " 
+	 "
+            .to_string(),
+        );
+
+        let mut with_brief = valid.clone();
+        with_brief.agent_brief = brief.clone();
+
+        let mut brief_without_explanation = valid;
+        brief_without_explanation.blocker_explanation = None;
+        brief_without_explanation.agent_brief = brief;
+
+        let cases: [(&str, TriageTicket, &str); 3] = [
+            (
+                "a done classification with a blank explanation",
+                blank_explanation,
+                "explanation",
+            ),
+            (
+                "a done classification that carries an Agent Brief",
+                with_brief,
+                "Agent Brief",
+            ),
+            (
+                "a done classification with a brief and no explanation",
+                brief_without_explanation,
+                "Agent Brief",
+            ),
+        ];
+
+        for (case, classification, expected) in cases {
+            let error = report_of(vec![classification])
+                .validate_against(&specification, &tickets)
+                .expect_err(case);
+            assert!(
+                error.contains("1-only"),
+                "{case}: must name the ticket: {error}"
+            );
+            assert!(
+                error.contains(expected),
+                "{case}: must name the failing field: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn when_classifying_work_given_each_state_payload_rule_then_preserves_report_invariants() {
+        let tickets = one_ticket_draft();
+        let specification = specification();
+        let ready = ready_classification("1-only", "Only slice", &[]);
+        let brief = ready.agent_brief.clone();
+
+        assert_eq!(
+            report_of(vec![ready.clone()]).validate_against(&specification, &tickets),
+            Ok(()),
+            "ready-for-agent carries a brief and no explanation"
+        );
+
+        let mut ready_with_explanation = ready.clone();
+        ready_with_explanation.blocker_explanation = Some("The ticket is blocked.".to_string());
+
+        let mut ready_with_blank_explanation = ready.clone();
+        ready_with_blank_explanation.blocker_explanation = Some(
+            "  
+"
+            .to_string(),
+        );
+
+        let mut ready_without_brief = ready;
+        ready_without_brief.agent_brief = None;
+
+        for (case, classification, expected) in [
+            (
+                "a ready classification with an explanation",
+                ready_with_explanation,
+                "blocker explanation",
+            ),
+            (
+                "a ready classification with a blank explanation",
+                ready_with_blank_explanation,
+                "blocker explanation",
+            ),
+            (
+                "a ready classification without a brief",
+                ready_without_brief,
+                "Agent Brief",
+            ),
+        ] {
+            let error = report_of(vec![classification])
+                .validate_against(&specification, &tickets)
+                .expect_err(case);
+            assert!(error.contains("1-only"), "{case}: {error}");
+            assert!(error.contains(expected), "{case}: {error}");
+        }
+
+        for state in [
+            TriageState::Done,
+            TriageState::ReadyForHuman,
+            TriageState::NeedsInfo,
+            TriageState::Wontfix,
+        ] {
+            let valid = blocked_classification(
+                "1-only",
+                "Only slice",
+                state,
+                "The ticket does not run in this state and this sentence explains why.",
+            );
+            assert_eq!(
+                report_of(vec![valid.clone()]).validate_against(&specification, &tickets),
+                Ok(()),
+                "{} carries an explanation and no brief",
+                state.wire()
+            );
+
+            let mut missing_explanation = valid.clone();
+            missing_explanation.blocker_explanation = None;
+            let error = report_of(vec![missing_explanation])
+                .validate_against(&specification, &tickets)
+                .expect_err("a non-ready classification without an explanation is rejected");
+            assert!(error.contains("explanation"), "{}: {error}", state.wire());
+
+            let mut with_brief = valid;
+            with_brief.agent_brief = brief.clone();
+            let error = report_of(vec![with_brief])
+                .validate_against(&specification, &tickets)
+                .expect_err("a non-ready classification with a brief is rejected");
+            assert!(error.contains("Agent Brief"), "{}: {error}", state.wire());
+        }
+
+        let error = report_of(Vec::new())
+            .validate_against(&specification, &tickets)
+            .expect_err("a report that classifies nothing cannot cover the draft set");
+        assert!(error.contains("no triage classification"), "{error}");
     }
 
     /// Every acceptance criterion must be non-blank: a brief whose list
@@ -1441,64 +1736,116 @@ cargo test triage::tests
     // -- Wire contract ------------------------------------------------------
 
     #[test]
-    fn when_serializing_triage_given_closed_contract_enums_then_emits_exact_values() {
-        assert_eq!(
-            TriageCategory::ALL,
-            [TriageCategory::Bug, TriageCategory::Enhancement]
-        );
-        for category in TriageCategory::ALL {
-            assert_eq!(
-                serde_json::to_value(category).expect("a category serializes"),
-                serde_json::json!(category.wire())
-            );
-            assert!(
-                matches!(category.wire(), "bug" | "enhancement"),
-                "the wire value is exactly bug or enhancement: {}",
-                category.wire()
-            );
-        }
-
+    fn when_enumerating_triage_states_given_closed_contract_then_returns_five_supported_values() {
         assert_eq!(
             TriageState::ALL,
             [
                 TriageState::ReadyForAgent,
+                TriageState::Done,
                 TriageState::ReadyForHuman,
                 TriageState::NeedsInfo,
                 TriageState::Wontfix,
             ]
         );
-        for state in TriageState::ALL {
+
+        let expected = [
+            (TriageState::ReadyForAgent, "ready-for-agent"),
+            (TriageState::Done, "done"),
+            (TriageState::ReadyForHuman, "ready-for-human"),
+            (TriageState::NeedsInfo, "needs-info"),
+            (TriageState::Wontfix, "wontfix"),
+        ];
+        for (state, wire) in expected {
+            assert_eq!(state.wire(), wire, "the wire value of {state:?}");
             assert_eq!(
                 serde_json::to_value(state).expect("a state serializes"),
-                serde_json::json!(state.wire())
+                serde_json::json!(wire)
             );
-            assert!(
-                !state.wire().contains('_'),
-                "the states are hyphenated wire values, never underscore-separated: {}",
-                state.wire()
-            );
-            assert_eq!(state.is_ready(), state == TriageState::ReadyForAgent);
-        }
-
-        for wire in [
-            "ready-for-agent",
-            "ready-for-human",
-            "needs-info",
-            "wontfix",
-        ] {
             assert_eq!(
                 serde_json::from_str::<TriageState>(&format!("{wire:?}"))
-                    .expect("a wire state parses")
-                    .wire(),
-                wire
+                    .expect("a wire state parses"),
+                state
             );
         }
-        for wire in ["bug", "enhancement"] {
+
+        let wires: Vec<&str> = TriageState::ALL.iter().map(|state| state.wire()).collect();
+        assert_eq!(
+            wires,
+            [
+                "ready-for-agent",
+                "done",
+                "ready-for-human",
+                "needs-info",
+                "wontfix",
+            ],
+            "the state set is exactly these five wire values, in documented order"
+        );
+
+        for payload in [
+            "ready_for_agent",
+            "ready_for_human",
+            "needs_info",
+            "done_",
+            "completed",
+            "needs-clarification",
+            "not-actionable",
+            "",
+        ] {
+            assert!(
+                serde_json::from_str::<TriageState>(&format!("{payload:?}")).is_err(),
+                "{payload:?} is not a wire state"
+            );
+        }
+    }
+
+    #[test]
+    fn when_authorizing_queue_progress_given_each_supported_triage_state_then_allows_only_ready_and_done()
+     {
+        let expected = [
+            (TriageState::ReadyForAgent, true, true),
+            (TriageState::Done, true, false),
+            (TriageState::ReadyForHuman, false, false),
+            (TriageState::NeedsInfo, false, false),
+            (TriageState::Wontfix, false, false),
+        ];
+
+        for (state, authorizes_queue, is_ready) in expected {
+            assert_eq!(
+                state.authorizes_queue(),
+                authorizes_queue,
+                "queue authorization for {}",
+                state.wire()
+            );
+            assert_eq!(state.is_ready(), is_ready, "readiness for {}", state.wire());
+        }
+
+        assert_eq!(
+            TriageState::ALL.len(),
+            expected.len(),
+            "every supported state must have an authorization expectation"
+        );
+    }
+
+    #[test]
+    fn when_preserving_triage_contract_given_existing_state_meanings_then_keeps_ready_and_category_sets()
+     {
+        assert_eq!(
+            TriageCategory::ALL,
+            [TriageCategory::Bug, TriageCategory::Enhancement]
+        );
+        for (category, wire) in [
+            (TriageCategory::Bug, "bug"),
+            (TriageCategory::Enhancement, "enhancement"),
+        ] {
+            assert_eq!(category.wire(), wire);
+            assert_eq!(
+                serde_json::to_value(category).expect("a category serializes"),
+                serde_json::json!(wire)
+            );
             assert_eq!(
                 serde_json::from_str::<TriageCategory>(&format!("{wire:?}"))
-                    .expect("a wire category parses")
-                    .wire(),
-                wire
+                    .expect("a wire category parses"),
+                category
             );
         }
 
@@ -1517,18 +1864,60 @@ cargo test triage::tests
                 "{payload:?} is not a wire category"
             );
         }
-        for payload in [
-            "ready_for_agent",
-            "ready_for_human",
-            "needs_info",
-            "needs-clarification",
-            "not-actionable",
-            "",
+
+        let tickets = one_ticket_draft();
+        let specification = specification();
+
+        let ready = ready_classification("1-only", "Only slice", &[]);
+        assert_eq!(
+            report_of(vec![ready.clone()]).validate_against(&specification, &tickets),
+            Ok(()),
+            "ready-for-agent still carries an Agent Brief and no explanation"
+        );
+
+        let mut ready_without_brief = ready.clone();
+        ready_without_brief.agent_brief = None;
+        let error = report_of(vec![ready_without_brief])
+            .validate_against(&specification, &tickets)
+            .expect_err("ready-for-agent without a brief must remain rejected");
+        assert!(error.contains("Agent Brief"), "{error}");
+
+        for state in [
+            TriageState::Done,
+            TriageState::ReadyForHuman,
+            TriageState::NeedsInfo,
+            TriageState::Wontfix,
         ] {
             assert!(
-                serde_json::from_str::<TriageState>(&format!("{payload:?}")).is_err(),
-                "{payload:?} is not a wire state"
+                !state.is_ready(),
+                "{} must not be treated as ready for an agent",
+                state.wire()
             );
+
+            let explained = blocked_classification(
+                "1-only",
+                "Only slice",
+                state,
+                "The existing implementation and tests satisfy the ticket.",
+            );
+            assert_eq!(
+                report_of(vec![explained]).validate_against(&specification, &tickets),
+                Ok(()),
+                "{} carries an explanation and no brief",
+                state.wire()
+            );
+
+            let mut with_brief = blocked_classification(
+                "1-only",
+                "Only slice",
+                state,
+                "The existing implementation and tests satisfy the ticket.",
+            );
+            with_brief.agent_brief = ready.agent_brief.clone();
+            let error = report_of(vec![with_brief])
+                .validate_against(&specification, &tickets)
+                .expect_err("a non-ready state with a brief must be rejected");
+            assert!(error.contains("Agent Brief"), "{}: {error}", state.wire());
         }
     }
 

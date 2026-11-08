@@ -14,8 +14,8 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`PROPOSAL-4-no-artificial-red-probes.md`](./.plans/PROPOSAL-4-no-artificial-red-probes.md) | [x] Complete (T04 done) | `T04` | `src/prompts/code.rs` |
 | [`01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md) | [x] Complete (T02, T03 done) | `T02`, `T03` | `src/prompts/plan.rs`, `src/prompts/spec.rs` |
 | [`PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md) | [x] Complete (T04, T06 done) | `T04`, `T06` | `src/prompts/code.rs`, `src/prompts/tickets.rs` |
-| [`02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md) | `[ ]` Pending (T02, T06 done; T07 pending) | `T02`, `T06`, `T07` | `src/prompts/tickets.rs`, `src/prompts/triage.rs` |
-| [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | `[ ]` Pending | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
+| [`02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md) | [x] Complete (T02, T06, T07 done) | `T02`, `T06`, `T07` | `src/prompts/tickets.rs`, `src/prompts/triage.rs` |
+| [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | `[ ]` Pending (T07 done; T08 pending) | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md) | `[ ]` Pending | `T09` | `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md) | `[ ]` Pending | `T10` | `src/orchestrator.rs`, `src/pipeline.rs` |
 | [`05-shell-execution-hardening.md`](./.plans/05-shell-execution-hardening.md) | `[ ]` Pending | `T11` | `src/tools.rs` |
@@ -55,7 +55,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
       │
       ▼
 [x] [T06] 02 + PROPOSAL-9: TICKETS_SYSTEM_PROMPT scope cap & contracts (src/prompts/tickets.rs)
-      ├──► [ ] [T07] PROPOSAL-1a + 02: TriageState::Done model & TRIAGE_SYSTEM_PROMPT (src/triage.rs, src/prompts/triage.rs)
+      ├──► [x] [T07] PROPOSAL-1a + 02: TriageState::Done model & TRIAGE_SYSTEM_PROMPT (src/triage.rs, src/prompts/triage.rs)
       │          │
       │          ▼
       │        [ ] [T08] PROPOSAL-1b: Pipeline pre-completion & unblocking for Done tickets (src/pipeline.rs)
@@ -163,7 +163,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 
 ### Wave 2: Triage/Pipeline Flow & Independent Runtime Hardening (`T07`–`T15`)
 
-- [ ] **`T07` — Add `TriageState::Done` Data Model & Upgrade `TRIAGE_SYSTEM_PROMPT`**
+- [x] **`T07` — Add `TriageState::Done` Data Model & Upgrade `TRIAGE_SYSTEM_PROMPT`**
   - `depends_on`: `["T06"]`
   - `unblocks`: `["T08"]`
   - `plans`: [`.plans/PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md), [`.plans/02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md)

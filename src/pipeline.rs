@@ -603,8 +603,8 @@ impl Pipeline {
         match crate::tools::run_command_in(&self.root, command) {
             Ok(_) => {
                 progress.transition_failures = 0;
-                let _ =
-                    status::shared().stdout_log(&format!("[INFO] transition gate `{command}` passed"));
+                let _ = status::shared()
+                    .stdout_log(&format!("[INFO] transition gate `{command}` passed"));
                 Ok(TransitionGate::Passed)
             }
             Err(output) => {
@@ -1144,10 +1144,7 @@ fn transition_fix_ticket(queue_round: usize, command: &str, excerpt: &str) -> Ti
 
 /// Whether `report` contains a finding matching `finding` by id or by
 /// normalized `(category, target)`.
-fn report_matches_finding(
-    report: &ReviewReport,
-    finding: &crate::review::ReviewFinding,
-) -> bool {
+fn report_matches_finding(report: &ReviewReport, finding: &crate::review::ReviewFinding) -> bool {
     let id = finding.id.trim();
     let category = finding.category.trim();
     let target = finding.target.trim();
@@ -1160,10 +1157,7 @@ fn report_matches_finding(
 
 /// Detect a finding that was reported in an earlier round, disappeared in the
 /// immediately preceding round, and re-opened in `current`.
-fn reopened_finding(
-    prior_reviews: &[ReviewReport],
-    current: &ReviewReport,
-) -> Option<String> {
+fn reopened_finding(prior_reviews: &[ReviewReport], current: &ReviewReport) -> Option<String> {
     let [older @ .., previous] = prior_reviews else {
         return None;
     };
@@ -1172,7 +1166,9 @@ fn reopened_finding(
     }
     current.findings.iter().find_map(|finding| {
         let reopened = !report_matches_finding(previous, finding)
-            && older.iter().any(|report| report_matches_finding(report, finding));
+            && older
+                .iter()
+                .any(|report| report_matches_finding(report, finding));
         reopened.then(|| {
             format!(
                 "finding `{}` on `{}` re-opened after passing an intermediate review round",
@@ -1185,10 +1181,7 @@ fn reopened_finding(
 
 /// Detect a finding that has remained unresolved for
 /// [`MAX_STALLED_REVIEW_ROUNDS`] consecutive review rounds.
-fn stalled_finding(
-    prior_reviews: &[ReviewReport],
-    current: &ReviewReport,
-) -> Option<String> {
+fn stalled_finding(prior_reviews: &[ReviewReport], current: &ReviewReport) -> Option<String> {
     let needed = MAX_STALLED_REVIEW_ROUNDS - 1;
     if prior_reviews.len() < needed {
         return None;
@@ -1220,10 +1213,7 @@ fn review_circuit_breaker(
 
 /// The phase name and concise detail handed to `downstream_retry` for a
 /// non-passing run termination.
-fn retry_termination_detail(
-    termination: &RunTermination,
-    report: &str,
-) -> (&'static str, String) {
+fn retry_termination_detail(termination: &RunTermination, report: &str) -> (&'static str, String) {
     match termination {
         RunTermination::Queue(outcome) => ("queue", queue_retry_detail(outcome, report)),
         RunTermination::TransitionGateFailed {
@@ -1239,9 +1229,7 @@ fn retry_termination_detail(
         }
         RunTermination::ReviewCapReached { rounds, findings } => (
             "review",
-            format!(
-                "still reported {findings} unresolved finding(s) after {rounds} review rounds"
-            ),
+            format!("still reported {findings} unresolved finding(s) after {rounds} review rounds"),
         ),
         RunTermination::ReviewCircuitBroken { round, reason } => (
             "review",
@@ -1829,7 +1817,12 @@ mod tests {
         }
     }
 
-    fn sample_review_report(finding_id: &str, category: &str, target: &str, ticket_id: &str) -> ReviewReport {
+    fn sample_review_report(
+        finding_id: &str,
+        category: &str,
+        target: &str,
+        ticket_id: &str,
+    ) -> ReviewReport {
         ReviewReport {
             scorecard: sample_scorecard(),
             findings: vec![crate::review::ReviewFinding {

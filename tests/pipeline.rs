@@ -875,7 +875,10 @@ fn when_review_exceeds_max_rounds_given_persistent_findings_then_summarises_and_
     // The nine permitted fix queues ran; the tenth review's fix ticket was
     // reported but never queued.
     for round in 1..=9 {
-        assert!(dir.join(format!("tickets/r{round}-1-verify-edge-case.md")).is_file());
+        assert!(
+            dir.join(format!("tickets/r{round}-1-verify-edge-case.md"))
+                .is_file()
+        );
     }
     assert!(!dir.join("tickets/r10-1-verify-edge-case.md").exists());
 
@@ -13532,17 +13535,32 @@ fn when_reviewing_given_reopened_finding_after_intermediate_round_then_breaks_ci
         bash_reply(),
         task_complete_reply(),
         // Review round 1 reports f1-regression
-        review_reply_with_finding("f1-regression", "boundary-matrix", "src/app.ts:click", "r1-1-fix"),
+        review_reply_with_finding(
+            "f1-regression",
+            "boundary-matrix",
+            "src/app.ts:click",
+            "r1-1-fix",
+        ),
         // Queue round 2
         bash_reply(),
         task_complete_reply(),
         // Review round 2 reports a different finding f2-other (f1-regression passed)
-        review_reply_with_finding("f2-other", "code-and-scope", "src/other.ts:init", "r2-1-fix"),
+        review_reply_with_finding(
+            "f2-other",
+            "code-and-scope",
+            "src/other.ts:init",
+            "r2-1-fix",
+        ),
         // Queue round 3
         bash_reply(),
         task_complete_reply(),
         // Review round 3 re-opens f1-regression -> circuit breaker trips!
-        review_reply_with_finding("f1-regression", "boundary-matrix", "src/app.ts:click", "r3-1-fix"),
+        review_reply_with_finding(
+            "f1-regression",
+            "boundary-matrix",
+            "src/app.ts:click",
+            "r3-1-fix",
+        ),
         // Summary pass receives the circuit-broken termination outcome.
         HandoverReply::Error(CallError::Api {
             status: 400,
@@ -13566,15 +13584,15 @@ fn when_reviewing_given_reopened_finding_after_intermediate_round_then_breaks_ci
     assert!(!artifacts.join("tickets/r3-1-fix.md").exists());
 
     let requests = transport.requests();
-    let summary_request = requests.last().expect("summary request was sent").to_string();
+    let summary_request = requests
+        .last()
+        .expect("summary request was sent")
+        .to_string();
     assert!(
         summary_request.contains("review circuit breaker stopped the run on review round 3"),
         "{summary_request}"
     );
-    assert!(
-        summary_request.contains("re-opened"),
-        "{summary_request}"
-    );
+    assert!(summary_request.contains("re-opened"), "{summary_request}");
 
     drop(repository);
     let _ = fs::remove_dir_all(&dir);
@@ -13585,7 +13603,10 @@ fn when_resuming_after_incomplete_queue_given_dirty_working_tree_then_allows_nex
  {
     let repository = committed_repository();
     let target = repository.path().join("tracked.txt");
-    let dirty_command = format!("printf 'uncommitted retry work\\n' > '{}'", target.display());
+    let dirty_command = format!(
+        "printf 'uncommitted retry work\\n' > '{}'",
+        target.display()
+    );
     let first_session = repository.path().join(".ejaj/retry-session-1");
     let second_session = repository.path().join(".ejaj/retry-session-2");
 
@@ -13662,7 +13683,9 @@ fn when_transition_gate_fails_once_given_project_test_suite_then_queues_repair_t
         "after the transition-gate repair ticket fixes the suite, the run completes: {step:?}"
     );
     assert!(
-        session.join("tickets/g1-1-fix-full-test-suite.md").is_file(),
+        session
+            .join("tickets/g1-1-fix-full-test-suite.md")
+            .is_file(),
         "the transition gate must persist its repair ticket before review"
     );
     assert_eq!(
