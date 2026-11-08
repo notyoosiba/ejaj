@@ -34,6 +34,9 @@ pub const SOURCE_LIMIT_BYTES: usize = 256 * 1024;
 /// Maximum number of match records `tools.grep` materializes and returns (1,000).
 pub const GREP_MATCH_LIMIT: usize = 1_000;
 
+/// Maximum UTF-8 bytes retained for one matched `tools.grep` line (2,000).
+pub const GREP_LINE_MAX_BYTES: usize = 2_000;
+
 /// Per-phase capability set and root directory confinement for [`ScriptEngine`].
 ///
 /// `Phase::Code` receives all six bindings (`read`, `write`, `replace`, `list`,
@@ -677,6 +680,185 @@ pub fn host_write(root: &Path, path: &str, content: &str) -> Result<(), String> 
     fs::write(&resolved, content).map_err(|e| format!("tools.write(`{path}`): {e}"))
 }
 
+/// The Unicode scalar a UTF-8 byte-order mark decodes to.
+const UTF8_BOM: char = '\u{FEFF}';
+
+/// The LF-normalized search view of a file plus the mapping from a view byte
+/// boundary back to the corresponding source byte boundary.
+struct LfView {
+    text: String,
+    source_offsets: Vec<usize>,
+}
+
+impl LfView {
+    /// Build the search view for `source`, replacing each `\r\n` with `\n`
+    /// and remembering where every view byte came from.
+    fn new(source: &str) -> Self {
+        let bytes = source.as_bytes();
+        let mut text = String::with_capacity(source.len());
+        let mut source_offsets = Vec::with_capacity(source.len() + 1);
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                source_offsets.push(index);
+                text.push('\n');
+                index += 2;
+            } else {
+                let ch = source[index..]
+                    .chars()
+                    .next()
+                    .expect("index is always a char boundary");
+                let width = ch.len_utf8();
+                for offset in 0..width {
+                    source_offsets.push(index + offset);
+                }
+                text.push(ch);
+                index += width;
+            }
+        }
+        source_offsets.push(bytes.len());
+        Self {
+            text,
+            source_offsets,
+        }
+    }
+
+    /// The source byte boundary corresponding to `view_offset`.
+    fn source_offset(&self, view_offset: usize) -> usize {
+        self.source_offsets[view_offset]
+    }
+}
+
+/// `\r\n` -> `\n`, leaving every other byte alone.
+fn normalize_line_feeds(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+/// The dominant line ending of `source`: CRLF when it has more CRLF than bare
+/// LF endings, otherwise LF (ties and files without endings are LF).
+fn dominant_line_ending(source: &str) -> &'static str {
+    let crlf = source.matches("\r\n").count();
+    let lf = source.matches('\n').count() - crlf;
+    if crlf > lf { "\r\n" } else { "\n" }
+}
+
+/// Format replacement text with `line_ending`: CRLF is normalized to LF first,
+/// then every LF is written in the dominant style.
+fn format_replacement(new_text: &str, line_ending: &str) -> String {
+    let normalized = normalize_line_feeds(new_text);
+    if line_ending == "\r\n" {
+        normalized.replace('\n', "\r\n")
+    } else {
+        normalized
+    }
+}
+
+/// Non-overlapping exact occurrences of `needle` in `haystack`.
+fn exact_match_ranges(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    haystack
+        .match_indices(needle)
+        .map(|(start, matched)| (start, start + matched.len()))
+        .collect()
+}
+
+/// One line of an LF-normalized view, with both possible end offsets.
+struct ViewLine<'a> {
+    start: usize,
+    end_with_newline: usize,
+    end_without_newline: usize,
+    has_newline: bool,
+    text: &'a str,
+}
+
+/// Split `view` into line spans that remember whether a newline is present.
+fn view_lines(view: &str) -> Vec<ViewLine<'_>> {
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for segment in view.split_inclusive('\n') {
+        let has_newline = segment.ends_with('\n');
+        let text = if has_newline {
+            &segment[..segment.len() - 1]
+        } else {
+            segment
+        };
+        let start = offset;
+        let end_with_newline = offset + segment.len();
+        let end_without_newline = start + text.len();
+        lines.push(ViewLine {
+            start,
+            end_with_newline,
+            end_without_newline,
+            has_newline,
+            text,
+        });
+        offset = end_with_newline;
+    }
+    lines
+}
+
+/// Non-overlapping line-based occurrences of `search` in `view`, comparing each
+/// corresponding line after removing only trailing ASCII spaces and tabs.
+fn trimmed_line_match_ranges(view: &str, search: &str) -> Vec<(usize, usize)> {
+    let trailing_newline = search.ends_with('\n');
+    let mut expected: Vec<&str> = search.split('\n').collect();
+    if trailing_newline {
+        expected.pop();
+    }
+    if expected.is_empty() {
+        return Vec::new();
+    }
+    let expected: Vec<&str> = expected
+        .iter()
+        .map(|line| line.trim_end_matches([' ', '\t']))
+        .collect();
+
+    let lines = view_lines(view);
+    if lines.len() < expected.len() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    for start_line in 0..=(lines.len() - expected.len()) {
+        let window = &lines[start_line..start_line + expected.len()];
+        let all_match = window
+            .iter()
+            .zip(&expected)
+            .all(|(line, wanted)| line.text.trim_end_matches([' ', '\t']) == *wanted);
+        if !all_match {
+            continue;
+        }
+        let last = &window[window.len() - 1];
+        if trailing_newline && !last.has_newline {
+            continue;
+        }
+        let start = window[0].start;
+        let end = if trailing_newline {
+            last.end_with_newline
+        } else {
+            last.end_without_newline
+        };
+        if ranges
+            .last()
+            .is_some_and(|&(_, previous_end)| previous_end > start)
+        {
+            continue;
+        }
+        ranges.push((start, end));
+    }
+    ranges
+}
+
+/// The 1-based source line on which the occurrence starting at `offset` begins.
+fn start_line_number(view: &str, offset: usize) -> usize {
+    1 + view.as_bytes()[..offset]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
+}
+
 /// `tools.replace(path, old_text, new_text)`: replace exactly one occurrence of
 /// `old_text` with `new_text` in `path`. Errors on zero or more than one match.
 pub fn host_replace(root: &Path, path: &str, old_text: &str, new_text: &str) -> Result<(), String> {
@@ -685,23 +867,61 @@ pub fn host_replace(root: &Path, path: &str, old_text: &str, new_text: &str) -> 
             "tools.replace(`{path}`): `old_text` must not be empty"
         ));
     }
+    if old_text == new_text {
+        return Err(format!(
+            "tools.replace(`{path}`): `old_text` and `new_text` must differ"
+        ));
+    }
+
     let resolved = resolve_confined_path(root, path)?;
     let content =
         fs::read_to_string(&resolved).map_err(|e| format!("tools.replace(`{path}`): {e}"))?;
 
-    let matches = content.matches(old_text).count();
-    if matches == 0 {
+    let (bom, body) = match content.strip_prefix(UTF8_BOM) {
+        Some(body) => (&content[..UTF8_BOM.len_utf8()], body),
+        None => ("", content.as_str()),
+    };
+
+    let view = LfView::new(body);
+    let search = normalize_line_feeds(old_text);
+    let mut ranges = exact_match_ranges(&view.text, &search);
+    if ranges.is_empty() {
+        ranges = trimmed_line_match_ranges(&view.text, &search);
+    }
+
+    if ranges.is_empty() {
         return Err(format!(
             "tools.replace(`{path}`): `old_text` matched 0 occurrences; expected exactly 1"
         ));
     }
-    if matches > 1 {
+
+    if ranges.len() > 1 {
+        let matches = ranges.len();
+        let starts: Vec<String> = ranges
+            .iter()
+            .map(|&(start, _)| start_line_number(&view.text, start).to_string())
+            .collect();
+        let listed = if matches <= 5 {
+            format!("at lines {}", starts.join(", "))
+        } else {
+            format!("first 5 at lines {}", starts[..5].join(", "))
+        };
         return Err(format!(
-            "tools.replace(`{path}`): `old_text` matched {matches} occurrences; expected exactly 1"
+            "tools.replace(`{path}`): `old_text` matched {matches} occurrences; expected exactly 1 ({listed}; add surrounding context lines)"
         ));
     }
 
-    let updated = content.replacen(old_text, new_text, 1);
+    let (start, end) = ranges[0];
+    let source_start = view.source_offset(start);
+    let source_end = view.source_offset(end);
+    let replacement = format_replacement(new_text, dominant_line_ending(body));
+
+    let mut updated = String::with_capacity(bom.len() + body.len() + replacement.len());
+    updated.push_str(bom);
+    updated.push_str(&body[..source_start]);
+    updated.push_str(&replacement);
+    updated.push_str(&body[source_end..]);
+
     fs::write(&resolved, updated).map_err(|e| format!("tools.replace(`{path}`): {e}"))
 }
 
@@ -767,7 +987,9 @@ pub fn host_list(root: &Path, glob: Option<&str>) -> Result<Vec<String>, String>
 ///
 /// At most [`GREP_MATCH_LIMIT`] matches are materialized: parsing stops as soon
 /// as that many valid, non-artifact records have been collected, so the first
-/// matches in `git grep` order are the ones returned.
+/// matches in `git grep` order are the ones returned. Each match's source-line
+/// content is independently capped at [`GREP_LINE_MAX_BYTES`] on a UTF-8
+/// character boundary with an exact additive omission marker.
 fn host_grep(root: &Path, pattern: &str, glob: Option<&str>) -> Result<Vec<GrepMatch>, String> {
     if pattern.is_empty() {
         return Err("tools.grep: `pattern` must not be empty".to_string());
@@ -831,11 +1053,26 @@ fn host_grep(root: &Path, pattern: &str, glob: Option<&str>) -> Result<Vec<GrepM
             results.push(GrepMatch {
                 path: path.to_string(),
                 line: parsed_line,
-                text: text.to_string(),
+                text: cap_grep_line(text, GREP_LINE_MAX_BYTES),
             });
         }
     }
     Ok(results)
+}
+
+/// Retain at most `limit` UTF-8 bytes of one matched line, stopping at a
+/// character boundary, and append the exact additive omission marker when the
+/// source line is longer. The marker is not part of the retained-content cap.
+fn cap_grep_line(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let end = floor_char_boundary(text, limit);
+    let omitted = text.len() - end;
+    format!(
+        "{}... [line truncated to {limit} bytes; +{omitted} bytes]",
+        &text[..end]
+    )
 }
 
 /// The largest untracked file rendered as a diff, in bytes. A bigger file is
@@ -1351,40 +1588,521 @@ mod tests {
     }
 
     #[test]
-    fn replace_rejects_zero_and_multiple_occurrences() {
-        let dir = scratch_dir("replace-counts");
+    fn when_replacing_text_given_multiple_occurrences_then_reports_one_based_line_numbers() {
+        let dir = scratch_dir("replace-line-numbers");
         let engine = QuickJsEngine::new();
         let caps = Capabilities::read_write(&dir);
 
-        fs::write(dir.join("sample.txt"), "alpha beta alpha\n").unwrap();
+        // Two occurrences on separate lines.
+        fs::write(dir.join("pair.txt"), "one\ntwo one\n").unwrap();
+        let pair = engine
+            .run(r#"tools.replace("pair.txt", "one", "replacement");"#, &caps)
+            .expect_err("two occurrences must fail");
+        assert!(
+            pair.contains(
+                "tools.replace(`pair.txt`): `old_text` matched 2 occurrences; expected exactly 1 (at lines 1, 2; add surrounding context lines)"
+            ),
+            "unexpected two-occurrence diagnostics: {pair}"
+        );
 
-        let zero_err = engine
-            .run(r#"tools.replace("sample.txt", "missing", "new");"#, &caps)
+        // Three occurrences: two start on line 1 and the third on line 3.
+        fs::write(dir.join("triple.txt"), "token token\nmiddle\ntoken\n").unwrap();
+        let triple = engine
+            .run(
+                r#"tools.replace("triple.txt", "token", "replacement");"#,
+                &caps,
+            )
+            .expect_err("three occurrences must fail");
+        assert!(
+            triple.contains(
+                "tools.replace(`triple.txt`): `old_text` matched 3 occurrences; expected exactly 1 (at lines 1, 1, 3; add surrounding context lines)"
+            ),
+            "unexpected three-occurrence diagnostics: {triple}"
+        );
+
+        // Four occurrences on lines 1, 4, 7 and 10.
+        fs::write(
+            dir.join("quad.txt"),
+            "alpha\nbeta\ngamma\nalpha\nbeta\ngamma\nalpha\nbeta\ngamma\nalpha\n",
+        )
+        .unwrap();
+        let quad = engine
+            .run(
+                r#"tools.replace("quad.txt", "alpha", "replacement");"#,
+                &caps,
+            )
+            .expect_err("four occurrences must fail");
+        assert!(
+            quad.contains(
+                "tools.replace(`quad.txt`): `old_text` matched 4 occurrences; expected exactly 1 (at lines 1, 4, 7, 10; add surrounding context lines)"
+            ),
+            "unexpected four-occurrence diagnostics: {quad}"
+        );
+
+        // Five occurrences on one line each contribute that line.
+        fs::write(dir.join("quint.txt"), "x x x x x\n").unwrap();
+        let quint = engine
+            .run(r#"tools.replace("quint.txt", "x", "replacement");"#, &caps)
+            .expect_err("five occurrences must fail");
+        assert!(
+            quint.contains(
+                "tools.replace(`quint.txt`): `old_text` matched 5 occurrences; expected exactly 1 (at lines 1, 1, 1, 1, 1; add surrounding context lines)"
+            ),
+            "unexpected five-occurrence diagnostics: {quint}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_more_than_five_occurrences_then_reports_only_first_five_lines() {
+        let dir = scratch_dir("replace-first-five");
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_write(&dir);
+
+        fs::write(dir.join("many.txt"), "title\nx\nx\nx\nx\nx\nx\nx\n").unwrap();
+        let many = engine
+            .run(r#"tools.replace("many.txt", "x", "replacement");"#, &caps)
+            .expect_err("seven occurrences must fail");
+        assert!(
+            many.contains(
+                "tools.replace(`many.txt`): `old_text` matched 7 occurrences; expected exactly 1 (first 5 at lines 2, 3, 4, 5, 6; add surrounding context lines)"
+            ),
+            "unexpected capped diagnostics: {many}"
+        );
+        assert!(
+            !many.contains(", 7"),
+            "line numbers after the first five must be omitted: {many}"
+        );
+
+        // More than five starts on one line also cap at the first five entries.
+        fs::write(dir.join("dense.txt"), "y y y y y y\n").unwrap();
+        let dense = engine
+            .run(r#"tools.replace("dense.txt", "y", "replacement");"#, &caps)
+            .expect_err("six occurrences must fail");
+        assert!(
+            dense.contains(
+                "tools.replace(`dense.txt`): `old_text` matched 6 occurrences; expected exactly 1 (first 5 at lines 1, 1, 1, 1, 1; add surrounding context lines)"
+            ),
+            "unexpected dense capped diagnostics: {dense}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_duplicate_occurrences_then_leaves_file_bytes_unchanged() {
+        let dir = scratch_dir("replace-duplicate-bytes");
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_write(&dir);
+
+        // The two "aa" matches inside "aaa aaa" are selected non-overlapping
+        // and both start on line 1.
+        let uncapped_original = b"aaa aaa\nzzz\r\n".to_vec();
+        fs::write(dir.join("uncapped.txt"), &uncapped_original).unwrap();
+        let uncapped = engine
+            .run(
+                r#"tools.replace("uncapped.txt", "aa", "replacement");"#,
+                &caps,
+            )
+            .expect_err("two non-overlapping occurrences must fail");
+        assert!(
+            uncapped.contains(
+                "tools.replace(`uncapped.txt`): `old_text` matched 2 occurrences; expected exactly 1 (at lines 1, 1; add surrounding context lines)"
+            ),
+            "unexpected uncapped diagnostics: {uncapped}"
+        );
+        assert_eq!(
+            fs::read(dir.join("uncapped.txt")).unwrap(),
+            uncapped_original,
+            "an uncapped duplicate failure rewrote the file"
+        );
+
+        let capped_original = b"hit\nhit\nhit\nhit\nhit\nhit\r\nhit\n".to_vec();
+        fs::write(dir.join("capped.txt"), &capped_original).unwrap();
+        let capped = engine
+            .run(
+                r#"tools.replace("capped.txt", "hit", "replacement");"#,
+                &caps,
+            )
+            .expect_err("seven occurrences must fail");
+        assert!(
+            capped.contains(
+                "tools.replace(`capped.txt`): `old_text` matched 7 occurrences; expected exactly 1 (first 5 at lines 1, 2, 3, 4, 5; add surrounding context lines)"
+            ),
+            "unexpected capped diagnostics: {capped}"
+        );
+        assert_eq!(
+            fs::read(dir.join("capped.txt")).unwrap(),
+            capped_original,
+            "a capped duplicate failure rewrote the file"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_duplicate_occurrences_then_preserves_existing_count_and_access_contracts()
+     {
+        let dir = scratch_dir("replace-contracts");
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_write(&dir);
+
+        fs::write(dir.join("exact.txt"), "alpha beta alpha\n").unwrap();
+        let zero = engine
+            .run(r#"tools.replace("exact.txt", "missing", "new");"#, &caps)
             .expect_err("zero occurrences must fail");
         assert!(
-            zero_err.starts_with("[ERROR: execute_script failed]"),
-            "unexpected prefix: {zero_err}"
-        );
-        assert!(
-            zero_err.contains("0 occurrences"),
-            "expected 0 occurrences message: {zero_err}"
+            zero.contains(
+                "tools.replace(`exact.txt`): `old_text` matched 0 occurrences; expected exactly 1"
+            ),
+            "unexpected zero-match error: {zero}"
         );
 
-        let many_err = engine
-            .run(r#"tools.replace("sample.txt", "alpha", "gamma");"#, &caps)
-            .expect_err("multiple occurrences must fail");
+        let many = engine
+            .run(r#"tools.replace("exact.txt", "alpha", "gamma");"#, &caps)
+            .expect_err("multiple exact occurrences must fail");
         assert!(
-            many_err.starts_with("[ERROR: execute_script failed]"),
-            "unexpected prefix: {many_err}"
+            many.contains(
+                "tools.replace(`exact.txt`): `old_text` matched 2 occurrences; expected exactly 1 (at lines 1, 1; add surrounding context lines)"
+            ),
+            "unexpected exact multi-match error: {many}"
         );
-        assert!(
-            many_err.contains("2 occurrences"),
-            "expected 2 occurrences message: {many_err}"
+        assert_eq!(
+            fs::read_to_string(dir.join("exact.txt")).unwrap(),
+            "alpha beta alpha\n"
         );
 
-        // File must be untouched after both failed replacements.
-        let unchanged = fs::read_to_string(dir.join("sample.txt")).unwrap();
-        assert_eq!(unchanged, "alpha beta alpha\n");
+        // The whitespace fallback enforces uniqueness too, using the selected
+        // tier's starts for the line diagnostics.
+        fs::write(dir.join("fallback.txt"), "alpha  \nheader\nalpha\t\n").unwrap();
+        let fallback_many = engine
+            .run(
+                r#"tools.replace("fallback.txt", "alpha\n", "gamma\n");"#,
+                &caps,
+            )
+            .expect_err("multiple fallback occurrences must fail");
+        assert!(
+            fallback_many.contains(
+                "tools.replace(`fallback.txt`): `old_text` matched 2 occurrences; expected exactly 1 (at lines 1, 3; add surrounding context lines)"
+            ),
+            "unexpected fallback multi-match error: {fallback_many}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("fallback.txt")).unwrap(),
+            "alpha  \nheader\nalpha\t\n"
+        );
+
+        // Read-only capabilities never expose replace.
+        let read_only = Capabilities::read_only(&dir);
+        let denied = engine
+            .run(
+                r#"tools.replace("exact.txt", "alpha", "gamma");"#,
+                &read_only,
+            )
+            .expect_err("read-only capabilities must not expose replace");
+        assert!(
+            denied.starts_with("[ERROR: execute_script failed]"),
+            "unexpected read-only error prefix: {denied}"
+        );
+
+        // Path confinement still rejects escapes before any write.
+        let escaped = engine
+            .run(
+                r#"tools.replace("../outside.txt", "alpha", "gamma");"#,
+                &caps,
+            )
+            .expect_err("a path outside the confined root must be rejected");
+        assert!(
+            escaped.contains("contains `..`"),
+            "unexpected confinement error: {escaped}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("exact.txt")).unwrap(),
+            "alpha beta alpha\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_crlf_file_and_lf_old_text_then_matches_and_preserves_crlf_endings()
+    {
+        let dir = scratch_dir("replace-crlf");
+        fs::write(
+            dir.join("crlf.txt"),
+            "first line\r\nsecond line\r\nthird line\r\n",
+        )
+        .unwrap();
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_write(&dir);
+
+        engine
+            .run(
+                r#"tools.replace("crlf.txt", "second line\nthird line", "SECOND\nTHIRD");"#,
+                &caps,
+            )
+            .expect("LF search text must match the CRLF file");
+
+        let persisted = fs::read(dir.join("crlf.txt")).unwrap();
+        assert_eq!(
+            String::from_utf8(persisted).expect("replacement output is UTF-8"),
+            "first line\r\nSECOND\r\nTHIRD\r\n",
+            "the replaced region and the untouched region must both keep CRLF endings"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_identical_old_and_new_text_then_returns_identical_error() {
+        let dir = scratch_dir("replace-identical");
+        fs::write(dir.join("same.txt"), "alpha\n").unwrap();
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_write(&dir);
+
+        let err = engine
+            .run(r#"tools.replace("same.txt", "alpha", "alpha");"#, &caps)
+            .expect_err("identical old and new text must fail");
+        assert!(
+            err.starts_with("[ERROR: execute_script failed]"),
+            "unexpected prefix: {err}"
+        );
+        assert!(
+            err.contains("tools.replace(`same.txt`): `old_text` and `new_text` must differ"),
+            "unexpected identical-text error: {err}"
+        );
+        assert_eq!(fs::read_to_string(dir.join("same.txt")).unwrap(), "alpha\n");
+
+        // The identical-text guard runs before the file is touched, so a
+        // missing file still reports the no-op error rather than a read error.
+        let missing = engine
+            .run(r#"tools.replace("missing.txt", "alpha", "alpha");"#, &caps)
+            .expect_err("identical old and new text must fail before file access");
+        assert!(
+            missing.contains("`old_text` and `new_text` must differ"),
+            "expected the identical-text error, got: {missing}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_utf8_bom_then_preserves_bom_on_write() {
+        let dir = scratch_dir("replace-bom");
+        fs::write(dir.join("bom.txt"), "\u{FEFF}alpha\nbeta\n").unwrap();
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_write(&dir);
+
+        engine
+            .run(r#"tools.replace("bom.txt", "alpha", "omega");"#, &caps)
+            .expect("replacement after the BOM must succeed");
+
+        let persisted = fs::read_to_string(dir.join("bom.txt")).unwrap();
+        assert_eq!(persisted, "\u{FEFF}omega\nbeta\n");
+        assert_eq!(
+            persisted.matches('\u{FEFF}').count(),
+            1,
+            "the BOM must remain present exactly once: {persisted:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_zero_or_empty_old_text_then_preserves_existing_error_messages() {
+        let dir = scratch_dir("replace-empty-unmatched");
+        fs::write(dir.join("sample.txt"), "alpha\n").unwrap();
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_write(&dir);
+
+        // Empty old_text takes precedence even when new_text is also empty.
+        let empty = engine
+            .run(r#"tools.replace("sample.txt", "", "");"#, &caps)
+            .expect_err("empty old_text must fail");
+        assert!(
+            empty.contains("tools.replace(`sample.txt`): `old_text` must not be empty"),
+            "unexpected empty old_text error: {empty}"
+        );
+
+        let mismatch = engine
+            .run(r#"tools.replace("sample.txt", "missing", "new");"#, &caps)
+            .expect_err("an unmatched old_text must fail");
+        assert!(
+            mismatch.contains(
+                "tools.replace(`sample.txt`): `old_text` matched 0 occurrences; expected exactly 1"
+            ),
+            "unexpected zero-match error: {mismatch}"
+        );
+
+        assert_eq!(
+            fs::read_to_string(dir.join("sample.txt")).unwrap(),
+            "alpha\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_invalid_utf8_file_then_returns_read_error_without_writing() {
+        let dir = scratch_dir("replace-invalid-utf8");
+        let original = vec![0xFF, 0xFE, b'a', b'\n'];
+        fs::write(dir.join("binary.txt"), &original).unwrap();
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_write(&dir);
+
+        let err = engine
+            .run(r#"tools.replace("binary.txt", "a", "b");"#, &caps)
+            .expect_err("invalid UTF-8 must fail");
+        assert!(
+            err.contains("tools.replace(`binary.txt`): "),
+            "expected the tools.replace path prefix: {err}"
+        );
+        assert_eq!(fs::read(dir.join("binary.txt")).unwrap(), original);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_trailing_whitespace_difference_then_matches_via_line_trimmed_fallback()
+     {
+        let dir = scratch_dir("replace-fallback");
+        fs::write(
+            dir.join("fallback.txt"),
+            "header\nfn main() {   \n    work();\t\n}\nfooter\n",
+        )
+        .unwrap();
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_write(&dir);
+
+        // Leading whitespace stays significant in the fallback: only trailing
+        // ASCII spaces and tabs are ignored.
+        let leading = engine
+            .run(
+                r#"tools.replace("fallback.txt", "fn main() {\nwork();\n}", "x");"#,
+                &caps,
+            )
+            .expect_err("removing leading whitespace must not match");
+        assert!(
+            leading.contains("matched 0 occurrences"),
+            "unexpected leading-whitespace error: {leading}"
+        );
+
+        engine
+            .run(
+                r#"tools.replace("fallback.txt", "fn main() {\n    work();\n}", "fn main() {\n    done();\n}");"#,
+                &caps,
+            )
+            .expect("trailing space and tab differences must match through the fallback");
+
+        assert_eq!(
+            fs::read_to_string(dir.join("fallback.txt")).unwrap(),
+            "header\nfn main() {\n    done();\n}\nfooter\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_exact_tier_match_then_skips_whitespace_fallback() {
+        let dir = scratch_dir("replace-tier-precedence");
+        fs::write(dir.join("tier.txt"), "alpha \nalpha\n").unwrap();
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_write(&dir);
+
+        // The exact tier finds the only "alpha " occurrence. The whitespace
+        // fallback would find two "alpha" lines and reject the edit, so success
+        // proves the fallback never ran.
+        engine
+            .run(r#"tools.replace("tier.txt", "alpha ", "beta");"#, &caps)
+            .expect("the exact tier must take precedence over the whitespace fallback");
+
+        assert_eq!(
+            fs::read_to_string(dir.join("tier.txt")).unwrap(),
+            "beta\nalpha\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_successful_edit_then_preserves_untouched_bytes_and_dominant_line_endings()
+     {
+        let dir = scratch_dir("replace-endings");
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_write(&dir);
+
+        // Mixed endings where CRLF outnumbers bare LF: replacement CRLF is kept
+        // and replacement LFs become CRLF; untouched regions keep their bytes.
+        fs::write(dir.join("mixed.txt"), "a\r\nb\r\nc\n").unwrap();
+        engine
+            .run(r#"tools.replace("mixed.txt", "b", "B1\r\nB2");"#, &caps)
+            .expect("mixed-ending replacement should succeed");
+        assert_eq!(
+            fs::read_to_string(dir.join("mixed.txt")).unwrap(),
+            "a\r\nB1\r\nB2\r\nc\n"
+        );
+
+        // A tie between CRLF and bare LF resolves to LF.
+        fs::write(dir.join("tie.txt"), "first\r\nsecond\n").unwrap();
+        engine
+            .run(
+                r#"tools.replace("tie.txt", "first", "FIRST\nSECOND");"#,
+                &caps,
+            )
+            .expect("tie replacement should succeed");
+        assert_eq!(
+            fs::read_to_string(dir.join("tie.txt")).unwrap(),
+            "FIRST\nSECOND\r\nsecond\n"
+        );
+
+        // A replacement carrying CRLF is normalized to the LF-dominant file.
+        fs::write(dir.join("lf.txt"), "one\ntwo\n").unwrap();
+        engine
+            .run(r#"tools.replace("lf.txt", "one", "ONE\r\nTWO");"#, &caps)
+            .expect("LF-dominant replacement should succeed");
+        assert_eq!(
+            fs::read_to_string(dir.join("lf.txt")).unwrap(),
+            "ONE\nTWO\ntwo\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_replacing_text_given_read_only_capability_or_confined_path_then_rejects_mutation() {
+        let dir = scratch_dir("replace-access");
+        fs::write(dir.join("note.txt"), "original\n").unwrap();
+        let engine = QuickJsEngine::new();
+
+        let read_only = Capabilities::read_only(&dir);
+        let denied = engine
+            .run(
+                r#"tools.replace("note.txt", "original", "mutated");"#,
+                &read_only,
+            )
+            .expect_err("read-only capabilities must not expose replace");
+        assert!(
+            denied.starts_with("[ERROR: execute_script failed]"),
+            "unexpected read-only error prefix: {denied}"
+        );
+
+        let read_write = Capabilities::read_write(&dir);
+        let escaped = engine
+            .run(
+                r#"tools.replace("../outside.txt", "original", "mutated");"#,
+                &read_write,
+            )
+            .expect_err("a path outside the confined root must be rejected");
+        assert!(
+            escaped.contains("contains `..`"),
+            "unexpected confinement error: {escaped}"
+        );
+
+        assert_eq!(
+            fs::read_to_string(dir.join("note.txt")).unwrap(),
+            "original\n"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1535,7 +2253,7 @@ mod tests {
     /// keeping the `{ path, line, text }` shape, while an empty pattern and a
     /// parent-traversal glob remain errors.
     #[test]
-    fn when_grep_given_over_one_thousand_matches_then_returns_the_first_one_thousand() {
+    fn when_grepping_files_given_more_than_one_thousand_matches_then_returns_first_one_thousand() {
         assert_eq!(
             GREP_MATCH_LIMIT, 1_000,
             "the public match cap must be 1,000"
@@ -1610,6 +2328,322 @@ mod tests {
             traversal.contains("may not reference parent or root directories"),
             "the existing traversal glob error must be preserved: {traversal}"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Core entry-point behavior: a matched line longer than the public line
+    /// cap is retained as the longest UTF-8 prefix that fits and carries the
+    /// exact additive omission marker, while `path` and `line` are
+    /// preserved. The multi-byte line stops on a character boundary even
+    /// though a three-byte character crosses the 2,000-byte limit.
+    #[test]
+    fn when_grepping_files_given_line_over_two_thousand_bytes_then_truncates_matched_line_on_utf8_boundary()
+     {
+        assert_eq!(
+            GREP_LINE_MAX_BYTES, 2_000,
+            "the public per-line cap must be 2,000 bytes"
+        );
+
+        let dir = scratch_dir("grep-line-cap-over");
+        init_git_repo(&dir);
+
+        let ascii_line = format!("needle {}", "a".repeat(3_000));
+        assert_eq!(ascii_line.len(), 3_007, "the ASCII fixture is over the cap");
+        fs::write(dir.join("ascii.txt"), format!("{ascii_line}\n")).unwrap();
+
+        let multibyte_prefix = format!("needle {}", "b".repeat(1_992));
+        assert_eq!(multibyte_prefix.len(), 1_999);
+        let multibyte_line = format!("{multibyte_prefix}€{}", "c".repeat(100));
+        assert_eq!(multibyte_line.len(), 2_102);
+        fs::write(dir.join("unicode.txt"), format!("{multibyte_line}\n")).unwrap();
+
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_only(&dir);
+
+        let ascii = engine
+            .run(r#"return tools.grep("needle", "ascii.txt");"#, &caps)
+            .expect("tools.grep should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&ascii).unwrap();
+        let ascii_prefix = format!("needle {}", "a".repeat(1_993));
+        let expected_ascii =
+            format!("{ascii_prefix}... [line truncated to 2000 bytes; +1007 bytes]");
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                { "path": "ascii.txt", "line": 1, "text": expected_ascii },
+            ]),
+            "an over-limit ASCII line keeps its path and line and gains the exact marker: {ascii}"
+        );
+
+        let unicode = engine
+            .run(r#"return tools.grep("needle", "unicode.txt");"#, &caps)
+            .expect("tools.grep should succeed");
+        let parsed_unicode: serde_json::Value = serde_json::from_str(&unicode).unwrap();
+        let expected_unicode =
+            format!("{multibyte_prefix}... [line truncated to 2000 bytes; +103 bytes]");
+        assert_eq!(
+            parsed_unicode,
+            serde_json::json!([
+                { "path": "unicode.txt", "line": 1, "text": expected_unicode },
+            ]),
+            "a multi-byte line retains a valid prefix of 1,999 bytes: {unicode}"
+        );
+        assert_eq!(
+            parsed_unicode[0]["text"].as_str().unwrap().len(),
+            expected_unicode.len(),
+            "the retained prefix stops before the character crossing the limit"
+        );
+        assert_eq!(
+            expected_unicode.len(),
+            1_999 + "... [line truncated to 2000 bytes; +103 bytes]".len()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Empty/zero and malformed boundaries: a search with no match is still an
+    /// empty array, and an empty pattern still fails with the established
+    /// error, even when a run artifact contains the pattern.
+    #[test]
+    fn when_grepping_files_given_no_matches_or_empty_pattern_then_preserves_existing_results_and_error()
+     {
+        let dir = scratch_dir("grep-no-match-empty-pattern");
+        init_git_repo(&dir);
+        fs::write(dir.join("ordinary.md"), "# nothing to find here\n").unwrap();
+        fs::create_dir_all(dir.join(".ejaj/run")).unwrap();
+        fs::write(
+            dir.join(".ejaj/run/handoff.md"),
+            "needle only in artifact\n",
+        )
+        .unwrap();
+
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_only(&dir);
+
+        let no_matches = engine
+            .run(r#"return tools.grep("needle");"#, &caps)
+            .expect("a no-match search is an empty array");
+        assert_eq!(no_matches, "[]");
+
+        let empty = engine
+            .run(r#"return tools.grep("");"#, &caps)
+            .expect_err("an empty pattern stays an error");
+        assert!(
+            empty.starts_with("[ERROR: execute_script failed]"),
+            "the error keeps its established shape: {empty}"
+        );
+        assert!(
+            empty.contains("`pattern` must not be empty"),
+            "the empty-pattern error is unchanged: {empty}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Maximum boundary: a matched line of exactly 2,000 UTF-8 bytes is
+    /// returned unchanged and carries no truncation marker.
+    #[test]
+    fn when_grepping_files_given_line_exactly_two_thousand_bytes_then_returns_unmarked_text() {
+        let dir = scratch_dir("grep-line-cap-exact");
+        init_git_repo(&dir);
+        let exactly = format!("needle {}", "e".repeat(1_993));
+        assert_eq!(exactly.len(), 2_000);
+        fs::write(dir.join("exact.txt"), format!("{exactly}\n")).unwrap();
+
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_only(&dir);
+
+        let out = engine
+            .run(r#"return tools.grep("needle");"#, &caps)
+            .expect("tools.grep should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                { "path": "exact.txt", "line": 1, "text": exactly },
+            ])
+        );
+        assert!(
+            !parsed[0]["text"].as_str().unwrap().contains("truncated"),
+            "a line at the cap is not marked: {out}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Contract/invariant: each returned record is capped on its own, in the
+    /// exact Git order, while the `{ path, line, text }` fields stay stable.
+    #[test]
+    fn when_grepping_files_given_multiple_long_matches_then_caps_each_line_and_preserves_git_order()
+    {
+        let dir = scratch_dir("grep-line-cap-multiple");
+        init_git_repo(&dir);
+
+        let first = format!("needle {}", "a".repeat(2_493));
+        assert_eq!(first.len(), 2_500);
+        let second = format!("needle {}", "b".repeat(2_993));
+        assert_eq!(second.len(), 3_000);
+        fs::write(dir.join("a.txt"), format!("{first}\n{second}\n")).unwrap();
+
+        let exact = format!("needle {}", "c".repeat(1_993));
+        assert_eq!(exact.len(), 2_000);
+        fs::write(dir.join("b.txt"), format!("{exact}\nneedle short\n")).unwrap();
+
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_only(&dir);
+
+        let out = engine
+            .run(r#"return tools.grep("needle");"#, &caps)
+            .expect("tools.grep should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let first_prefix = format!("needle {}", "a".repeat(1_993));
+        let expected_first =
+            format!("{first_prefix}... [line truncated to 2000 bytes; +500 bytes]");
+        let second_prefix = format!("needle {}", "b".repeat(1_993));
+        let expected_second =
+            format!("{second_prefix}... [line truncated to 2000 bytes; +1000 bytes]");
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                { "path": "a.txt", "line": 1, "text": expected_first },
+                { "path": "a.txt", "line": 2, "text": expected_second },
+                { "path": "b.txt", "line": 1, "text": exact },
+                { "path": "b.txt", "line": 2, "text": "needle short" },
+            ]),
+            "each line is capped independently in Git order: {out}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Malformed/invalid payload boundary: traversal and absolute globs are
+    /// rejected before `git grep` runs.
+    #[test]
+    fn when_grepping_files_given_invalid_glob_then_rejects_traversal() {
+        let dir = scratch_dir("grep-invalid-glob");
+        init_git_repo(&dir);
+        fs::write(dir.join("ordinary.txt"), "needle here\n").unwrap();
+
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_only(&dir);
+
+        let traversal = engine
+            .run(r#"return tools.grep("needle", "../outside/*.txt");"#, &caps)
+            .expect_err("a parent-traversal glob must be rejected");
+        assert!(
+            traversal.starts_with("[ERROR: execute_script failed]"),
+            "unexpected error shape: {traversal}"
+        );
+        assert!(
+            traversal.contains("may not reference parent or root directories"),
+            "the traversal glob must name its rejection: {traversal}"
+        );
+
+        let absolute = engine
+            .run(r#"return tools.grep("needle", "/etc/*.txt");"#, &caps)
+            .expect_err("an absolute glob must be rejected");
+        assert!(
+            absolute.contains("must be relative to the project root"),
+            "the absolute glob must name its rejection: {absolute}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: the existing grep contracts survive the line cap -- empty
+    /// pattern errors, null and omitted globs search the same tree, glob
+    /// validation still rejects traversal, `.ejaj/` artifacts stay filtered,
+    /// and the result count remains capped at 1,000.
+    #[test]
+    fn when_grepping_files_given_empty_pattern_null_or_omitted_glob_and_path_filters_then_preserves_existing_contracts()
+     {
+        let dir = scratch_dir("grep-existing-contracts");
+        init_git_repo(&dir);
+        fs::write(dir.join("a.rs"), "fn main() {}\n// findme in rust\n").unwrap();
+        fs::write(dir.join("b.md"), "# findme in docs\n").unwrap();
+        fs::create_dir_all(dir.join(".ejaj/run")).unwrap();
+        fs::write(dir.join(".ejaj/run/handoff.md"), "findme in artifact\n").unwrap();
+        let many: String = (1..=1_001)
+            .map(|line| format!("needle line {line}\n"))
+            .collect();
+        fs::write(dir.join("many.txt"), many).unwrap();
+
+        let engine = QuickJsEngine::new();
+        let caps = Capabilities::read_only(&dir);
+
+        let omitted = engine
+            .run(r#"return tools.grep("findme");"#, &caps)
+            .expect("tools.grep without a glob should succeed");
+        let parsed_omitted: serde_json::Value = serde_json::from_str(&omitted).unwrap();
+        assert_eq!(
+            parsed_omitted,
+            serde_json::json!([
+                { "path": "a.rs", "line": 2, "text": "// findme in rust" },
+                { "path": "b.md", "line": 1, "text": "# findme in docs" },
+            ]),
+            "run artifacts stay filtered from the whole-tree search: {omitted}"
+        );
+
+        let null_glob = engine
+            .run(r#"return tools.grep("findme", null);"#, &caps)
+            .expect("a null glob should behave like an omitted glob");
+        assert_eq!(null_glob, omitted, "a null glob changes nothing");
+
+        let narrowed = engine
+            .run(r#"return tools.grep("findme", "*.rs");"#, &caps)
+            .expect("an ordinary glob should narrow the search");
+        let parsed_narrowed: serde_json::Value = serde_json::from_str(&narrowed).unwrap();
+        assert_eq!(
+            parsed_narrowed,
+            serde_json::json!([
+                { "path": "a.rs", "line": 2, "text": "// findme in rust" },
+            ])
+        );
+
+        let artifact_glob = engine
+            .run(r#"return tools.grep("findme", ".ejaj/**");"#, &caps)
+            .expect("an explicit artifact glob should succeed");
+        assert_eq!(artifact_glob, "[]", "an artifact glob reveals nothing");
+
+        let empty = engine
+            .run(r#"return tools.grep("");"#, &caps)
+            .expect_err("an empty pattern stays an error");
+        assert!(
+            empty.contains("`pattern` must not be empty"),
+            "the empty-pattern error is unchanged: {empty}"
+        );
+
+        let invalid = engine
+            .run(r#"return tools.grep("findme", "../outside/*.txt");"#, &caps)
+            .expect_err("a traversal glob stays an error");
+        assert!(
+            invalid.contains("may not reference parent or root directories"),
+            "the glob-validation error is unchanged: {invalid}"
+        );
+
+        let limited = engine
+            .run(
+                r#"
+                const matches = tools.grep("needle");
+                return {
+                    count: matches.length,
+                    firstLine: matches[0].line,
+                    firstText: matches[0].text,
+                    lastLine: matches[matches.length - 1].line,
+                };
+                "#,
+                &caps,
+            )
+            .expect("tools.grep over the limit should succeed");
+        let parsed_limited: serde_json::Value = serde_json::from_str(&limited).unwrap();
+        assert_eq!(parsed_limited["count"], serde_json::json!(1_000));
+        assert_eq!(parsed_limited["firstLine"], serde_json::json!(1));
+        assert_eq!(
+            parsed_limited["firstText"],
+            serde_json::json!("needle line 1")
+        );
+        assert_eq!(parsed_limited["lastLine"], serde_json::json!(1_000));
 
         let _ = fs::remove_dir_all(&dir);
     }
