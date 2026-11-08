@@ -15,7 +15,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
 | [`01-plan-and-spec-prompts.md`](./.plans/01-plan-and-spec-prompts.md) | [x] Complete (T02, T03 done) | `T02`, `T03` | `src/prompts/plan.rs`, `src/prompts/spec.rs` |
 | [`PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md`](./.plans/PROPOSAL-9-rollback-failed-ticket-and-cap-scope.md) | [x] Complete (T04, T06 done) | `T04`, `T06` | `src/prompts/code.rs`, `src/prompts/tickets.rs` |
 | [`02-tickets-and-triage-prompts.md`](./.plans/02-tickets-and-triage-prompts.md) | [x] Complete (T02, T06, T07 done) | `T02`, `T06`, `T07` | `src/prompts/tickets.rs`, `src/prompts/triage.rs` |
-| [`PROPOSAL-14-pre-planned-task-fast-track.md`](./.plans/PROPOSAL-14-pre-planned-task-fast-track.md) | `[ ]` Pending | `T19` | `src/prompts/plan.rs`, `tests/prompt_contract.rs` |
+| [`PROPOSAL-14-pre-planned-task-fast-track.md`](./.plans/PROPOSAL-14-pre-planned-task-fast-track.md) | [x] Complete (T19 done) | `T19` | `src/prompts/plan.rs`, `tests/prompt_contract.rs` |
 | [`PROPOSAL-1-triage-done-state.md`](./.plans/PROPOSAL-1-triage-done-state.md) | `[ ]` Pending (T07 done; T08 pending) | `T07`, `T08` | `src/triage.rs`, `src/prompts/triage.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-5-forward-triage-brief-to-code-agent.md`](./.plans/PROPOSAL-5-forward-triage-brief-to-code-agent.md) | `[ ]` Pending | `T09` | `src/triage.rs`, `src/orchestrator.rs`, `src/pipeline.rs` |
 | [`PROPOSAL-7-gate-failure-excerpt-in-queue-report.md`](./.plans/PROPOSAL-7-gate-failure-excerpt-in-queue-report.md) | `[ ]` Pending | `T10` | `src/orchestrator.rs`, `src/pipeline.rs` |
@@ -59,7 +59,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
       ├──► [x] [T07] PROPOSAL-1a + 02: TriageState::Done model & TRIAGE_SYSTEM_PROMPT (src/triage.rs, src/prompts/triage.rs)
       │          │
       │          ▼
-      │        [ ] [T19] PROPOSAL-14: Fast-track pre-planned & tracker tasks in PLAN_SYSTEM_PROMPT (src/prompts/plan.rs, tests/prompt_contract.rs)
+      │        [x] [T19] PROPOSAL-14: Fast-track pre-planned & tracker tasks in PLAN_SYSTEM_PROMPT (src/prompts/plan.rs, tests/prompt_contract.rs)
       │          │
       │          ▼
       │        [ ] [T08] PROPOSAL-1b: Pipeline pre-completion & unblocking for Done tickets (src/pipeline.rs)
@@ -178,7 +178,7 @@ Tracks the implementation status of all specifications and proposals in [`.plans
     - In `TODO.md`, mark `T07` complete (`[x]`) in the DAG and ordered backlog, mark `02-tickets-and-triage-prompts.md` `[x] Complete (T02, T06, T07 done)`, and update `PROPOSAL-1-triage-done-state.md` to `[ ]` Pending (T07 done; T08 pending) right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib triage && cargo test --lib prompts::triage && cargo test --lib tools && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T19` — Fast-Track Pre-Planned & Tracker-Backed Tasks in `PLAN_SYSTEM_PROMPT`**
+- [x] **`T19` — Fast-Track Pre-Planned & Tracker-Backed Tasks in `PLAN_SYSTEM_PROMPT`**
   - `depends_on`: `["T03", "T07"]`
   - `unblocks`: `["T08"]`
   - `plans`: [`.plans/PROPOSAL-14-pre-planned-task-fast-track.md`](./.plans/PROPOSAL-14-pre-planned-task-fast-track.md)

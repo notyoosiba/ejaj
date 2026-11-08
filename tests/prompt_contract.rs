@@ -118,6 +118,40 @@ fn when_proposing_given_existing_behavior_then_plan_prompt_requires_reuse_extend
     ]);
 }
 
+/// Core entry-point behavior and malformed-input boundary: a request that
+/// references a repository task, tracker, or proposal document is fast-tracked
+/// only when reconnaissance confirms it against the live code. The documented
+/// target module, modification approach, and constraints count as settled, and
+/// the agent hands off with `finish_plan` in Turn 1 without asking `Q1`. A
+/// missing or uninspectable fact, a contradiction, an unstated blocking
+/// prerequisite, or task-selection ambiguity stays unsettled and becomes a
+/// question instead of a handoff that depends on it.
+#[test]
+fn when_starting_given_preplanned_task_then_plan_prompt_treats_documented_choices_as_settled_and_hands_off()
+ {
+    assert_plan_prompt_contains(&[
+        "For a code-related request",
+        "complete that reconnaissance for every code-related request, including one that references no task document",
+        "such as `TODO.md`, `.plan/`, or `.plans/`",
+        "inspect that document and the target modules it names during reconnaissance",
+        "treat the concrete design choices, target paths, and integration mode it specifies as decisions the user has already settled",
+        "unless they contradict the live codebase",
+        "never ask the user to re-confirm an integration choice that the request or the referenced plan already specifies and the codebase supports",
+        "When the request or a referenced task, tracker, or proposal file already specifies the target module, how to extend or modify it, and the constraints to honour",
+        "read-only reconnaissance finds no contradiction with the repository",
+        "call `finish_plan` in that first turn without asking `Q1`",
+        "a missing or uninspectable referenced fact",
+        "a concrete mismatch with the live code",
+        "an unstated blocking prerequisite",
+        "uncertainty about which task is intended",
+        "is not settled",
+        "Ask the user about that blocker and wait",
+        "ask whether to reuse it, extend it or replace it whenever the request or the referenced document has not already settled that choice",
+        "The **frontier** contains only unsettled decisions that block immediate work and that the user can answer now",
+        "A genuinely unresolved blocking decision is never silently treated as settled",
+    ]);
+}
+
 /// Regression: the existing opening marker, focused-round mechanics, terminal
 /// handoff, and ordered template headings remain intact.
 #[test]
