@@ -1,5 +1,7 @@
 # 12: HTTP 408 Timeout Retry, Quota-vs-Rate-Limit Classification, and 429 Retry-After Hints (`src/retry.rs`)
 
+> **Status:** `[x]` Complete (T13 done) — HTTP `408` retry, permanent `429`/`2xx` quota fast-fail with the `token_quota_exceeded` exception, `429` retry-delay hints, and saturating capped backoff are implemented and unit-tested in `src/retry.rs`.
+
 > **Note:** HTTP `529` (Anthropic Overloaded), `200..=299` embedded API errors, and `CallError::Malformed` responses starting with `"the response carried no usable content"` are **already implemented and tested** in `src/retry.rs:38-52` and `src/llm/anthropic.rs`.
 
 This document specifies the remaining upgrades to `should_retry` in `src/retry.rs`:
