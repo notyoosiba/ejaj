@@ -208,7 +208,12 @@ Follow a strict Red-First TDD loop for this ticket:\n\
 every test before implementation: for each slice, author the relevant outside-in expectation from \
 `## Test Expectations` using exact `when_<action>_given_<context>_then_<outcome>` test titles \
 (never put internal function or class names in test titles) and exercise behavior through the \
-public seam rather than requiring tests of internal helpers.\n\
+public seam rather than requiring tests of internal helpers. Batch the initial reconnaissance into 1–2 \
+`execute_script` calls before the first slice. When several `## Test Expectations` entries exercise the \
+same public seam and test harness, batch those test functions and their shared fixture and helper updates \
+into one slice edit rather than a separate edit-and-compile cycle per test function; keep test functions \
+that use unrelated seams in separate slices, and never write every test before implementing the first \
+slice.\n\
 2. Keep internal helpers private: do not widen `pub` visibility on internal helpers solely for \
 tests. When behavior is consolidated behind a deeper seam, replace tests coupled to the removed \
 internal behavior with seam-level tests rather than retaining both sets.\n\
@@ -231,7 +236,11 @@ behavior, that passing result is sufficient evidence to proceed with the product
 implementation: do not require or manufacture an artificial red failure, and never break, \
 sabotage, stash, or back up production files to force one.\n\
 9. After implementing the production code, run the ticket's `verification_gate` with `bash` until \
-it exits successfully.\n\
+it exits successfully. Once the production change and the new tests pass, also run the full relevant \
+test target -- the complete test binary or suite such as `cargo test --test <binary>`, or the ticket's \
+`verification_gate` when that gate is the full target suite -- before any tracker edits: a focused test \
+selection alone does not satisfy that early full-target run, and this early run supplements rather than \
+replaces the focused Red/Green checks and the final `verification_gate`.\n\
 10. Complete all source and test changes before tracker edits. Make any needed `TODO.md` and \
 `.plan/*.md` tracker edits last, immediately before running the verification gate. If the gate \
 fails, revert those tracker edits first, preserve the production and test changes, and then \
@@ -908,6 +917,55 @@ mod tests {
                 "Edge-Case Tables across Empty/Zero/Nil, Minimum valid, Maximum limit, Malformed/Invalid, and Unauthorized/Forbidden boundaries",
                 "Contract & Invariant Checks",
                 "Regression Tests",
+            ],
+        );
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
+    }
+
+    /// Core entry-point behavior: expectations that exercise the same public
+    /// seam and harness become one cohesive slice edit, unrelated seams stay
+    /// apart, implementation still comes first, and reconnaissance is batched.
+    #[test]
+    fn when_batching_test_expectations_given_a_shared_seam_then_edits_them_together() {
+        let rendered = rendered_ticket(vec![
+            "when_running_the_suite_given_repair_then_all_tests_pass",
+            "when_running_the_suite_given_a_boundary_then_reports_the_case",
+        ]);
+        let kickoff = ticket_kickoff(&rendered);
+
+        assert_contains_all(
+            &kickoff,
+            &[
+                "Batch the initial reconnaissance into 1–2 `execute_script` calls",
+                "batch those test functions and their shared fixture and helper updates into one slice edit",
+                "keep test functions that use unrelated seams in separate slices",
+                "never write every test before implementing the first slice",
+            ],
+        );
+        assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);
+    }
+
+    /// Regression: once the production change and new tests pass, the complete
+    /// relevant target runs before tracker edits, supplementing the focused
+    /// Red/Green checks and the final gate without replacing them.
+    #[test]
+    fn when_running_implementation_checks_given_new_tests_pass_then_checks_the_full_target_before_tracker_edits()
+     {
+        let rendered = rendered_ticket(vec!["when_a_given_b_then_c"]);
+        let kickoff = ticket_kickoff(&rendered);
+
+        assert_contains_all(
+            &kickoff,
+            &[
+                "Batch the initial reconnaissance into 1–2 `execute_script` calls",
+                "run the full relevant test target",
+                "cargo test --test <binary>",
+                "before any tracker edits",
+                "a focused test selection alone does not satisfy that early full-target run",
+                "supplements rather than replaces the focused Red/Green checks and the final `verification_gate`",
+                "Complete all source and test changes before tracker edits",
+                "`TODO.md` and `.plan/*.md` tracker edits last, immediately before running the verification gate",
+                "revert those tracker edits first",
             ],
         );
         assert_disciplined_kickoff_preserves_ticket(&kickoff, &rendered);

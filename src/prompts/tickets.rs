@@ -67,7 +67,14 @@ ticket is an object with exactly these fields:
   keeper categories (Core Entry-Point Behaviors, Edge-Case Tables, Contract & Invariant Checks,
   Regression Tests) and the 5-dimension boundary matrix (Empty/Zero/Nil, Minimum valid boundary,
   Maximum limit/Upper boundary, Malformed/Invalid payload, Boundary unauthorized/Forbidden access),
-  with strict edge-only mocking (never mock internal classes, services or local persistence). Write test expectations only for executable source-code behavior -- never for documentation, `README.md`, `TODO.md`, `.plan/`/`.plans/` tracker files, or other human-facing prose. Every ticket that changes executable source code must carry at least one non-blank entry in `test_expectations`, and every substantive entry must name its test in lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>` form (without
+  with strict edge-only mocking (never mock internal classes, services or local persistence).
+  Consolidate the applicable boundary cases from that matrix into table-driven `Edge-Case Tables` test functions
+  rather than emitting separate duplicate test functions for the same behavior, and omit a dimension or keeper
+  category that does not apply: never require an irrelevant dimension or keeper category to be tested. Keep each
+  ticket to a compact set of distinct test functions -- typically 3–6 `when_<action>_given_<context>_then_<outcome>` tests --
+  and treat that as typical sizing guidance rather than a hard minimum or a hard upper bound,
+  splitting into an additional ticket when the feature genuinely needs more distinct test functions.
+  Write test expectations only for executable source-code behavior -- never for documentation, `README.md`, `TODO.md`, `.plan/`/`.plans/` tracker files, or other human-facing prose. Every ticket that changes executable source code must carry at least one non-blank entry in `test_expectations`, and every substantive entry must name its test in lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>` form (without
   internal function or class names in the test title). A documentation-only or markdown-only ticket that modifies only documentation or markdown files and no executable source code may pass `test_expectations: []`, which renders as `None.`; test expectations are required only for executable source-code behavior.
 - `verification_gate`: the exact terminal command that must exit 0.
 
@@ -168,6 +175,45 @@ mod tests {
             "more than one test file is acceptable when one focused journey or a shared verification gate requires it",
             "Batch small same-shape edits into one ticket only when they share one verification gate",
         ]);
+    }
+
+    /// Edge-case table: the applicable Empty/Zero/Nil, Minimum valid,
+    /// Maximum limit/Upper boundary, Malformed/Invalid payload, and
+    /// Unauthorized/Forbidden cases consolidate into table-driven
+    /// `Edge-Case Tables` functions instead of duplicate per-dimension
+    /// functions, irrelevant dimensions stay optional, and the
+    /// executable-source non-blank rule survives.
+    #[test]
+    fn when_consolidating_boundary_expectations_given_applicable_cases_then_groups_them_as_edge_case_tables()
+     {
+        assert_prompt_contains(&[
+            "Consolidate the applicable boundary cases from that matrix into table-driven `Edge-Case Tables` test functions",
+            "rather than emitting separate duplicate test functions for the same behavior",
+            "never require an irrelevant dimension or keeper category to be tested",
+            "Empty/Zero/Nil",
+            "Minimum valid boundary",
+            "Maximum limit/Upper boundary",
+            "Malformed/Invalid payload",
+            "Boundary unauthorized/Forbidden access",
+            "Every ticket that changes executable source code must carry at least one non-blank entry in `test_expectations`",
+        ]);
+    }
+
+    /// Contract and invariant check: typically 3–6 distinct BDD functions is
+    /// advisory sizing, neither a hard minimum nor a hard upper bound, and a
+    /// genuinely larger feature earns another ticket.
+    #[test]
+    fn when_sizing_ticket_expectations_given_distinct_functions_then_keeps_guidance_advisory_and_allows_a_split()
+     {
+        assert_prompt_contains(&[
+            "typically 3–6 `when_<action>_given_<context>_then_<outcome>` tests",
+            "typical sizing guidance rather than a hard minimum or a hard upper bound",
+            "splitting into an additional ticket when the feature genuinely needs more distinct test functions",
+        ]);
+        assert!(
+            !TICKETS_SYSTEM_PROMPT.contains("maximum number of test expectations"),
+            "the sizing rule must stay advisory, not a hard cap"
+        );
     }
 
     /// Empty/zero boundary: without blockers or consumers the prompt requires
