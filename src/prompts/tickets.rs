@@ -17,9 +17,13 @@ Turn the specification below into an ordered set of tickets without prompting th
    through every layer it touches -- a tracer bullet that is independently verifiable on its own.
    Never slice by layer or by module: a ticket that changes only one module, only one file or only
    one layer is not a ticket, because the behaviour is not verifiable until some later ticket
-   lands. Size each ticket for one fresh context window. Order the tickets in implementation order
+   lands. Scope each ticket to at most one primary user journey or entry point and size it for one
+   fresh context window. Prefer a focused set of test expectations -- typically 3–8 BDD cases in one test file -- instead of bundling 15 or more expectations across multiple suites.
+   Treat the test count and single-file preference as typical sizing guidance, not an absolute prohibition: more than one test file is acceptable when one focused journey or a shared verification gate requires it.
+   Batch small same-shape edits into one ticket only when they share one verification gate.
+   Order the tickets in implementation order
    and name the dependency edges between them: a ticket that builds on another names that id in its
-   `blocked_by`. Fold `README.md`, `TODO.md`, documentation, and `.plan/`/`.plans/` tracker updates into the executable-behavior ticket whose deliverable needs them; never create standalone documentation or tracker tickets for those accompanying updates.
+   `blocked_by`. Fold `README.md`, `TODO.md`, documentation, and `.plan/`/`.plans/` tracker updates into the executable-behavior ticket whose deliverable needs them; never create standalone documentation or tracker tickets for those accompanying updates. Fold setup, configuration, scaffolding, documentation, `README.md`, `TODO.md`, and `.plan/`/`.plans/` tracker updates into the behavioral ticket that needs them rather than creating standalone accompanying-work tickets.
 3. **Sequence a wide mechanical change as expand, migrate, contract:** one mechanical edit with a
    wide effect -- a rename, a signature change or a shape change that breaks many call sites at
    once -- is not a tracer bullet. Add the new form beside the old form first (the expand), then
@@ -37,6 +41,11 @@ Scope every ticket behaviourally: state the observable change the ticket makes, 
 files and modules in `prerequisites_assumed` and `scope_of_changes` so the code agent can go
 straight to them.
 
+When a ticket consumes a contract from a ticket named in its `blocked_by`, `prerequisites_assumed` must state the exact Rust module paths, type names, and complete function signatures, including every parameter type and every return type.
+When a ticket produces a contract for a ticket named in its `blocks`, `scope_of_changes` must state the exact public type names and complete function signatures, including every parameter type and every return type.
+Always distinguish the consumed prerequisite contract from the produced scope contract. Do not repeat expand-migrate-contract sequencing here: Step 3 remains its sole source.
+Do not invent an interface when the ticket has no applicable `blocked_by` dependency or no downstream `blocks` consumer; write `None.` instead.
+
 `finish_tickets` takes one required argument, `tickets`: the whole set as a JSON object. Every
 ticket is an object with exactly these fields:
 - `id`: the numbered ticket identifier, of the form `<digits>-<slugs>`, unique in the set and made
@@ -49,9 +58,11 @@ ticket is an object with exactly these fields:
   specification story it implements without paraphrasing, shortening or rewording them and without
   a leading checkbox marker.
 - `prerequisites_assumed`: what the ticket takes for granted about the tree, including the existing
-  files and modules it builds on.
+  files and modules it builds on, and, when the ticket consumes a contract, the exact consumed
+  interface described below.
 - `out_of_scope`: what this ticket must not touch.
-- `scope_of_changes`: the behaviour the ticket makes work and the target files/modules it touches.
+- `scope_of_changes`: the behaviour the ticket makes work and the target files/modules it touches,
+  and, when the ticket produces a contract, the exact produced interface described below.
 - `test_expectations`: the outside-in test cases the ticket adds or updates for executable source-code behavior, structured by the 4
   keeper categories (Core Entry-Point Behaviors, Edge-Case Tables, Contract & Invariant Checks,
   Regression Tests) and the 5-dimension boundary matrix (Empty/Zero/Nil, Minimum valid boundary,
@@ -122,3 +133,123 @@ anything.
 # Technical specification
 
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::TICKETS_SYSTEM_PROMPT;
+
+    fn assert_prompt_contains(needles: &[&str]) {
+        for needle in needles {
+            assert!(
+                TICKETS_SYSTEM_PROMPT.contains(needle),
+                "TICKETS_SYSTEM_PROMPT must contain `{needle}`"
+            );
+        }
+    }
+
+    /// Core entry-point behavior at the minimum-valid boundary: one primary
+    /// journey and a focused, typically single-file expectation set.
+    #[test]
+    fn when_slicing_tickets_given_one_primary_journey_then_prompt_requires_a_focused_ticket() {
+        assert_prompt_contains(&[
+            "Scope each ticket to at most one primary user journey or entry point",
+            "typically 3–8 BDD cases in one test file",
+            "instead of bundling 15 or more expectations across multiple suites",
+        ]);
+    }
+
+    /// Maximum-limit boundary: large suites stay discouraged while the sizing
+    /// rules remain advisory, and same-shape edits batch only behind one gate.
+    #[test]
+    fn when_sizing_tickets_given_many_suites_or_one_shared_gate_then_prompt_keeps_sizing_advisory()
+    {
+        assert_prompt_contains(&[
+            "Treat the test count and single-file preference as typical sizing guidance, not an absolute prohibition",
+            "more than one test file is acceptable when one focused journey or a shared verification gate requires it",
+            "Batch small same-shape edits into one ticket only when they share one verification gate",
+        ]);
+    }
+
+    /// Empty/zero boundary: without blockers or consumers the prompt requires
+    /// no invented interface, so both contracts stay conditional.
+    #[test]
+    fn when_describing_dependencies_given_no_blockers_or_consumers_then_prompt_requires_no_invented_interface()
+     {
+        assert_prompt_contains(&[
+            "When a ticket consumes a contract from a ticket named in its `blocked_by`",
+            "When a ticket produces a contract for a ticket named in its `blocks`",
+            "Do not invent an interface when the ticket has no applicable `blocked_by` dependency or no downstream `blocks` consumer",
+        ]);
+    }
+
+    /// Contract and invariant check: consumed prerequisites and produced scope
+    /// contracts both demand exact names and complete signatures.
+    #[test]
+    fn when_describing_dependencies_given_blocker_and_downstream_tickets_then_prompt_requires_exact_signatures()
+     {
+        assert_prompt_contains(&[
+            "`prerequisites_assumed` must state the exact Rust module paths, type names, and complete function signatures",
+            "including every parameter type and every return type",
+            "`scope_of_changes` must state the exact public type names and complete function signatures",
+            "distinguish the consumed prerequisite contract from the produced scope contract",
+        ]);
+    }
+
+    /// Regression: the handoff schema, ordered workflow, source-only test
+    /// policy, prefactoring rule, and Step 3 sequencing remain intact.
+    #[test]
+    fn when_preserving_ticket_guidance_given_prompt_contracts_then_schema_workflow_and_test_policy_remain_unchanged()
+     {
+        assert_prompt_contains(&[
+            "Turn the specification below into an ordered set of tickets without prompting the user.",
+            "## Workflow",
+            "1. **Inspect the codebase (read-only) with `execute_script`:**",
+            "5. **Hand over:** call `finish_tickets` with the whole set.",
+            "with exactly these fields:",
+            "test expectations are required only for executable source-code behavior",
+            "Every ticket that changes executable source code must carry at least one non-blank entry in `test_expectations`",
+            "lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>` form",
+            "A documentation-only or markdown-only ticket that modifies only documentation or markdown files and no executable source code may pass `test_expectations: []`, which renders as `None.`",
+            "Use a narrow test selection (`cargo test <module>::tests`)",
+            "**Look for prefactoring first:** make the change easy, then make the easy change.",
+            "**Sequence a wide mechanical change as expand, migrate, contract:**",
+        ]);
+
+        const FIELDS: [&str; 11] = [
+            "id",
+            "blocked_by",
+            "blocks",
+            "title",
+            "objective",
+            "acceptance_criteria",
+            "prerequisites_assumed",
+            "out_of_scope",
+            "scope_of_changes",
+            "test_expectations",
+            "verification_gate",
+        ];
+        let fields_start = TICKETS_SYSTEM_PROMPT
+            .find("with exactly these fields:")
+            .expect("the handoff schema must stay introduced");
+        let fields_end = TICKETS_SYSTEM_PROMPT
+            .find("The `verification_gate` must demonstrate")
+            .expect("the verification-gate guidance must follow the schema");
+        let field_block = &TICKETS_SYSTEM_PROMPT[fields_start..fields_end];
+        let defined: Vec<&str> = field_block
+            .lines()
+            .filter_map(|line| line.strip_prefix("- `"))
+            .filter_map(|rest| rest.split_once("`: ").map(|(name, _)| name))
+            .collect();
+        assert_eq!(
+            defined, FIELDS,
+            "the handoff schema must keep exactly its eleven existing fields in order"
+        );
+        assert_eq!(
+            TICKETS_SYSTEM_PROMPT
+                .matches("expand, migrate, contract")
+                .count(),
+            1,
+            "Step 3 must remain the sole source of expand-migrate-contract sequencing"
+        );
+    }
+}
