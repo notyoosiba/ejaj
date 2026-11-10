@@ -2118,15 +2118,17 @@ fn missing_criteria_error(missing: &[(&str, &str)]) -> String {
     if missing.len() == 1 {
         format!(
             "[ERROR] the ticket set is missing the specification criterion for story \"{}\": \
-             \"{}\"; every criterion must appear exactly in the `acceptance_criteria` of the \
-             ticket that implements its story, so missing or altered criterion text is rejected",
+             \"{}\"; a story's criteria may appear on the ticket implementing it or across the \
+             tickets implementing its slices, and each criterion belongs only on the ticket whose \
+             scope implements it, so missing or altered criterion text is rejected",
             missing[0].0, missing[0].1
         )
     } else {
         format!(
             "[ERROR] the ticket set is missing or altered {} specification criteria: {list}; \
-             every criterion must appear exactly in the `acceptance_criteria` of the ticket that \
-             implements its story, so missing or altered criterion text is rejected",
+             a story's criteria may appear on the ticket implementing it or across the tickets \
+             implementing its slices, and each criterion belongs only on the ticket whose scope \
+             implements it, so missing or altered criterion text is rejected",
             missing.len()
         )
     }
@@ -4886,57 +4888,160 @@ None.
         );
     }
 
+    /// A ticket set whose entries each implement one slice of the story.
+    fn sliced_ticket_set(slices: Vec<Vec<&str>>) -> TicketSet {
+        TicketSet {
+            tickets: slices
+                .into_iter()
+                .enumerate()
+                .map(|(index, criteria)| Ticket {
+                    id: format!("{}-slice", index + 1),
+                    blocked_by: Vec::new(),
+                    blocks: Vec::new(),
+                    title: format!("Implement slice {}", index + 1),
+                    objective: "Implement one slice of the version story.".to_string(),
+                    acceptance_criteria: criteria.into_iter().map(str::to_string).collect(),
+                    prerequisites_assumed: "The parser builds.".to_string(),
+                    out_of_scope: Vec::new(),
+                    scope_of_changes: vec!["Add one slice.".to_string()],
+                    test_expectations: vec![
+                        "when_printing_version_given_slice_then_exits_zero".to_string(),
+                    ],
+                    verification_gate: "cargo test".to_string(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
-    fn a_missing_criterion_is_reported_with_its_text() {
+    fn when_story_criterion_is_missing_given_ticket_slices_then_explains_distribution() {
         let error = spec_to_tickets(&flag_specification(), &ticket_set(vec!["Something else."]))
             .expect_err("must be rejected");
         assert!(
-            error.contains("`--version` prints the version and exits."),
+            error.contains("is missing the specification criterion for story"),
             "{error}"
         );
         assert!(error.contains("Version output"), "{error}");
+        assert!(
+            error.contains("\"`--version` prints the version and exits.\""),
+            "{error}"
+        );
         assert!(error.contains("missing"), "{error}");
+        assert!(
+            error.contains("missing or altered criterion text is rejected"),
+            "{error}"
+        );
+        assert!(
+            error.contains(
+                "a story's criteria may appear on the ticket implementing it or across the tickets implementing its slices"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("each criterion belongs only on the ticket whose scope implements it"),
+            "{error}"
+        );
     }
 
-    /// Every missing criterion is named, each with its story.
     #[test]
-    fn every_missing_criterion_is_named() {
-        let mut specification = flag_specification();
-        specification.user_stories.push(UserStory {
-            title: "Quiet mode".to_string(),
-            requirement: "The binary stays quiet unless asked.".to_string(),
-            acceptance_criteria: vec!["No output without the verbose flag.".to_string()],
-        });
+    fn when_multiple_story_criteria_are_missing_given_ticket_slices_then_lists_each_detail() {
+        let cases = [
+            (
+                "Version output",
+                "`--version` prints the version and exits.",
+            ),
+            ("Quiet mode", "No output without the verbose flag."),
+            ("Exit status", "The process exits with status zero."),
+        ];
+        let specification = Specification {
+            user_stories: cases
+                .iter()
+                .map(|(title, criterion)| UserStory {
+                    title: title.to_string(),
+                    requirement: format!("{title} behaves as specified."),
+                    acceptance_criteria: vec![criterion.to_string()],
+                })
+                .collect(),
+            ..flag_specification()
+        };
 
         let error =
             spec_to_tickets(&specification, &ticket_set(Vec::new())).expect_err("must be rejected");
         assert!(
-            error.contains("`--version` prints the version and exits."),
+            error.contains("is missing or altered 3 specification criteria:"),
+            "{error}"
+        );
+        for (title, criterion) in cases {
+            assert!(
+                error.contains(&format!("\"{criterion}\" (story \"{title}\")")),
+                "{error}"
+            );
+        }
+        assert!(
+            error.contains("missing or altered criterion text is rejected"),
             "{error}"
         );
         assert!(
-            error.contains("No output without the verbose flag."),
+            error.contains(
+                "a story's criteria may appear on the ticket implementing it or across the tickets implementing its slices"
+            ),
             "{error}"
         );
         assert!(
-            error.contains("Quiet mode") && error.contains("Version output"),
+            error.contains("each criterion belongs only on the ticket whose scope implements it"),
             "{error}"
         );
     }
 
-    /// An altered criterion is the same failure: the exact string is absent.
     #[test]
-    fn an_altered_criterion_is_rejected() {
+    fn when_story_criterion_is_altered_given_ticket_slices_then_preserves_exact_diagnostic_details()
+    {
         let error = spec_to_tickets(
             &flag_specification(),
             &ticket_set(vec!["`--version` prints the version."]),
         )
         .expect_err("must be rejected");
+        assert!(error.contains("story \"Version output\""), "{error}");
         assert!(
-            error.contains("`--version` prints the version and exits."),
+            error.contains("\"`--version` prints the version and exits.\""),
             "{error}"
         );
         assert!(error.contains("altered"), "{error}");
+        assert!(
+            error.contains("missing or altered criterion text is rejected"),
+            "{error}"
+        );
+        assert!(
+            error.contains(
+                "a story's criteria may appear on the ticket implementing it or across the tickets implementing its slices"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("each criterion belongs only on the ticket whose scope implements it"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn when_shared_story_criteria_are_distributed_given_multiple_ticket_entries_then_coverage_passes()
+     {
+        let mut specification = flag_specification();
+        specification.user_stories[0].acceptance_criteria = vec![
+            "`--version` prints the version and exits.".to_string(),
+            "`--help` lists the version flag.".to_string(),
+        ];
+
+        assert_eq!(
+            spec_to_tickets(
+                &specification,
+                &sliced_ticket_set(vec![
+                    vec!["`--version` prints the version and exits."],
+                    vec!["`--help` lists the version flag."],
+                ])
+            ),
+            Ok(())
+        );
     }
 
     /// Additional ticket-specific criteria are permitted: they do not replace

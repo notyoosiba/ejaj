@@ -8,7 +8,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::specification::NONE;
 
@@ -177,8 +177,11 @@ impl TicketSet {
     /// entry, because blank entries carry no content; and every `test_expectations` entry that is
     /// neither blank nor the `None.` marker must name a
     /// `when_<action>_given_<context>_then_<outcome>` test. Test expectations are optional
-    /// because not every ticket has an applicable source-code test. `blocks` stays documentation
-    /// (it never affects scheduling) and no other content is judged.
+    /// because not every ticket has an applicable source-code test. Within one ticket, non-blank
+    /// `acceptance_criteria` entries must be unique after trimming and collapsing every run of
+    /// whitespace to one space; the comparison is case- and punctuation-sensitive and the later
+    /// duplicate is refused by its trimmed original text. `blocks` stays documentation (it never
+    /// affects scheduling) and no other content is judged.
     pub fn validate(&self) -> Result<(), String> {
         if self.tickets.is_empty() {
             return Err(
@@ -307,6 +310,20 @@ impl TicketSet {
                      non-blank entry so the code agent knows what to do"
                 ));
             }
+            let mut seen_criteria: HashSet<String> = HashSet::new();
+            for criterion in &ticket.acceptance_criteria {
+                let original = criterion.trim();
+                if original.is_empty() {
+                    continue;
+                }
+                if !seen_criteria.insert(normalize_criterion(original)) {
+                    return Err(format!(
+                        "[ERROR] ticket `{id}` repeats an `acceptance_criteria` entry: \"{original}\"; \
+                         remove the duplicate criterion so each entry in a ticket is unique"
+                    ));
+                }
+            }
+
             let substantive_tests = ticket
                 .test_expectations
                 .iter()
@@ -385,6 +402,13 @@ fn normalize_content(text: &str) -> String {
         .map(str::to_lowercase)
         .collect::<Vec<String>>()
         .join(" ")
+}
+
+/// Fold one acceptance criterion for duplicate detection: trim, then collapse every run of
+/// whitespace to a single space. Case and punctuation are preserved, so only whitespace
+/// differences make two non-blank criteria equal.
+fn normalize_criterion(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
 
 /// Find the back edge that closes a cycle among the `blocked_by` edges, if there is one.
@@ -1129,6 +1153,96 @@ cargo test tickets
         set.tickets[0].test_expectations = vec![
             "`when_parsing_set_given_valid_json_then_returns_ok` in `src/tickets.rs`.".to_string(),
         ];
+        assert_eq!(set.validate(), Ok(()));
+    }
+
+    /// A later criterion that repeats an earlier one after trimming and collapsing every
+    /// whitespace run is refused: the error names the trimmed ticket id, the field, the later
+    /// entry's trimmed original text and the removal that restores uniqueness.
+    #[test]
+    fn when_ticket_repeats_a_criterion_given_collapsed_whitespace_then_rejects_with_ticket_and_criterion()
+     {
+        let mut set = valid_set();
+        set.tickets[0].id = "  1-first  ".to_string();
+        set.tickets[0].acceptance_criteria = vec![
+            "Add the   parser.".to_string(),
+            "  Add\tthe parser.  ".to_string(),
+        ];
+        let error = set.validate().expect_err("must not validate");
+        let expected = concat!(
+            "[ERROR] ticket `1-first` repeats an `acceptance_criteria` entry: \"Add\tthe parser.\"; ",
+            "remove the duplicate criterion so each entry in a ticket is unique"
+        );
+        assert_eq!(error, expected);
+    }
+
+    /// Blank entries carry no criterion, so repeated empty or whitespace-only entries never look
+    /// like duplicates; and the existing all-content-blank rejection stays in force.
+    #[test]
+    fn when_ticket_has_blank_criteria_given_duplicate_check_then_ignores_blanks() {
+        for blank_criteria in [
+            vec![String::new(), String::new()],
+            vec!["   ".to_string(), "   ".to_string()],
+            vec!["\t".to_string(), "\n".to_string()],
+            vec![String::new(), "   ".to_string(), "\t\n ".to_string()],
+        ] {
+            let mut set = valid_set();
+            set.tickets[0].acceptance_criteria = blank_criteria.clone();
+            assert_eq!(
+                set.validate(),
+                Ok(()),
+                "blank criteria {blank_criteria:?} must not be duplicates"
+            );
+        }
+
+        let mut set = valid_set();
+        set.tickets[0].out_of_scope.clear();
+        set.tickets[0].scope_of_changes.clear();
+        set.tickets[0].test_expectations.clear();
+        set.tickets[0].acceptance_criteria =
+            vec![String::new(), "   ".to_string(), "\n".to_string()];
+        let error = set.validate().expect_err("must not validate");
+        assert!(error.contains("1-first"), "{error}");
+        assert!(error.contains("no content"), "{error}");
+    }
+
+    /// One criterion, many distinct criteria, case-only or punctuation-only differences, and the
+    /// same normalized criterion on separate tickets are all accepted: uniqueness is case-
+    /// sensitive, punctuation-sensitive and scoped to one ticket, with no upper limit.
+    #[test]
+    fn when_ticket_criteria_differ_given_case_punctuation_or_ticket_scope_then_accepts_them() {
+        for criteria in [
+            vec!["The parser runs.".to_string()],
+            vec![
+                "The parser runs.".to_string(),
+                "The ticket renders.".to_string(),
+                "Criterion number 3.".to_string(),
+            ],
+            vec![
+                "The parser runs.".to_string(),
+                "The Parser runs.".to_string(),
+            ],
+            vec![
+                "The parser runs.".to_string(),
+                "The parser runs!".to_string(),
+                "The parser, runs.".to_string(),
+            ],
+            (0..64)
+                .map(|index| format!("Criterion number {index}."))
+                .collect::<Vec<String>>(),
+        ] {
+            let mut set = valid_set();
+            set.tickets[0].acceptance_criteria = criteria.clone();
+            assert_eq!(
+                set.validate(),
+                Ok(()),
+                "criteria {criteria:?} must be accepted"
+            );
+        }
+
+        let mut set = valid_set();
+        set.tickets[0].acceptance_criteria = vec!["  The shared criterion.  ".to_string()];
+        set.tickets[1].acceptance_criteria = vec!["The\tshared   criterion.".to_string()];
         assert_eq!(set.validate(), Ok(()));
     }
 }

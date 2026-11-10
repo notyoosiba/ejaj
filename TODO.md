@@ -10,7 +10,7 @@ Tracks the implementation status of active proposals in [`.plans/`](./.plans/REA
 | --- | --- | --- | --- |
 | [`PROPOSAL-17-high-signal-bash-failure-digest.md`](./.plans/PROPOSAL-17-high-signal-bash-failure-digest.md) | `[x]` Complete (T20 done) | `T20` | `src/tools.rs` |
 | [`PROPOSAL-16-ticket-test-cap-and-batched-tdd.md`](./.plans/PROPOSAL-16-ticket-test-cap-and-batched-tdd.md) | `[x]` Complete (T21 done) | `T21` | `src/prompts/tickets.rs`, `src/prompts/code.rs` |
-| [`PROPOSAL-15-ticket-criteria-validation.md`](./.plans/PROPOSAL-15-ticket-criteria-validation.md) | `[ ]` Pending | `T22` | `src/tickets.rs`, `src/tools.rs` |
+| [`PROPOSAL-15-ticket-criteria-validation.md`](./.plans/PROPOSAL-15-ticket-criteria-validation.md) | `[x]` Complete (T22 done) | `T22` | `src/tickets.rs`, `src/tools.rs` |
 | [`PROPOSAL-18-spec-and-tickets-story-slicing.md`](./.plans/PROPOSAL-18-spec-and-tickets-story-slicing.md) | `[ ]` Pending | `T23` | `src/prompts/spec.rs`, `src/prompts/tickets.rs`, `tests/prompt_contract.rs` |
 | [`PROPOSAL-19-triage-slice-criteria-narrowing.md`](./.plans/PROPOSAL-19-triage-slice-criteria-narrowing.md) | `[ ]` Pending | `T24` | `src/prompts/triage.rs`, `tests/prompt_contract.rs` |
 
@@ -22,7 +22,7 @@ The pending tasks form a strictly ordered, serialized pipeline designed to stay 
 
 1. **`T20` (Diagnostics First) — `[x]` Complete (T20 done):** Hardens `form_bash_digest` in `src/tools.rs` so any test or compiler failure in subsequent tasks receives an immediate, high-signal summary at the top of the digest instead of being buried under passing-test `[ERROR]` logs.
 2. **`T21` (Discipline Second) — `[x]` Complete (T21 done):** Caps per-ticket test functions at 3–6 in `TICKETS_SYSTEM_PROMPT` and introduces batched TDD / early full-suite execution in `CODE_TDD_DISCIPLINE` so ticket execution avoids tool-call expansion.
-3. **`T22` (Data Model Third):** Enforces duplicate criterion rejection in `TicketSet::validate` and clarifies multi-ticket error messaging in `missing_criteria_error` before phase prompts teach models the rule.
+3. **`T22` (Data Model Third) — `[x]` Complete (T22 done):** Enforces duplicate criterion rejection in `TicketSet::validate` and clarifies multi-ticket error messaging in `missing_criteria_error` before phase prompts teach models the rule.
 4. **`T23` (Story Slicing Prompts Fourth):** Guides upstream authoring in `SPEC_SYSTEM_PROMPT` (vertical slices, explicit tracker paths) and `TICKETS_SYSTEM_PROMPT` (authorized tracker folding, verbatim slice criteria distribution).
 5. **`T24` (Triage Brief Narrowing Fifth):** Guides downstream triage in `TRIAGE_SYSTEM_PROMPT` to narrow `Agent Brief` criteria for shared-story slices without blocking with `needs-info`.
 
@@ -33,7 +33,7 @@ The pending tasks form a strictly ordered, serialized pipeline designed to stay 
 [T21] [x] Complete (T21 done) PROPOSAL-16: Consolidate boundary test_expectations & batch TDD slice runs (src/prompts/{tickets,code}.rs)
   │
   ▼
-[T22] PROPOSAL-15: Duplicate criteria validation in TicketSet::validate & multi-ticket error (src/{tickets,tools}.rs)
+[T22] [x] Complete (T22 done) PROPOSAL-15: Duplicate criteria validation in TicketSet::validate & multi-ticket error (src/{tickets,tools}.rs)
   │
   ▼
 [T23] PROPOSAL-18: Story slicing, per-ticket criteria scoping & authorized tracker folding (src/prompts/{spec,tickets}.rs)
@@ -68,7 +68,7 @@ The pending tasks form a strictly ordered, serialized pipeline designed to stay 
     - In `TODO.md` only (do not edit `.plans/PROPOSAL-16-ticket-test-cap-and-batched-tdd.md`), mark `T21` complete (`[x]`) in the DAG and ordered backlog and update the `PROPOSAL-16-ticket-test-cap-and-batched-tdd.md` row in the `TODO.md` status matrix to `[x] Complete (T21 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib prompts::tickets && cargo test --lib prompts::code && cargo test --lib prompts::review && cargo test --test prompt_contract && cargo test --test llm_wire && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T22` — Duplicate Criteria Validation in `TicketSet::validate` & Multi-Ticket Error Format**
+- [x] **`T22` — Duplicate Criteria Validation in `TicketSet::validate` & Multi-Ticket Error Format (T22 done)**
   - `depends_on`: `["T21"]`
   - `unblocks`: `["T23"]`
   - `plans`: [`.plans/PROPOSAL-15-ticket-criteria-validation.md`](./.plans/PROPOSAL-15-ticket-criteria-validation.md)
