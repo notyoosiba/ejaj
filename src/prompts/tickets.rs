@@ -23,7 +23,7 @@ Turn the specification below into an ordered set of tickets without prompting th
    Batch small same-shape edits into one ticket only when they share one verification gate.
    Order the tickets in implementation order
    and name the dependency edges between them: a ticket that builds on another names that id in its
-   `blocked_by`. Fold `README.md`, `TODO.md`, documentation, and `.plan/`/`.plans/` tracker updates into the executable-behavior ticket whose deliverable needs them; never create standalone documentation or tracker tickets for those accompanying updates. Fold setup, configuration, scaffolding, documentation, `README.md`, `TODO.md`, and `.plan/`/`.plans/` tracker updates into the behavioral ticket that needs them rather than creating standalone accompanying-work tickets.
+   `blocked_by`. Fold `README.md`, `TODO.md`, documentation, and `.plan/`/`.plans/` tracker updates into the executable-behavior ticket whose deliverable needs them; never create standalone documentation or tracker tickets for those accompanying updates. Fold setup, configuration, scaffolding, documentation, `README.md`, `TODO.md`, and `.plan/`/`.plans/` tracker updates into the behavioral ticket that needs them rather than creating standalone accompanying-work tickets. Only fold documentation, `README.md`, `TODO.md`, or `.plan/`/`.plans/` tracker updates into a ticket when the specification itself calls for updating them; do not invent tracker or documentation tasks that the specification omits.
 3. **Sequence a wide mechanical change as expand, migrate, contract:** one mechanical edit with a
    wide effect -- a rename, a signature change or a shape change that breaks many call sites at
    once -- is not a tracer bullet. Add the new form beside the old form first (the expand), then
@@ -54,9 +54,9 @@ ticket is an object with exactly these fields:
 - `blocks`: the ids of tickets this one unblocks; documentation only, it never affects scheduling.
 - `title`: an imperative action title.
 - `objective`: the outcome in prose.
-- `acceptance_criteria`: the acceptance criteria this ticket makes true, copied from the
-  specification story it implements without paraphrasing, shortening or rewording them and without
-  a leading checkbox marker.
+- `acceptance_criteria`: the acceptance criteria this ticket makes true, copied verbatim from the specification story it implements, without paraphrasing, shortening, rewording, or a leading checkbox marker.
+  When a specification story spans multiple tickets, copy into each ticket only the verbatim criteria from that story that this ticket's own `scope_of_changes` and `verification_gate` make true, so the union across the ticket set covers every criterion of the story.
+  Never copy a criterion for behaviour listed in this ticket's `out_of_scope`, and never carry duplicate or altered criteria from an earlier attempt.
 - `prerequisites_assumed`: what the ticket takes for granted about the tree, including the existing
   files and modules it builds on, and, when the ticket consumes a contract, the exact consumed
   interface described below.

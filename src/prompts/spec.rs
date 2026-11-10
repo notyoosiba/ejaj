@@ -22,12 +22,24 @@ Convert the upstream plan into a technical specification without prompting the u
    Propose a new seam only when no existing seam can observe the behaviour. Do not ask the user and
    do not add an intermediate checkpoint: decide the seams yourself and hand the specification over
    in the same turn. Scope testing decisions to executable source-code behavior only, never to documentation, `README.md`, `TODO.md`, `.plan/`/`.plans/` tracker files, changelogs, or other human-facing prose. Testing decisions cover only executable source-code behavior. When documentation or tracker updates accompany source changes, record those file updates in `### Module Architecture` but exclude them from `## 5. Testing Decisions & Seams`. A documentation-only specification that changes only documentation or human-facing content writes exactly `None.` under each of `### Test Seams`, `### Coverage Strategy`, and `### Prior Art`.
-3. **Define exact contracts and write implementation-ready stories and criteria:** Wherever producer and consumer modules depend on one another, including a single dependency, state the exact function and type signatures in `### Module Architecture` and `### Data Models & Contracts`, including every parameter type and every return type. Each story and each acceptance criterion must
+3. **Define exact contracts and write implementation-ready stories and criteria:** Wherever producer and consumer modules depend on one another, including a single dependency, state the exact function and type signatures in `### Module Architecture` and `### Data Models & Contracts`, including every parameter type and every return type.
+   Structure the user stories as independently verifiable vertical slices:
+   each story delivers one end-to-end slice of user-facing behaviour that can be
+   implemented and verified on its own, and
+   never make a story's verification depend on a later story.
+   Keep each acceptance criterion scoped to one cohesive slice or module boundary
+   rather than combining separately gated requirements into one criterion.
+   Each story and each acceptance criterion must
    be concrete enough for the tickets agent to slice into a ticket and for the code agent to verify.
    State the expected behaviour and the exact pass/fail condition, including error states and edge
    cases. Add the acceptance criteria, the exact values, the test seams, the prior art and the
-   resolution of the questions the plan left open, wherever they apply. Never merely restate a plan
-   decision: where a section necessarily refers to one, say what the implementation adds to it.
+   resolution of the questions the plan left open, wherever they apply.
+   When documentation or tracker changes accompany the source changes,
+   name the exact target file paths in `### Module Architecture`:
+   documentation, `README.md`, `TODO.md`, and `.plan/` or `.plans/` tracker files
+   are examples of the kinds of files to name, never substitutes for the exact path.
+   Never merely restate a plan decision: where a section necessarily refers to one, say what the
+   implementation adds to it.
 4. **Hand over:** call `finish_spec` with the complete specification as a markdown document. The
    document must match the template below; a missing required heading, an unknown heading, a repeated
    heading, or headings out of order rejects the handoff. A pass that ends without calling

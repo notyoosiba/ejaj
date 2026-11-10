@@ -11,7 +11,7 @@ Tracks the implementation status of active proposals in [`.plans/`](./.plans/REA
 | [`PROPOSAL-17-high-signal-bash-failure-digest.md`](./.plans/PROPOSAL-17-high-signal-bash-failure-digest.md) | `[x]` Complete (T20 done) | `T20` | `src/tools.rs` |
 | [`PROPOSAL-16-ticket-test-cap-and-batched-tdd.md`](./.plans/PROPOSAL-16-ticket-test-cap-and-batched-tdd.md) | `[x]` Complete (T21 done) | `T21` | `src/prompts/tickets.rs`, `src/prompts/code.rs` |
 | [`PROPOSAL-15-ticket-criteria-validation.md`](./.plans/PROPOSAL-15-ticket-criteria-validation.md) | `[x]` Complete (T22 done) | `T22` | `src/tickets.rs`, `src/tools.rs` |
-| [`PROPOSAL-18-spec-and-tickets-story-slicing.md`](./.plans/PROPOSAL-18-spec-and-tickets-story-slicing.md) | `[ ]` Pending | `T23` | `src/prompts/spec.rs`, `src/prompts/tickets.rs`, `tests/prompt_contract.rs` |
+| [`PROPOSAL-18-spec-and-tickets-story-slicing.md`](./.plans/PROPOSAL-18-spec-and-tickets-story-slicing.md) | `[x]` Complete (T23 done) | `T23` | `src/prompts/spec.rs`, `src/prompts/tickets.rs`, `tests/prompt_contract.rs` |
 | [`PROPOSAL-19-triage-slice-criteria-narrowing.md`](./.plans/PROPOSAL-19-triage-slice-criteria-narrowing.md) | `[ ]` Pending | `T24` | `src/prompts/triage.rs`, `tests/prompt_contract.rs` |
 
 ---
@@ -36,7 +36,7 @@ The pending tasks form a strictly ordered, serialized pipeline designed to stay 
 [T22] [x] Complete (T22 done) PROPOSAL-15: Duplicate criteria validation in TicketSet::validate & multi-ticket error (src/{tickets,tools}.rs)
   │
   ▼
-[T23] PROPOSAL-18: Story slicing, per-ticket criteria scoping & authorized tracker folding (src/prompts/{spec,tickets}.rs)
+[T23] [x] Complete (T23 done) PROPOSAL-18: Story slicing, per-ticket criteria scoping & authorized tracker folding (src/prompts/{spec,tickets}.rs)
   │
   ▼
 [T24] PROPOSAL-19: Narrow shared-story criteria in Agent Brief during Triage (src/prompts/triage.rs)
@@ -79,7 +79,7 @@ The pending tasks form a strictly ordered, serialized pipeline designed to stay 
     - In `TODO.md` only (do not edit `.plans/PROPOSAL-15-ticket-criteria-validation.md`), mark `T22` complete (`[x]`) in the DAG and ordered backlog and update the `PROPOSAL-15-ticket-criteria-validation.md` row in the `TODO.md` status matrix to `[x] Complete (T22 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib tickets && cargo test --lib tools && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T23` — Story Slicing, Per-Ticket Criteria Scoping & Authorized Tracker Folding in Spec & Tickets Prompts**
+- [x] **`T23` — Story Slicing, Per-Ticket Criteria Scoping & Authorized Tracker Folding in Spec & Tickets Prompts**
   - `depends_on`: `["T22"]`
   - `unblocks`: `["T24"]`
   - `plans`: [`.plans/PROPOSAL-18-spec-and-tickets-story-slicing.md`](./.plans/PROPOSAL-18-spec-and-tickets-story-slicing.md)

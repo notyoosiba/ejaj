@@ -6,7 +6,9 @@
 //! question frontier, the handoff rules, the specification architecture and
 //! testing policy, and the existing templates with known literal text.
 
-use ejaj::prompts::{PLAN_SYSTEM_PROMPT, SPEC_KICKOFF_PROMPT, SPEC_SYSTEM_PROMPT};
+use ejaj::prompts::{
+    PLAN_SYSTEM_PROMPT, SPEC_KICKOFF_PROMPT, SPEC_SYSTEM_PROMPT, TICKETS_SYSTEM_PROMPT,
+};
 
 /// The opening sentence every existing plan-prompt consumer already relies on.
 const OPENING_MARKER: &str =
@@ -350,6 +352,38 @@ fn when_defining_given_cross_module_dependencies_then_prompt_requires_exact_sign
     ]);
 }
 
+/// Core entry-point behavior: a specification structures its stories as
+/// independently verifiable vertical slices, and each acceptance criterion
+/// stays inside one cohesive slice or module boundary instead of combining
+/// requirements that are gated separately.
+#[test]
+fn when_specifying_given_independently_verifiable_stories_then_criteria_follow_vertical_slices() {
+    assert_spec_prompt_contains(&[
+        "Structure the user stories as independently verifiable vertical slices",
+        "each story delivers one end-to-end slice of user-facing behaviour",
+        "implemented and verified on its own",
+        "never make a story's verification depend on a later story",
+        "Keep each acceptance criterion scoped to one cohesive slice or module boundary",
+        "rather than combining separately gated requirements into one criterion",
+    ]);
+}
+
+/// Contract and invariant check: when documentation or tracker updates
+/// accompany source changes, the specification names their exact target file
+/// paths in `### Module Architecture`, and documentation, `README.md`, `TODO.md`
+/// and `.plan/` or `.plans/` tracker files are examples rather than substitute
+/// paths.
+#[test]
+fn when_specifying_given_accompanying_documentation_updates_then_module_architecture_names_exact_paths()
+ {
+    assert_spec_prompt_contains(&[
+        "When documentation or tracker changes accompany the source changes",
+        "name the exact target file paths in `### Module Architecture`",
+        "documentation, `README.md`, `TODO.md`, and `.plan/` or `.plans/` tracker files",
+        "are examples of the kinds of files to name, never substitutes for the exact path",
+    ]);
+}
+
 /// Regression: the existing system opening marker, kickoff marker, workflow
 /// handoff, template rules, and every required heading -- including section 7
 /// and its subsections -- remain intact and ordered.
@@ -460,4 +494,109 @@ fn when_reviewing_given_specification_prompt_without_access_control_then_no_auth
             );
         }
     }
+}
+
+/// The exact tracker-folding instruction the ticket-authoring pass already
+/// relies on; the authorization wording must qualify it without rewriting it.
+const TICKETS_TRACKER_FOLDING_NEEDLE: &str = "Fold `README.md`, `TODO.md`, documentation, and `.plan/`/`.plans/` tracker updates into the executable-behavior ticket whose deliverable needs them; never create standalone documentation or tracker tickets for those accompanying updates.";
+
+/// Return Workflow Step 2 of the exported ticket prompt, the step that slices
+/// the specification and places accompanying work.
+fn tickets_step_two() -> &'static str {
+    let start = TICKETS_SYSTEM_PROMPT
+        .find("2. **Slice the specification into vertical slices:**")
+        .expect("TICKETS_SYSTEM_PROMPT must keep its specification-slicing step");
+    let end = TICKETS_SYSTEM_PROMPT
+        .find("3. **Sequence a wide mechanical change as expand, migrate, contract:**")
+        .expect("TICKETS_SYSTEM_PROMPT must keep its sequencing step");
+    &TICKETS_SYSTEM_PROMPT[start..end]
+}
+
+/// Core entry-point behavior at the unauthorized/forbidden boundary:
+/// accompanying documentation and tracker work is folded only when the
+/// specification itself calls for it, while omitted work is never invented.
+#[test]
+fn when_authorizing_accompanying_work_given_specification_omits_updates_then_ticket_prompt_prohibits_invention()
+ {
+    let step_two = tickets_step_two();
+    for needle in [
+        TICKETS_TRACKER_FOLDING_NEEDLE,
+        "Only fold documentation, `README.md`, `TODO.md`, or `.plan/`/`.plans/` tracker updates into a ticket when the specification itself calls for updating them",
+        "do not invent tracker or documentation tasks that the specification omits",
+        "never create standalone documentation or tracker tickets",
+    ] {
+        assert!(
+            step_two.contains(needle),
+            "Step 2 of TICKETS_SYSTEM_PROMPT must contain `{needle}`"
+        );
+    }
+}
+
+/// The eleven ticket fields the handoff schema must keep, in their required
+/// order. The schema is the contract the harness renders every ticket from.
+const TICKETS_FIELDS_IN_ORDER: [&str; 11] = [
+    "id",
+    "blocked_by",
+    "blocks",
+    "title",
+    "objective",
+    "acceptance_criteria",
+    "prerequisites_assumed",
+    "out_of_scope",
+    "scope_of_changes",
+    "test_expectations",
+    "verification_gate",
+];
+
+/// Core entry-point behavior: one specification story implemented by several
+/// tickets hands each ticket only the verbatim criteria its own changes make
+/// true, so the ticket set still covers the whole story while no ticket claims
+/// out-of-scope behaviour or repeats a criterion.
+#[test]
+fn when_assigning_criteria_given_shared_story_spans_tickets_then_each_ticket_carries_only_its_verbatim_scope()
+ {
+    for needle in [
+        "copied verbatim from the specification story it implements",
+        "without paraphrasing, shortening, rewording, or a leading checkbox marker",
+        "When a specification story spans multiple tickets, copy into each ticket only the verbatim criteria from that story",
+        "that this ticket's own `scope_of_changes` and `verification_gate` make true",
+        "the union across the ticket set covers every criterion of the story",
+        "Never copy a criterion for behaviour listed in this ticket's `out_of_scope`",
+        "never carry duplicate or altered criteria from an earlier attempt",
+    ] {
+        assert!(
+            TICKETS_SYSTEM_PROMPT.contains(needle),
+            "TICKETS_SYSTEM_PROMPT must contain `{needle}`"
+        );
+    }
+}
+
+/// Contract and invariant check: adding the shared-story criteria rule leaves
+/// the eleven handoff fields in their existing order and keeps
+/// `expand, migrate, contract` stated by its single sequencing step.
+#[test]
+fn when_preserving_prompt_contracts_given_shared_story_guidance_then_fields_and_sequence_remain_stable()
+ {
+    let schema_start = TICKETS_SYSTEM_PROMPT
+        .find("with exactly these fields:")
+        .expect("TICKETS_SYSTEM_PROMPT must keep its handoff schema");
+    let schema_end = TICKETS_SYSTEM_PROMPT
+        .find("The `verification_gate` must demonstrate")
+        .expect("TICKETS_SYSTEM_PROMPT must keep the verification-gate guidance after it");
+    let fields: Vec<&str> = TICKETS_SYSTEM_PROMPT[schema_start..schema_end]
+        .lines()
+        .filter_map(|line| line.strip_prefix("- `"))
+        .filter_map(|rest| rest.split_once("`: ").map(|(name, _)| name))
+        .collect();
+    assert_eq!(
+        fields, TICKETS_FIELDS_IN_ORDER,
+        "the handoff schema must keep exactly its eleven existing fields in order"
+    );
+    assert_eq!(
+        TICKETS_SYSTEM_PROMPT
+            .matches("expand, migrate, contract")
+            .count(),
+        1,
+        "Step 3 must remain the sole source of expand-migrate-contract sequencing"
+    );
 }
