@@ -771,7 +771,8 @@ fn run_agent_loop_capturing(
         last_narration,
     );
     if let Err(error) = save_trajectory(invocation, config, phase, steps_taken, &stop, messages) {
-        let _ = status::shared().stderr_log(&format!("[WARN] could not persist trajectory: {error}"));
+        let _ =
+            status::shared().stderr_log(&format!("[WARN] could not persist trajectory: {error}"));
     }
     stop
 }
@@ -8629,10 +8630,7 @@ mod tests {
         assert!(
             retried.iter().any(|message| {
                 message.role == Role::Tool
-                    && message
-                        .content
-                        .as_deref()
-                        .is_some_and(is_tool_result_stub)
+                    && message.content.as_deref().is_some_and(is_tool_result_stub)
             }),
             "older tool results were stubbed before the retry"
         );
@@ -8682,7 +8680,7 @@ mod tests {
 
     #[test]
     fn when_loop_finishes_given_ejaj_session_dir_then_writes_numbered_traj_json_under_trajectories()
-     {
+    {
         let root = std::env::temp_dir().join(format!(
             "ejaj-traj-test-{}-{}",
             std::process::id(),

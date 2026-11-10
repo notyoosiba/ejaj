@@ -8,6 +8,7 @@
 
 use ejaj::prompts::{
     PLAN_SYSTEM_PROMPT, SPEC_KICKOFF_PROMPT, SPEC_SYSTEM_PROMPT, TICKETS_SYSTEM_PROMPT,
+    TRIAGE_SYSTEM_PROMPT,
 };
 
 /// The opening sentence every existing plan-prompt consumer already relies on.
@@ -599,4 +600,126 @@ fn when_preserving_prompt_contracts_given_shared_story_guidance_then_fields_and_
         1,
         "Step 3 must remain the sole source of expand-migrate-contract sequencing"
     );
+}
+
+/// The four exact Step 2 strings every existing triage-prompt consumer already
+/// relies on; narrowing the Agent Brief criteria must not rewrite them.
+const TRIAGE_LEGACY_STEP_TWO_NEEDLES: &[&str] = &[
+    "A disagreement among scope, tests, gate and specification is a finding",
+    "inconsistency in the ticket",
+    "The notes of a classification are evidence",
+    "restatement of the title or the objective is not evidence",
+];
+
+/// Return Workflow Step 2 of the exported triage prompt, the step that audits
+/// every draft ticket against the draft set, the specification and the code.
+fn triage_step_two() -> &'static str {
+    let start = TRIAGE_SYSTEM_PROMPT
+        .find("2. **Audit every draft ticket against what you found:**")
+        .expect("TRIAGE_SYSTEM_PROMPT must keep its ticket-audit step");
+    let end = TRIAGE_SYSTEM_PROMPT
+        .find("3. **Classify each draft ticket**")
+        .expect("TRIAGE_SYSTEM_PROMPT must keep its classification step");
+    &TRIAGE_SYSTEM_PROMPT[start..end]
+}
+
+/// Assert Step 2 of the exported triage prompt carries every known literal.
+fn assert_triage_step_two_contains(needles: &[&str]) {
+    let step_two = triage_step_two();
+    for needle in needles {
+        assert!(
+            step_two.contains(needle),
+            "Step 2 of TRIAGE_SYSTEM_PROMPT must contain `{needle}`"
+        );
+    }
+}
+
+/// Core entry-point behavior: a ticket that only carries a sibling ticket's
+/// verbatim criterion from a shared specification story stays ready for an
+/// agent, with its Agent Brief criteria narrowed to its own self-contained
+/// slice and the audited overlap recorded as evidence.
+#[test]
+fn when_triaging_given_shared_story_sibling_criterion_then_narrows_ready_agent_brief() {
+    assert_triage_step_two_contains(&[
+        "a specification story is shared across multiple draft tickets",
+        "a ticket carries a sibling ticket's verbatim criterion from that shared story",
+        "that ticket's own `scope_of_changes`, `test_expectations`, and `verification_gate` define a self-contained slice of the specification",
+        "narrow that ticket's `acceptance_criteria` in its Agent Brief to the criteria its own scope implements",
+        "record in the classification notes the audited overlap and that narrowing as evidence",
+        "keep the classification `ready-for-agent`",
+        "instead of marking it `needs-info` over that overlap",
+    ]);
+    for legacy in TRIAGE_LEGACY_STEP_TWO_NEEDLES {
+        assert!(
+            triage_step_two().contains(legacy),
+            "Step 2 of TRIAGE_SYSTEM_PROMPT must keep the legacy wording `{legacy}`"
+        );
+    }
+}
+
+/// Edge-case table across the narrowing boundary: the ticket-local slice
+/// conditions are checked one by one, a qualifying multi-ticket story narrows
+/// only its own criteria, and every unrelated inconsistency stays a finding.
+#[test]
+fn when_triaging_given_shared_story_boundary_cases_then_narrows_only_self_contained_slices() {
+    let step_two = triage_step_two();
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "shared-story premise absent",
+            &["when the story is not shared", "no criteria are narrowed"],
+        ),
+        (
+            "sibling verbatim criterion absent",
+            &["the criterion is the ticket's own rather than a sibling's"],
+        ),
+        (
+            "ticket-local scope, tests or gate do not agree",
+            &[
+                "the ticket's own `scope_of_changes`, `test_expectations` and `verification_gate` do not define a self-contained slice",
+                "no criteria are narrowed",
+            ],
+        ),
+        (
+            "qualifying story shared across several tickets and criteria",
+            &[
+                "shared across multiple draft tickets",
+                "a sibling ticket's verbatim criterion from that shared story",
+                "narrow that ticket's `acceptance_criteria` in its Agent Brief",
+                "keep the classification `ready-for-agent`",
+            ],
+        ),
+        (
+            "unrelated inconsistency",
+            &[
+                "A disagreement among scope, tests, gate and specification is a finding",
+                "Every other ticket, repository and specification inconsistency remains a finding",
+                "classified by the existing rules below",
+            ],
+        ),
+    ];
+    for (case, needles) in cases {
+        for needle in *needles {
+            assert!(
+                step_two.contains(needle),
+                "Step 2 of TRIAGE_SYSTEM_PROMPT must keep `{needle}` for the {case} case"
+            );
+        }
+    }
+    assert_eq!(
+        step_two
+            .matches("narrow that ticket's `acceptance_criteria`")
+            .count(),
+        1,
+        "only the qualifying shared-story overlap may direct a narrowing of Agent Brief criteria"
+    );
+    for unconditional in [
+        "Always narrow",
+        "always narrow",
+        "narrow every ticket's `acceptance_criteria`",
+    ] {
+        assert!(
+            !step_two.contains(unconditional),
+            "the narrowing directive must stay conditional, never `{unconditional}`"
+        );
+    }
 }

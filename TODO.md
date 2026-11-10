@@ -12,7 +12,7 @@ Tracks the implementation status of active proposals in [`.plans/`](./.plans/REA
 | [`PROPOSAL-16-ticket-test-cap-and-batched-tdd.md`](./.plans/PROPOSAL-16-ticket-test-cap-and-batched-tdd.md) | `[x]` Complete (T21 done) | `T21` | `src/prompts/tickets.rs`, `src/prompts/code.rs` |
 | [`PROPOSAL-15-ticket-criteria-validation.md`](./.plans/PROPOSAL-15-ticket-criteria-validation.md) | `[x]` Complete (T22 done) | `T22` | `src/tickets.rs`, `src/tools.rs` |
 | [`PROPOSAL-18-spec-and-tickets-story-slicing.md`](./.plans/PROPOSAL-18-spec-and-tickets-story-slicing.md) | `[x]` Complete (T23 done) | `T23` | `src/prompts/spec.rs`, `src/prompts/tickets.rs`, `tests/prompt_contract.rs` |
-| [`PROPOSAL-19-triage-slice-criteria-narrowing.md`](./.plans/PROPOSAL-19-triage-slice-criteria-narrowing.md) | `[ ]` Pending | `T24` | `src/prompts/triage.rs`, `tests/prompt_contract.rs` |
+| [`PROPOSAL-19-triage-slice-criteria-narrowing.md`](./.plans/PROPOSAL-19-triage-slice-criteria-narrowing.md) | `[x]` Complete (T24 done) | `T24` | `src/prompts/triage.rs`, `tests/prompt_contract.rs` |
 
 ---
 
@@ -39,7 +39,7 @@ The pending tasks form a strictly ordered, serialized pipeline designed to stay 
 [T23] [x] Complete (T23 done) PROPOSAL-18: Story slicing, per-ticket criteria scoping & authorized tracker folding (src/prompts/{spec,tickets}.rs)
   │
   ▼
-[T24] PROPOSAL-19: Narrow shared-story criteria in Agent Brief during Triage (src/prompts/triage.rs)
+[T24] [x] Complete (T24 done) PROPOSAL-19: Narrow shared-story criteria in Agent Brief during Triage (src/prompts/triage.rs)
 ```
 
 ---
@@ -91,7 +91,7 @@ The pending tasks form a strictly ordered, serialized pipeline designed to stay 
     - In `TODO.md` only (do not edit `.plans/PROPOSAL-18-spec-and-tickets-story-slicing.md`), mark `T23` complete (`[x]`) in the DAG and ordered backlog and update the `PROPOSAL-18-spec-and-tickets-story-slicing.md` row in the `TODO.md` status matrix to `[x] Complete (T23 done)` right before running `verification_gate`.
   - `verification_gate`: `cargo test --lib prompts::spec && cargo test --lib prompts::tickets && cargo test --test prompt_contract && cargo test --test test_titles && cargo clippy --all-targets -- -D warnings`
 
-- [ ] **`T24` — Narrow Shared-Story Criteria in Agent Brief During Triage**
+- [x] **`T24` — Narrow Shared-Story Criteria in Agent Brief During Triage**
   - `depends_on`: `["T23"]`
   - `unblocks`: `[]`
   - `plans`: [`.plans/PROPOSAL-19-triage-slice-criteria-narrowing.md`](./.plans/PROPOSAL-19-triage-slice-criteria-narrowing.md)

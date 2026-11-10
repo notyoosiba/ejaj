@@ -714,10 +714,11 @@ impl HandoffScript {
 
 /// The last scripted reply repeats.
 fn handoff_reply_at(turns: &[HandoffReply], turn: usize) -> HandoffReply {
-    turns
-        .get(turn)
-        .copied()
-        .unwrap_or_else(|| *turns.last().expect("a scripted handoff has at least one reply"))
+    turns.get(turn).copied().unwrap_or_else(|| {
+        *turns
+            .last()
+            .expect("a scripted handoff has at least one reply")
+    })
 }
 
 /// One tool-free assistant turn.

@@ -2465,7 +2465,11 @@ fn when_triaging_tickets_given_missing_or_invalid_handoff_then_returns_retry_wit
             common::TriageScript::TurnEnd,
             5,
         ),
-        ("a refused triage request", common::TriageScript::ApiError, 4),
+        (
+            "a refused triage request",
+            common::TriageScript::ApiError,
+            4,
+        ),
     ] {
         let (step, dir, transport) = triage_run(script);
 
@@ -14377,7 +14381,6 @@ fn when_transition_gate_fails_once_given_project_test_suite_then_queues_repair_t
     let _ = fs::remove_dir_all(repository.path());
 }
 
-
 // -- Unattended handoff retry ----------------------------------------------
 
 /// Every request one run sent for the pass identified by `marker`.
@@ -14411,10 +14414,7 @@ fn unattended_run(
 }
 
 fn turn_end_then_handoff() -> common::HandoffScript {
-    common::HandoffScript::Turns(&[
-        common::HandoffReply::TurnEnd,
-        common::HandoffReply::Handoff,
-    ])
+    common::HandoffScript::Turns(&[common::HandoffReply::TurnEnd, common::HandoffReply::Handoff])
 }
 
 #[test]
@@ -14451,12 +14451,12 @@ fn when_eligible_stop_given_each_unattended_pass_then_fresh_handoff_continues_no
         let _ = fs::remove_dir_all(&dir);
     }
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new().with_triage(common::TriageScript::Turns(&[
+        let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_triage(
+            common::TriageScript::Turns(&[
                 common::HandoffReply::TurnEnd,
                 common::HandoffReply::Handoff,
-            ])),
-        );
+            ]),
+        ));
         assert!(matches!(step, Step::Complete), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::TRIAGE_MARKER).len(),
@@ -14469,12 +14469,12 @@ fn when_eligible_stop_given_each_unattended_pass_then_fresh_handoff_continues_no
         let _ = fs::remove_dir_all(&dir);
     }
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new().with_review(common::ReviewScript::Turns(&[
+        let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_review(
+            common::ReviewScript::Turns(&[
                 common::HandoffReply::TurnEnd,
                 common::HandoffReply::Handoff,
-            ])),
-        );
+            ]),
+        ));
         assert!(matches!(step, Step::Complete), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::REVIEW_MARKER).len(),
@@ -14490,10 +14490,9 @@ fn when_eligible_stop_given_each_unattended_pass_then_fresh_handoff_continues_no
 #[test]
 fn when_eligible_stop_given_second_attempt_stops_then_preserves_failure_without_third_attempt() {
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new()
-                .with_spec(common::HandoffScript::Turns(&[common::HandoffReply::TurnEnd])),
-        );
+        let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_spec(
+            common::HandoffScript::Turns(&[common::HandoffReply::TurnEnd]),
+        ));
         assert!(matches!(step, Step::Retry), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::SPEC_MARKER).len(),
@@ -14504,11 +14503,10 @@ fn when_eligible_stop_given_second_attempt_stops_then_preserves_failure_without_
         let _ = fs::remove_dir_all(&dir);
     }
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new().with_tickets_handoff(
+        let (step, dir, transport) =
+            unattended_run(common::ScriptedTransport::new().with_tickets_handoff(
                 common::HandoffScript::Turns(&[common::HandoffReply::TurnEnd]),
-            ),
-        );
+            ));
         assert!(matches!(step, Step::Retry), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::TICKETS_MARKER).len(),
@@ -14520,10 +14518,9 @@ fn when_eligible_stop_given_second_attempt_stops_then_preserves_failure_without_
         let _ = fs::remove_dir_all(&dir);
     }
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new()
-                .with_triage(common::TriageScript::Turns(&[common::HandoffReply::TurnEnd])),
-        );
+        let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_triage(
+            common::TriageScript::Turns(&[common::HandoffReply::TurnEnd]),
+        ));
         assert!(matches!(step, Step::Retry), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::TRIAGE_MARKER).len(),
@@ -14535,10 +14532,9 @@ fn when_eligible_stop_given_second_attempt_stops_then_preserves_failure_without_
         let _ = fs::remove_dir_all(&dir);
     }
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new()
-                .with_review(common::ReviewScript::Turns(&[common::HandoffReply::TurnEnd])),
-        );
+        let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_review(
+            common::ReviewScript::Turns(&[common::HandoffReply::TurnEnd]),
+        ));
         assert!(matches!(step, Step::Retry), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::REVIEW_MARKER).len(),
@@ -14551,14 +14547,15 @@ fn when_eligible_stop_given_second_attempt_stops_then_preserves_failure_without_
 }
 
 #[test]
-fn when_retrying_given_api_or_transport_failure_on_second_attempt_then_stops_without_third_attempt() {
+fn when_retrying_given_api_or_transport_failure_on_second_attempt_then_stops_without_third_attempt()
+{
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new().with_spec(common::HandoffScript::Turns(&[
+        let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_spec(
+            common::HandoffScript::Turns(&[
                 common::HandoffReply::TurnEnd,
                 common::HandoffReply::ApiError,
-            ])),
-        );
+            ]),
+        ));
         assert!(matches!(step, Step::Retry), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::SPEC_MARKER).len(),
@@ -14568,12 +14565,12 @@ fn when_retrying_given_api_or_transport_failure_on_second_attempt_then_stops_wit
         let _ = fs::remove_dir_all(&dir);
     }
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new().with_spec(common::HandoffScript::Turns(&[
+        let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_spec(
+            common::HandoffScript::Turns(&[
                 common::HandoffReply::TurnEnd,
                 common::HandoffReply::TransportError,
-            ])),
-        );
+            ]),
+        ));
         assert!(matches!(step, Step::Retry), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::SPEC_MARKER).len(),
@@ -14605,12 +14602,12 @@ fn when_recovering_given_turn_end_then_retries_once_without_unusable_artifact() 
 
 #[test]
 fn when_recovering_given_malformed_stop_then_valid_retry_handoff_follows_normal_path() {
-    let (step, dir, transport) = unattended_run(
-        common::ScriptedTransport::new().with_spec(common::HandoffScript::Turns(&[
+    let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_spec(
+        common::HandoffScript::Turns(&[
             common::HandoffReply::Malformed,
             common::HandoffReply::Handoff,
-        ])),
-    );
+        ]),
+    ));
     assert!(matches!(step, Step::Complete), "{step:?}");
     assert_eq!(
         unattended_requests(&transport, common::SPEC_MARKER).len(),
@@ -14623,10 +14620,9 @@ fn when_recovering_given_malformed_stop_then_valid_retry_handoff_follows_normal_
 
 #[test]
 fn when_recovering_given_two_eligible_stops_then_stops_after_two_attempts() {
-    let (step, dir, transport) = unattended_run(
-        common::ScriptedTransport::new()
-            .with_triage(common::TriageScript::Turns(&[common::HandoffReply::TurnEnd])),
-    );
+    let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_triage(
+        common::TriageScript::Turns(&[common::HandoffReply::TurnEnd]),
+    ));
     assert!(matches!(step, Step::Retry), "{step:?}");
     assert_eq!(
         unattended_requests(&transport, common::TRIAGE_MARKER).len(),
@@ -14640,10 +14636,9 @@ fn when_recovering_given_two_eligible_stops_then_stops_after_two_attempts() {
 #[test]
 fn when_recovering_given_exhausted_malformed_response_then_retries_only_after_agent_loop_stops() {
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new()
-                .with_triage(common::TriageScript::Turns(&[common::HandoffReply::Malformed])),
-        );
+        let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_triage(
+            common::TriageScript::Turns(&[common::HandoffReply::Malformed]),
+        ));
         assert!(matches!(step, Step::Retry), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::TRIAGE_MARKER).len(),
@@ -14672,10 +14667,9 @@ fn when_recovering_given_exhausted_malformed_response_then_retries_only_after_ag
 #[test]
 fn when_handling_given_api_or_transport_stop_then_preserves_failure_without_outer_retry() {
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new()
-                .with_spec(common::HandoffScript::Turns(&[common::HandoffReply::ApiError])),
-        );
+        let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_spec(
+            common::HandoffScript::Turns(&[common::HandoffReply::ApiError]),
+        ));
         assert!(matches!(step, Step::Retry), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::SPEC_MARKER).len(),
@@ -14686,10 +14680,9 @@ fn when_handling_given_api_or_transport_stop_then_preserves_failure_without_oute
         let _ = fs::remove_dir_all(&dir);
     }
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new()
-                .with_spec(common::HandoffScript::Turns(&[common::HandoffReply::Forbidden])),
-        );
+        let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_spec(
+            common::HandoffScript::Turns(&[common::HandoffReply::Forbidden]),
+        ));
         assert!(matches!(step, Step::Retry), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::SPEC_MARKER).len(),
@@ -14700,11 +14693,9 @@ fn when_handling_given_api_or_transport_stop_then_preserves_failure_without_oute
         let _ = fs::remove_dir_all(&dir);
     }
     {
-        let (step, dir, transport) = unattended_run(
-            common::ScriptedTransport::new().with_spec(common::HandoffScript::Turns(&[
-                common::HandoffReply::TransportError,
-            ])),
-        );
+        let (step, dir, transport) = unattended_run(common::ScriptedTransport::new().with_spec(
+            common::HandoffScript::Turns(&[common::HandoffReply::TransportError]),
+        ));
         assert!(matches!(step, Step::Retry), "{step:?}");
         assert_eq!(
             unattended_requests(&transport, common::SPEC_MARKER).len(),

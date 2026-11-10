@@ -29,9 +29,7 @@
 
 use crate::Config;
 use crate::git;
-use crate::loops::{
-    FailureKind, InvocationContext, plan, review, spec, summary, tickets, triage,
-};
+use crate::loops::{FailureKind, InvocationContext, plan, review, spec, summary, tickets, triage};
 
 /// Whether one non-handoff outcome is an unattended early stop the pipeline
 /// retries once in a fresh session.
@@ -2377,7 +2375,6 @@ mod tests {
         );
     }
 }
-
 
 #[cfg(test)]
 mod unattended_retry_tests {
