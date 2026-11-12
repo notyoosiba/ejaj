@@ -1537,7 +1537,7 @@ enum DiagnosticPriority {
 /// de-duplicated, with every primary block before every secondary block. The
 /// extraction is deliberately lexical: the model gets the lines that already
 /// name a failure, not a reinterpretation of them.
-fn diagnostic_text(rendered: &str) -> String {
+pub(crate) fn diagnostic_text(rendered: &str) -> String {
     let lines: Vec<&str> = rendered.lines().collect();
     let mut primary: Vec<String> = Vec::new();
     let mut secondary: Vec<String> = Vec::new();

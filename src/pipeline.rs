@@ -1341,18 +1341,58 @@ fn transition_gate_command(root: &Path) -> Option<&'static str> {
     }
 }
 
-/// Bounded tail excerpt of a failed transition-gate command's output.
+/// The retained Unicode scalar-value cap on a transition-failure repair excerpt.
+const TRANSITION_EXCERPT_CHARS: usize = 1_200;
+
+/// Bounded excerpt of a failed transition-gate command's output. Empty output
+/// keeps its canonical marker, short output survives trimming verbatim, and
+/// oversized output prefers the extracted diagnostics -- so noisy trailing logs
+/// can never crowd a real failure out of the repair ticket -- falling back to the
+/// UTF-8-safe raw tail when the extractor recognizes nothing.
 fn transition_failure_excerpt(output: &str) -> String {
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return "command exited non-zero with no output".to_string();
     }
     let chars: Vec<char> = trimmed.chars().collect();
-    if chars.len() <= 1_200 {
-        trimmed.to_string()
+    if chars.len() <= TRANSITION_EXCERPT_CHARS {
+        return trimmed.to_string();
+    }
+
+    // The command runner prepends a synthetic `[ERROR: ...]` header to a failed
+    // run. It is split off before extraction so it neither annexes the startup
+    // banner under it nor masks an empty extraction, and it is re-attached only
+    // when diagnostics were found.
+    let (header, body) = split_verification_header(trimmed);
+    let diagnostics = crate::tools::diagnostic_text(body);
+    if diagnostics.is_empty() {
+        let tail: String = chars[chars.len() - TRANSITION_EXCERPT_CHARS..]
+            .iter()
+            .collect();
+        return format!("...{tail}");
+    }
+    let combined = match header {
+        Some(header) => format!("{header}\n{diagnostics}"),
+        None => diagnostics,
+    };
+    if combined.chars().count() <= TRANSITION_EXCERPT_CHARS {
+        return combined;
+    }
+    let head: String = combined.chars().take(TRANSITION_EXCERPT_CHARS).collect();
+    format!("{head}...")
+}
+
+/// Split a leading verification header off the trimmed command output. Only the
+/// first line is eligible, and only in the `[ERROR: ...]` form the command runner
+/// emits; any other output is handed back untouched as the body.
+fn split_verification_header(trimmed: &str) -> (Option<&str>, &str) {
+    let Some((first_line, rest)) = trimmed.split_once('\n') else {
+        return (None, trimmed);
+    };
+    if first_line.starts_with("[ERROR: ") && first_line.ends_with(']') {
+        (Some(first_line), rest)
     } else {
-        let tail: String = chars[chars.len() - 1_200..].iter().collect();
-        format!("...{tail}")
+        (None, trimmed)
     }
 }
 
@@ -2237,6 +2277,358 @@ mod tests {
         assert!(
             !ticket.to_markdown().contains(synthetic),
             "the rendered repair ticket must not name the synthetic expectation"
+        );
+    }
+
+    /// Edge-case table: empty and whitespace-only output collapses to the
+    /// canonical no-output marker, while anything trimming to at most 1,200
+    /// Unicode scalar values survives trimming byte for byte -- including a
+    /// value at exactly the limit and multibyte text.
+    #[test]
+    fn when_transition_output_given_empty_or_within_limit_then_preserves_trimmed_contract() {
+        let exact_limit = "a".repeat(1_200);
+        let multibyte_at_limit = format!("{}é", "b".repeat(1_199));
+        for (name, output, expected) in [
+            ("empty", "", "command exited non-zero with no output"),
+            (
+                "whitespace only",
+                " \n\t\n ",
+                "command exited non-zero with no output",
+            ),
+            (
+                "short",
+                "  error: nothing to do  \n",
+                "error: nothing to do",
+            ),
+            ("exact limit", exact_limit.as_str(), exact_limit.as_str()),
+            (
+                "multibyte at limit",
+                multibyte_at_limit.as_str(),
+                multibyte_at_limit.as_str(),
+            ),
+        ] {
+            let excerpt = transition_failure_excerpt(output);
+            assert_eq!(
+                excerpt, expected,
+                "{name}: the excerpt must be the trimmed text"
+            );
+            assert_eq!(
+                excerpt.as_bytes(),
+                expected.as_bytes(),
+                "{name}: the trimmed text must survive byte for byte"
+            );
+            assert!(
+                !excerpt.starts_with("...") && !excerpt.ends_with("..."),
+                "{name}: within-limit output must carry no shortening marker: {excerpt}"
+            );
+        }
+    }
+
+    /// Core entry-point behavior: an oversized failing suite whose primary
+    /// failure sits before a wall of passing-test logs reaches the real repair
+    /// ticket through its existing prerequisite context, and the ticket contract
+    /// stays untouched.
+    #[test]
+    fn when_transition_failure_given_oversized_diagnostics_then_repair_ticket_carries_selected_excerpt()
+     {
+        let mut output = String::new();
+        output.push_str("test broken_arithmetic ... FAILED\n");
+        output.push_str("---- broken_arithmetic stdout ----\n");
+        output.push_str("thread 'broken_arithmetic' panicked at src/lib.rs:42:5:\n");
+        output.push_str("assertion `left == right` failed\n");
+        output.push('\n');
+        for index in 0..80 {
+            output.push_str(&format!(
+                "[INFO] passing test {index} wrote a routine log line\n"
+            ));
+        }
+        assert!(
+            output.chars().count() > 1_200,
+            "the fixture must be oversized"
+        );
+
+        let excerpt = transition_failure_excerpt(&output);
+        let ticket = transition_fix_ticket(2, "cargo test", &excerpt);
+
+        let expected = "test broken_arithmetic ... FAILED\n\
+             ---- broken_arithmetic stdout ----\n\
+             thread 'broken_arithmetic' panicked at src/lib.rs:42:5:\n\
+             assertion `left == right` failed";
+        assert_eq!(
+            excerpt, expected,
+            "the excerpt must be the extracted primary failure"
+        );
+        assert_eq!(
+            ticket.prerequisites_assumed,
+            format!("Queue round 2 completed, and `cargo test` failed with:\n{excerpt}"),
+            "the repair ticket must carry the selected excerpt verbatim"
+        );
+        assert_eq!(ticket.id, "g2-1-fix-full-test-suite");
+        assert_eq!(ticket.title, "Fix full test suite regression (cargo test)");
+        assert!(
+            ticket.objective.contains("cargo test"),
+            "{}",
+            ticket.objective
+        );
+        assert_eq!(
+            ticket.acceptance_criteria,
+            vec!["The full test suite command `cargo test` exits with code 0.".to_string()]
+        );
+        assert_eq!(ticket.blocked_by, Vec::<String>::new());
+        assert_eq!(ticket.blocks, Vec::<String>::new());
+        assert_eq!(
+            ticket.out_of_scope,
+            vec!["Unrelated features outside the specification.".to_string()]
+        );
+        assert_eq!(
+            ticket.scope_of_changes,
+            vec!["Resolve the cross-suite regression reported by `cargo test`.".to_string()]
+        );
+        assert_eq!(ticket.verification_gate, "cargo test");
+        assert!(
+            ticket.test_expectations.is_empty(),
+            "the repair ticket must carry no expectations: {:?}",
+            ticket.test_expectations
+        );
+        assert!(
+            ticket
+                .to_markdown()
+                .contains("## Test Expectations\n\nNone."),
+            "the repair ticket must still render the canonical no-expectations section"
+        );
+    }
+
+    /// Contract: an oversized diagnostic selection is bounded to the first
+    /// 1,200 Unicode scalar values of the extracted text, carries the shortening
+    /// marker only when shortened, and lands on a character boundary.
+    #[test]
+    fn when_oversized_diagnostics_given_excerpt_exceeds_limit_then_truncates_combined_prefix_on_scalar_boundary()
+     {
+        // Each line stays under the extractor's per-line bound; together they
+        // outgrow the excerpt cap, and the 1,200th scalar value is the
+        // two-byte character so a byte-wise cut would split it.
+        let first = format!("error[E0308]: {}", "a".repeat(498));
+        let second = format!("error[E0277]: {}", "b".repeat(498));
+        let third_prefix = format!("error[E0432]: {}é", "c".repeat(159));
+        let third = format!("{third_prefix}{}", "d".repeat(50));
+        let output = format!("{first}\n{second}\n{third}");
+        assert!(
+            output.chars().count() > 1_200,
+            "the diagnostics must outgrow the excerpt cap"
+        );
+
+        let excerpt = transition_failure_excerpt(&output);
+
+        let expected = format!("{first}\n{second}\n{third_prefix}...");
+        assert_eq!(
+            excerpt, expected,
+            "the excerpt must be the bounded prefix of the diagnostics"
+        );
+        assert_eq!(
+            excerpt.chars().count(),
+            1_203,
+            "the marker may add exactly three scalar values beyond the cap"
+        );
+        assert!(
+            excerpt.ends_with("é..."),
+            "the truncation must not split the multibyte character: {excerpt}"
+        );
+    }
+
+    /// Edge-case table: oversized output with nothing the extractor recognizes
+    /// still hands the repair ticket the final 1,200 Unicode scalar values of the
+    /// full trimmed output behind the marker -- never splitting a character and
+    /// never separately prepending a wrapper header.
+    #[test]
+    fn when_oversized_output_given_no_diagnostics_then_uses_utf8_safe_raw_tail() {
+        // The tail begins with two-byte characters, so a byte-wise cut of the
+        // last 1,200 bytes would split one and change the excerpt.
+        let multibyte_tail = format!("{}{}", "é".repeat(600), "z".repeat(600));
+        let unrecognized_logs =
+            format!("{}{multibyte_tail}", "[INFO] server starting\n".repeat(20));
+
+        // A harness warning is never a diagnostic, even when its text replays a
+        // `[ERROR: ...]` wrapper, so these inputs have no extractable failure.
+        let malformed_line = "[WARN] replayed wrapper [ERROR: exit code 1 for `npm test`]\n";
+        let malformed_tail = format!("{}{}", "[INFO] step done\n".repeat(60), "x".repeat(180));
+        let malformed_wrapper = format!("{malformed_line}{malformed_tail}");
+
+        let non_leading_tail = format!("{}{}", "[INFO] tick\n".repeat(90), "y".repeat(120));
+        let non_leading_wrapper = format!(
+            "{}{malformed_line}{non_leading_tail}",
+            "[INFO] launching runner\n".repeat(20)
+        );
+
+        // A recognized leading header with a plain body still takes the raw-tail
+        // fallback, and the header is not re-attached on that path.
+        let plain_tail = format!("{}{}", "[INFO] final step\n".repeat(60), "w".repeat(120));
+        let plain_body = format!(
+            "[ERROR: exit code 1 for `npm test`]\n{}{plain_tail}",
+            "[INFO] runner step\n".repeat(40)
+        );
+
+        for (name, output, tail) in [
+            ("unrecognized logs", unrecognized_logs, multibyte_tail),
+            (
+                "malformed wrapper-like line",
+                malformed_wrapper,
+                malformed_tail,
+            ),
+            (
+                "non-leading wrapper-like line",
+                non_leading_wrapper,
+                non_leading_tail,
+            ),
+            ("plain body under a header", plain_body, plain_tail),
+        ] {
+            assert_eq!(
+                tail.chars().count(),
+                1_200,
+                "{name}: the fixture tail must be the whole retained window"
+            );
+            assert!(
+                output.chars().count() > 1_200,
+                "{name}: the fixture must be oversized"
+            );
+
+            let excerpt = transition_failure_excerpt(&output);
+
+            assert_eq!(
+                excerpt,
+                format!("...{tail}"),
+                "{name}: the fallback is the final 1,200 scalar values behind the marker"
+            );
+            assert_eq!(
+                excerpt.chars().count(),
+                1_203,
+                "{name}: the marker may add exactly three scalar values beyond the cap"
+            );
+            assert!(
+                excerpt.starts_with("..."),
+                "{name}: the raw-tail fallback is marked shortened"
+            );
+            assert!(
+                !excerpt.contains("[WARN]") && !excerpt.contains("runner step"),
+                "{name}: no banner or wrapper text is prepended on the fallback path: {excerpt}"
+            );
+        }
+    }
+
+    /// Contract: only a leading `[ERROR: ...]` verification header is restored,
+    /// exactly once, and the startup banner under it stays out of the excerpt
+    /// while the real failure is still extracted from the remaining output.
+    #[test]
+    fn when_verification_header_given_banner_and_diagnostics_then_prepends_header_without_banner() {
+        let mut output = String::new();
+        output.push_str("[ERROR: exit code 101 for `cargo test`]\n");
+        output.push_str("   Compiling ejaj v0.1.0 (/tmp/ejaj)\n");
+        output.push_str("    Finished `test` profile [unoptimized] target(s) in 12.3s\n");
+        output.push_str("     Running unittests src/lib.rs\n");
+        output.push_str("[INFO] startup banner: twelve providers registered\n");
+        output.push('\n');
+        output.push_str("test broken_arithmetic ... FAILED\n");
+        output.push_str("---- broken_arithmetic stdout ----\n");
+        output.push_str("thread 'broken_arithmetic' panicked at src/lib.rs:42:5:\n");
+        output.push_str("assertion `left == right` failed\n");
+        output.push('\n');
+        for index in 0..80 {
+            output.push_str(&format!(
+                "[INFO] passing test {index} wrote a routine log line\n"
+            ));
+        }
+        assert!(
+            output.chars().count() > 1_200,
+            "the fixture must be oversized"
+        );
+
+        let excerpt = transition_failure_excerpt(&output);
+
+        let mut expected = String::new();
+        expected.push_str("[ERROR: exit code 101 for `cargo test`]\n");
+        expected.push_str("test broken_arithmetic ... FAILED\n");
+        expected.push_str("---- broken_arithmetic stdout ----\n");
+        expected.push_str("thread 'broken_arithmetic' panicked at src/lib.rs:42:5:\n");
+        expected.push_str("assertion `left == right` failed");
+        assert_eq!(
+            excerpt, expected,
+            "the header is restored once, ahead of the extracted failure only"
+        );
+        assert_eq!(
+            excerpt
+                .matches("[ERROR: exit code 101 for `cargo test`]")
+                .count(),
+            1,
+            "the verification header must appear exactly once: {excerpt}"
+        );
+        for banner in [
+            "Compiling ejaj",
+            "Finished `test` profile",
+            "Running unittests",
+            "[INFO] startup banner",
+        ] {
+            assert!(
+                !excerpt.contains(banner),
+                "ordinary banner text must stay out of the diagnostics: {banner}"
+            );
+        }
+    }
+
+    /// Regression: the extractor's primary-before-secondary ordering keeps the
+    /// real test and compiler failures ahead of unrelated trailing logs, so an
+    /// excerpt that fits the cap never degenerates into the noisiest tail.
+    #[test]
+    fn when_trailing_logs_given_primary_failures_then_diagnostics_keep_primary_order() {
+        let mut output = String::new();
+        output.push_str("test broken_arithmetic ... FAILED\n");
+        output.push_str("---- broken_arithmetic stdout ----\n");
+        output.push_str("thread 'broken_arithmetic' panicked at src/lib.rs:42:5:\n");
+        output.push_str("assertion `left == right` failed\n");
+        output.push_str("  left: 1\n");
+        output.push_str(" right: 2\n");
+        output.push('\n');
+        output.push_str("error[E0308]: mismatched types\n");
+        output.push_str(" --> src/main.rs:7:9\n");
+        output.push_str("  |\n");
+        output.push_str("7 |     let total: u8 = 300;\n");
+        output.push_str("  |         ^^^ expected `u8`, found integer\n");
+        output.push('\n');
+        output.push_str("[ERROR] secondary noise 0\n");
+        output.push_str("[ERROR] secondary noise 1\n");
+        for index in 0..80 {
+            output.push_str(&format!("[INFO] routine progress line {index}\n"));
+        }
+        assert!(
+            output.chars().count() > 1_200,
+            "the fixture must be oversized"
+        );
+
+        let excerpt = transition_failure_excerpt(&output);
+
+        let mut expected = String::new();
+        expected.push_str("test broken_arithmetic ... FAILED\n");
+        expected.push_str("---- broken_arithmetic stdout ----\n");
+        expected.push_str("thread 'broken_arithmetic' panicked at src/lib.rs:42:5:\n");
+        expected.push_str("assertion `left == right` failed\n");
+        expected.push_str("  left: 1\n");
+        expected.push_str(" right: 2\n");
+        expected.push_str("error[E0308]: mismatched types\n");
+        expected.push_str(" --> src/main.rs:7:9\n");
+        expected.push_str("  |\n");
+        expected.push_str("7 |     let total: u8 = 300;\n");
+        expected.push_str("  |         ^^^ expected `u8`, found integer\n");
+        expected.push_str("[ERROR] secondary noise 0\n");
+        expected.push_str("[ERROR] secondary noise 1");
+        assert_eq!(
+            excerpt, expected,
+            "primary failures keep their order ahead of the secondary logs"
+        );
+        assert!(
+            !excerpt.ends_with("..."),
+            "an excerpt that fits the cap carries no marker: {excerpt}"
+        );
+        assert!(
+            !excerpt.contains("[INFO] routine progress line"),
+            "routine progress lines are not diagnostics: {excerpt}"
         );
     }
 
