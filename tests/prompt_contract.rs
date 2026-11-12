@@ -155,6 +155,26 @@ fn when_starting_given_preplanned_task_then_plan_prompt_treats_documented_choice
     ]);
 }
 
+/// Core entry-point behavior: a settled choice is digested into the Plan's own
+/// prose, a task-document path never becomes a requirement pointer, verification
+/// shell commands stay out of the Plan, and a task or tracker file is inspected
+/// only as needed to modify the exact path the task requires, matching that
+/// file's current structure.
+#[test]
+fn when_planning_given_task_choices_are_settled_then_plan_is_self_contained() {
+    assert_plan_prompt_contains(&[
+        "Carry every settled choice into the Plan itself",
+        "write the agreed behaviour, defaults and constraints in the Plan's own prose",
+        "A task-document path is never a requirement pointer",
+        "never write a decision, a default, a constraint or an open question as `see <path>`",
+        "never defer a requirement to a task or tracker document the spec agent must open",
+        "never copy verification shell commands (`cargo test ...`, `cargo clippy ...`, `npm test`, or a similar terminal chain) into the Plan",
+        "Inspect a task or tracker file only as far as the task requires",
+        "when the task explicitly requires modifying an exact task or tracker path, inspect that exact path and match its current structure",
+        "never widen that inspection to a sibling task or proposal document the task does not name",
+    ]);
+}
+
 /// Regression: the existing opening marker, focused-round mechanics, terminal
 /// handoff, and ordered template headings remain intact.
 #[test]
@@ -385,6 +405,28 @@ fn when_specifying_given_accompanying_documentation_updates_then_module_architec
     ]);
 }
 
+/// Core entry-point behavior: the confirmed Plan and the live code are the
+/// specification's only sources of task scope, tracker documents contribute no
+/// requirements, test names, design choices or commands, a task or tracker file
+/// is read only to match the exact path the Plan requires modifying, and testing
+/// guidance stays architectural instead of prescribing shell commands.
+#[test]
+fn when_specifying_given_tracker_is_present_then_scope_and_testing_remain_authoritative() {
+    assert_spec_prompt_contains(&[
+        "The confirmed Plan and the live codebase are the only sources of task scope",
+        "take each requirement from the confirmed Plan and each current module boundary, type and test harness from the live code",
+        "Never import requirements, test names, design choices or verification commands from `.plan/` or `.plans/` task, proposal or tracker documents",
+        "a requirement the confirmed Plan did not state stays out of the specification",
+        "Read a task or tracker file only when the confirmed Plan explicitly directs modifying that exact path",
+        "read only that path, to match that file's current structure (its existing table row, checklist line or heading)",
+        "copy nothing else from it",
+        "Keep every testing decision architectural",
+        "describe test boundaries, keeper categories, seams and the cases each seam covers",
+        "never prescribe `cargo test ...`, `cargo clippy ...`, `npm test`, a per-ticket verification gate, or a repository-wide verification command",
+        "the tickets agent owns each ticket's narrow gate and the harness owns the full-suite and lint runs",
+    ]);
+}
+
 /// Regression: the existing system opening marker, kickoff marker, workflow
 /// handoff, template rules, and every required heading -- including section 7
 /// and its subsections -- remain intact and ordered.
@@ -602,6 +644,63 @@ fn when_preserving_prompt_contracts_given_shared_story_guidance_then_fields_and_
     );
 }
 
+/// Assert every known literal is present in the exported ticket prompt.
+fn assert_tickets_prompt_contains(needles: &[&str]) {
+    for needle in needles {
+        assert!(
+            TICKETS_SYSTEM_PROMPT.contains(needle),
+            "TICKETS_SYSTEM_PROMPT must contain `{needle}`"
+        );
+    }
+}
+
+/// Core entry-point behavior: the specification and the live code are the
+/// ticket prompt's only sources of task scope, tracker documents supply no
+/// scope beyond the exact path the specification requires editing, substantive
+/// expectations name the BDD tests the ticket adds or updates, and the gate
+/// stays on the touched module or target instead of a name-prefix filter or a
+/// repository-wide run.
+#[test]
+fn when_authoring_tickets_given_specification_scope_then_gates_stay_slice_scoped() {
+    assert_tickets_prompt_contains(&[
+        "The specification below and the live codebase are the only sources of task scope",
+        "take each requirement from the specification",
+        "each current module boundary, type, schema and test harness from the live code",
+        "Never recover requirements, test names, design choices or verification commands from the Plan",
+        "`.plan/` or `.plans/` task, proposal or tracker documents",
+        "a requirement the specification did not state stays out of the ticket set",
+        "Inspect a task or tracker file only when the specification explicitly requires modifying that exact path",
+        "read only that exact path",
+        "copy nothing else from it",
+    ]);
+
+    let scope_line = TICKETS_SYSTEM_PROMPT
+        .lines()
+        .find(|line| line.contains("only sources of task scope"))
+        .expect("the ticket prompt must name the sources of task scope");
+    assert!(scope_line.contains("The specification below and the live codebase"));
+    assert!(
+        !scope_line.contains("Plan"),
+        "the scope sources must not include the Plan: {scope_line}"
+    );
+    assert!(
+        !scope_line.contains(".plan/"),
+        "the scope sources must not include tracker documents: {scope_line}"
+    );
+
+    assert_tickets_prompt_contains(&[
+        "Every substantive entry must name a BDD test this ticket adds or updates, never an unrelated test that already exists unchanged",
+    ]);
+
+    assert_tickets_prompt_contains(&[
+        "Recommend a gate that covers the touched modules or one focused target and runs every BDD test this ticket names in `test_expectations`",
+        "Use a narrow test selection (`cargo test <module>::tests`) for a touched module, or a target selection such as `cargo test --test <target>` for the touched test binary",
+        "Prefer that module or target selection over a `when_*` name-prefix filter",
+        "never prescribe repository-wide tests or lint (`cargo test`, `cargo clippy`) as a ticket gate",
+        "the harness owns the full-suite and lint runs",
+    ]);
+}
+
 /// The four exact Step 2 strings every existing triage-prompt consumer already
 /// relies on; narrowing the Agent Brief criteria must not rewrite them.
 const TRIAGE_LEGACY_STEP_TWO_NEEDLES: &[&str] = &[
@@ -630,6 +729,55 @@ fn assert_triage_step_two_contains(needles: &[&str]) {
         assert!(
             step_two.contains(needle),
             "Step 2 of TRIAGE_SYSTEM_PROMPT must contain `{needle}`"
+        );
+    }
+}
+
+/// Core entry-point behavior: triage audits every BDD test a ticket names in its
+/// own expectations against that ticket's own gate, reports an unrun test as an
+/// inconsistency, and treats a narrow module or target gate as complete rather
+/// than flagging it for leaving broader transition-gate and review coverage out
+/// -- while the existing Step 2 wording, shared-story narrowing, evidence and
+/// blocked-triage retry contracts all survive.
+#[test]
+fn when_triaging_given_ticket_gate_is_narrow_then_audit_stays_ticket_local() {
+    assert_triage_step_two_contains(&[
+        "runs every BDD test named in that same ticket's own `test_expectations`",
+        "a named test the gate never runs is an omission",
+        "report every omission as an inconsistency in that ticket",
+        "A gate that selects the touched module or one focused test target is narrow rather than incomplete",
+        "do not flag it merely because the specification describes broader tests or lint that the transition gate and the review phase own",
+    ]);
+
+    let step_two = triage_step_two();
+    for legacy in TRIAGE_LEGACY_STEP_TWO_NEEDLES {
+        assert!(
+            step_two.contains(legacy),
+            "Step 2 of TRIAGE_SYSTEM_PROMPT must keep the legacy wording `{legacy}`"
+        );
+    }
+    for shared_story in [
+        "a specification story is shared across multiple draft tickets",
+        "a ticket carries a sibling ticket's verbatim criterion from that shared story",
+        "narrow that ticket's `acceptance_criteria` in its Agent Brief to the criteria its own scope implements",
+        "keep the classification `ready-for-agent`",
+        "when the story is not shared",
+        "no criteria are narrowed",
+    ] {
+        assert!(
+            step_two.contains(shared_story),
+            "Step 2 of TRIAGE_SYSTEM_PROMPT must keep its shared-story condition `{shared_story}`"
+        );
+    }
+
+    for blocked_triage_retry in [
+        "A payload the boundary rejects comes back to you as a tool error naming the ticket and the field to fix",
+        "A rejected payload never ends the pass",
+        "Rejected payloads are corrections, not failures",
+    ] {
+        assert!(
+            TRIAGE_SYSTEM_PROMPT.contains(blocked_triage_retry),
+            "TRIAGE_SYSTEM_PROMPT must keep its blocked-triage retry wording `{blocked_triage_retry}`"
         );
     }
 }

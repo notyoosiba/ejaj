@@ -9,7 +9,9 @@ Turn the specification below into an ordered set of tickets without prompting th
 ## Workflow
 
 1. **Inspect the codebase (read-only) with `execute_script`:** match existing module boundaries,
-   types, schemas and test harnesses before deciding anything. Use `tools.list(glob?)`,
+   types, schemas and test harnesses before deciding anything. The specification below and the live codebase are the only sources of task scope: take each requirement from the specification and each current module boundary, type, schema and test harness from the live code, and let the code answer every question about how the repository behaves today.
+   Never recover requirements, test names, design choices or verification commands from the Plan, from `.plan/` or `.plans/` task, proposal or tracker documents, or from any other tracker document: a requirement the specification did not state stays out of the ticket set.
+   Inspect a task or tracker file only when the specification explicitly requires modifying that exact path; then read only that exact path to match the existing structure the ticket edits -- its table row, checklist line or heading -- and copy nothing else from it. Use `tools.list(glob?)`,
    `tools.grep(pattern, glob?)` and `tools.read(path, startLine?, endLine?)` (1-based inclusive line
    numbers). Prefer one script that gathers multiple facts over many separate tool calls. Never
    write, build or test.
@@ -75,12 +77,15 @@ ticket is an object with exactly these fields:
   and treat that as typical sizing guidance rather than a hard minimum or a hard upper bound,
   splitting into an additional ticket when the feature genuinely needs more distinct test functions.
   Write test expectations only for executable source-code behavior -- never for documentation, `README.md`, `TODO.md`, `.plan/`/`.plans/` tracker files, or other human-facing prose. Every ticket that changes executable source code must carry at least one non-blank entry in `test_expectations`, and every substantive entry must name its test in lowercase `snake_case` `when_<action>_given_<context>_then_<outcome>` form (without
-  internal function or class names in the test title). A documentation-only or markdown-only ticket that modifies only documentation or markdown files and no executable source code may pass `test_expectations: []`, which renders as `None.`; test expectations are required only for executable source-code behavior.
+  internal function or class names in the test title). Every substantive entry must name a BDD test this ticket adds or updates, never an unrelated test that already exists unchanged.
+  A documentation-only or markdown-only ticket that modifies only documentation or markdown files and no executable source code may pass `test_expectations: []`, which renders as `None.`; test expectations are required only for executable source-code behavior.
 - `verification_gate`: the exact terminal command that must exit 0.
 
 The `verification_gate` must demonstrate this ticket's new behaviour and would fail before that
-behaviour exists. Use a narrow test selection (`cargo test <module>::tests`) or an appropriate
-content check (`cargo test && git grep -q <token> -- <path>`). Do not use the bare command
+behaviour exists. Recommend a gate that covers the touched modules or one focused target and runs every BDD test this ticket names in `test_expectations`.
+Use a narrow test selection (`cargo test <module>::tests`) for a touched module, or a target selection such as `cargo test --test <target>` for the touched test binary.
+Prefer that module or target selection over a `when_*` name-prefix filter, which can skip a named test and pass vacuously; never prescribe repository-wide tests or lint (`cargo test`, `cargo clippy`) as a ticket gate: the harness owns the full-suite and lint runs.
+Do not use the bare command
 `cargo test` when a narrower command proves the behaviour.
 
 Every `blocked_by` and `blocks` entry must name an id that exists in the set, and the set must be

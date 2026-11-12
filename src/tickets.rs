@@ -339,6 +339,22 @@ impl TicketSet {
                     ));
                 }
             }
+
+            let expected: Vec<&str> = ticket
+                .test_expectations
+                .iter()
+                .map(|entry| entry.trim())
+                .filter(|entry| !entry.is_empty() && !is_none_marker(entry))
+                .flat_map(bdd_test_identifiers)
+                .collect();
+            if let Some(skipped) = first_skipped_identifier(&expected, gate) {
+                return Err(format!(
+                    "[ERROR] ticket `{id}` has a verification gate that runs only filtered Cargo \
+                     tests and skips the expected test `{skipped}`; widen the gate to a module or \
+                     target selection, such as `cargo test tickets::tests`, so every test the \
+                     ticket names runs"
+                ));
+            }
         }
 
         Ok(())
@@ -354,8 +370,149 @@ fn is_none_marker(entry: &str) -> bool {
 /// Whether `text` contains a valid `when_<action>_given_<context>_then_<outcome>`
 /// identifier token in lowercase `snake_case`.
 pub fn has_bdd_test_name(text: &str) -> bool {
+    !bdd_test_identifiers(text).is_empty()
+}
+
+/// Every valid `when_<action>_given_<context>_then_<outcome>` identifier token in `text`, in
+/// the order it appears.
+fn bdd_test_identifiers(text: &str) -> Vec<&str> {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(is_bdd_test_identifier)
+        .filter(|token| is_bdd_test_identifier(token))
+        .collect()
+}
+
+/// The first identifier in `expected` that no Cargo test filter covers, in expectation/text
+/// order, or `None` when every identifier is covered.
+///
+/// Cargo's test-name filter coverage is substring coverage: a filter covers an identifier when the
+/// filter occurs within it. The check only applies to a gate whose recognized Cargo test
+/// invocations are all filter-only; any other gate returns `None` and keeps its existing
+/// acceptance.
+fn first_skipped_identifier<'a>(expected: &[&'a str], gate: &str) -> Option<&'a str> {
+    let commands = gate
+        .split("&&")
+        .flat_map(|command| command.split("||"))
+        .flat_map(|command| command.split(';'))
+        .map(str::trim)
+        .filter(|command| !command.is_empty());
+
+    let mut filters: Vec<&str> = Vec::new();
+    let mut saw_cargo_test = false;
+    for command in commands {
+        if !is_cargo_test_invocation(command) {
+            continue;
+        }
+        saw_cargo_test = true;
+        let Some(command_filters) = cargo_test_filters(command) else {
+            // One unfiltered, target-selecting or module-selecting Cargo test invocation is
+            // enough to run every test, so the gate keeps its existing acceptance.
+            return None;
+        };
+        filters.extend(command_filters);
+    }
+    if !saw_cargo_test {
+        // A build check, a shell-only gate or a gate with no command at all names no Cargo test
+        // invocation to judge: no expected identifier can be skipped.
+        return None;
+    }
+
+    expected
+        .iter()
+        .copied()
+        .find(|identifier| !filters.iter().any(|filter| identifier.contains(*filter)))
+}
+
+/// Whether `command` is a simple Cargo test invocation: a `cargo` token immediately followed
+/// by a `test` token.
+fn is_cargo_test_invocation(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let Some(cargo) = tokens.iter().position(|token| *token == "cargo") else {
+        return false;
+    };
+    tokens.get(cargo + 1).copied() == Some("test")
+}
+
+/// The positional `when_*` filters of a simple Cargo test invocation, or `None` when it is
+/// unfiltered, selects a module or target, or passes any other positional argument.
+///
+/// Command parsing stays deliberately shallow: the callers split the gate into simple commands
+/// and only look at `cargo test`; flags before `--` are skipped (target-selecting flags make the
+/// invocation unfiltered); known value-taking flags consume the following token so an option
+/// value such as a feature name is never mistaken for a test-name selector; and only the
+/// remaining positional arguments are treated as test-name filters.
+fn cargo_test_filters(command: &str) -> Option<Vec<&str>> {
+    const TARGET_FLAGS: [&str; 15] = [
+        "--lib",
+        "--bin",
+        "--bins",
+        "--test",
+        "--tests",
+        "--example",
+        "--examples",
+        "--bench",
+        "--benches",
+        "--all-targets",
+        "--all",
+        "--workspace",
+        "--doc",
+        "-p",
+        "--package",
+    ];
+    // Cargo options whose following token is a value, not a test-name selector. Target
+    // selections above stay unfiltered before this list is consulted.
+    const VALUE_FLAGS: [&str; 12] = [
+        "--features",
+        "-F",
+        "--exclude",
+        "--target",
+        "--target-dir",
+        "--manifest-path",
+        "--config",
+        "--jobs",
+        "-j",
+        "--profile",
+        "--message-format",
+        "--color",
+    ];
+
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let cargo = tokens.iter().position(|token| *token == "cargo")?;
+    let mut filters = Vec::new();
+    let mut index = cargo + 2;
+    while index < tokens.len() {
+        let token = tokens[index];
+        index += 1;
+        if token == "--" {
+            break;
+        }
+        if TARGET_FLAGS.contains(&token) {
+            return None;
+        }
+        if VALUE_FLAGS.contains(&token) {
+            // Consume the option value: it is not a test-name selector.
+            index += 1;
+            continue;
+        }
+        if VALUE_FLAGS.iter().any(|flag| {
+            token
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='))
+        }) {
+            continue;
+        }
+        if token.starts_with('-') {
+            continue;
+        }
+        if !token.starts_with("when_") {
+            return None;
+        }
+        filters.push(token);
+    }
+    if filters.is_empty() {
+        None
+    } else {
+        Some(filters)
+    }
 }
 
 /// Whether `token` is a single `when_<action>_given_<context>_then_<outcome>`
@@ -1154,6 +1311,236 @@ cargo test tickets
             "`when_parsing_set_given_valid_json_then_returns_ok` in `src/tickets.rs`.".to_string(),
         ];
         assert_eq!(set.validate(), Ok(()));
+    }
+
+    /// The base for the gate-coverage tests: the first ticket names `expectations` and its gate is
+    /// `gate`; the second ticket stays valid.
+    fn gate_set(expectations: &[&str], gate: &str) -> TicketSet {
+        let mut set = valid_set();
+        set.tickets[0].test_expectations =
+            expectations.iter().map(|entry| entry.to_string()).collect();
+        set.tickets[0].verification_gate = gate.to_string();
+        set
+    }
+
+    #[test]
+    fn when_validating_ticket_given_filtered_gate_skips_expected_test_then_rejects() {
+        let set = gate_set(
+            &[
+                "when_saving_given_empty_input_then_returns_error",
+                "when_saving_given_valid_input_then_saves",
+            ],
+            "cargo test when_saving_given_empty_input_then_returns_error",
+        );
+        let error = set.validate().expect_err("must not validate");
+        assert!(error.contains("1-first"), "{error}");
+        assert!(
+            error.contains("when_saving_given_valid_input_then_saves"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("when_saving_given_empty_input_then_returns_error"),
+            "the covered identifier is not skipped: {error}"
+        );
+        assert!(error.contains("module or target"), "{error}");
+
+        // Two skipped identifiers: the first in expectation/text order is the one named.
+        let set = gate_set(
+            &["when_saving_given_empty_input_then_returns_error and \
+                 when_loading_given_missing_file_then_errors and \
+                 when_loading_given_valid_file_then_loads"],
+            "cargo test when_saving_given_empty_input_then_returns_error",
+        );
+        let error = set.validate().expect_err("must not validate");
+        assert!(
+            error.contains("when_loading_given_missing_file_then_errors"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("when_loading_given_valid_file_then_loads"),
+            "{error}"
+        );
+
+        // Compound invocations that are all filter-only are judged by their union, which still
+        // misses the second expected identifier.
+        let set = gate_set(
+            &[
+                "when_saving_given_empty_input_then_returns_error",
+                "when_saving_given_valid_input_then_saves",
+            ],
+            "cargo test when_saving_given_empty_input_then_returns_error ; \
+             cargo test when_loading_given_missing_file_then_errors",
+        );
+        let error = set.validate().expect_err("must not validate");
+        assert!(error.contains("1-first"), "{error}");
+        assert!(
+            error.contains("when_saving_given_valid_input_then_saves"),
+            "{error}"
+        );
+        assert!(error.contains("module or target"), "{error}");
+    }
+
+    /// A known value-taking Cargo option consumes its value, so a feature name is not treated
+    /// as a positional test-name filter and cannot make a filtered gate look broader than it is.
+    #[test]
+    fn when_validating_ticket_given_feature_option_filtered_gate_skips_expected_test_then_rejects()
+    {
+        let expectations = [
+            "when_saving_given_empty_input_then_returns_error",
+            "when_saving_given_valid_input_then_saves",
+        ];
+        for gate in [
+            "cargo test --features reporting when_saving_given_empty_input_then_returns_error",
+            "cargo test --features=reporting when_saving_given_empty_input_then_returns_error",
+            "cargo test --features when_saving_given_valid_input_then_saves \
+             when_saving_given_empty_input_then_returns_error",
+        ] {
+            let set = gate_set(&expectations, gate);
+            let error = set.validate().expect_err("must not validate");
+            assert!(error.contains("1-first"), "{error}");
+            assert!(
+                error.contains("when_saving_given_valid_input_then_saves"),
+                "the skipped test is named for `{gate}`: {error}"
+            );
+            assert!(error.contains("module or target"), "{error}");
+        }
+    }
+
+    #[test]
+    fn when_validating_ticket_given_matching_filter_then_accepts() {
+        let set = gate_set(
+            &[
+                "when_saving_given_empty_input_then_returns_error",
+                "when_saving_given_valid_input_then_saves",
+            ],
+            "cargo test when_saving",
+        );
+        assert_eq!(set.validate(), Ok(()));
+
+        // A substring filter covers both identifiers named in one expectation.
+        let set = gate_set(
+            &["when_saving_given_empty_input_then_returns_error and \
+                 when_saving_given_valid_input_then_saves"],
+            "cargo test when_saving",
+        );
+        assert_eq!(set.validate(), Ok(()));
+
+        // The exact identifier is a filter too.
+        let set = gate_set(
+            &["when_saving_given_valid_input_then_saves"],
+            "cargo test when_saving_given_valid_input_then_saves",
+        );
+        assert_eq!(set.validate(), Ok(()));
+    }
+
+    #[test]
+    fn when_validating_ticket_given_compound_filters_cover_expectations_then_accepts() {
+        let expectations = [
+            "when_saving_given_empty_input_then_returns_error",
+            "when_saving_given_valid_input_then_saves",
+        ];
+        for (separator, gate) in [
+            (
+                "&&",
+                "cargo test when_saving_given_empty_input_then_returns_error && \
+                 cargo test when_saving_given_valid_input_then_saves",
+            ),
+            (
+                ";",
+                "cargo test when_saving_given_empty_input_then_returns_error ; \
+                 cargo test when_saving_given_valid_input_then_saves",
+            ),
+            (
+                "||",
+                "cargo test when_saving_given_empty_input_then_returns_error || \
+                 cargo test when_saving_given_valid_input_then_saves",
+            ),
+        ] {
+            let set = gate_set(&expectations, gate);
+            assert_eq!(
+                set.validate(),
+                Ok(()),
+                "`{separator}`-separated filters must cover both identifiers together"
+            );
+        }
+
+        // One invocation may carry several filters; together they cover both identifiers.
+        let set = gate_set(
+            &expectations,
+            "cargo test when_saving_given_empty_input_then_returns_error \
+             when_saving_given_valid_input_then_saves",
+        );
+        assert_eq!(set.validate(), Ok(()));
+    }
+
+    #[test]
+    fn when_validating_ticket_given_module_or_target_gate_then_accepts() {
+        let expectations = [
+            "when_saving_given_empty_input_then_returns_error",
+            "when_saving_given_valid_input_then_saves",
+        ];
+        for gate in [
+            "cargo test tickets::tests",
+            "cargo test --test tickets",
+            "cargo test --lib",
+            "cargo test --lib when_saving_given_empty_input_then_returns_error",
+            "cargo test --test tickets when_saving_given_empty_input_then_returns_error",
+            "cargo test -p ejaj when_saving_given_empty_input_then_returns_error",
+        ] {
+            let set = gate_set(&expectations, gate);
+            assert_eq!(
+                set.validate(),
+                Ok(()),
+                "a module or target selection must not spell out every test name: `{gate}`"
+            );
+        }
+    }
+
+    #[test]
+    fn when_validating_ticket_given_unfiltered_or_non_cargo_gate_then_accepts() {
+        let expectations = [
+            "when_saving_given_empty_input_then_returns_error",
+            "when_saving_given_valid_input_then_saves",
+        ];
+        for gate in [
+            "cargo test",
+            "cargo test --release",
+            "cargo test --features reporting",
+            "cargo test --features=reporting",
+            "cargo test --features when_saving_given_valid_input_then_saves",
+            "cargo test -- --nocapture",
+            "cargo test && cargo test when_saving_given_empty_input_then_returns_error",
+            "cargo check",
+            "cargo check && cargo clippy --all-targets -- -D warnings",
+            "cargo fmt --check",
+            "./scripts/verify.sh",
+            "true",
+        ] {
+            let set = gate_set(&expectations, gate);
+            assert_eq!(
+                set.validate(),
+                Ok(()),
+                "an unfiltered or non-Cargo gate keeps its acceptance: `{gate}`"
+            );
+        }
+
+        // Blank and `None.` entries name no test, so a filter-only gate has nothing to skip.
+        for expectations in [
+            Vec::new(),
+            vec!["", "   "],
+            vec!["None.", "  nOnE.  "],
+            vec!["", "None.", "   "],
+        ] {
+            let set = gate_set(
+                &expectations,
+                "cargo test when_saving_given_valid_input_then_saves",
+            );
+            assert_eq!(
+                set.validate(),
+                Ok(()),
+                "blank and marker expectations {expectations:?} create no coverage requirement"
+            );
+        }
     }
 
     /// A later criterion that repeats an earlier one after trimming and collapsing every
