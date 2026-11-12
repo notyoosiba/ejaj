@@ -10,7 +10,9 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::api::{CallError, FunctionCall, Message, Outgoing, RawResponse, Role, ToolCall};
+use crate::api::{
+    CallError, FunctionCall, Message, Outgoing, RawResponse, Role, TokenUsage, ToolCall,
+};
 use crate::llm::{LlmProvider, Prepared, factory};
 use crate::tools::{Phase, Tool};
 
@@ -143,6 +145,7 @@ impl LlmProvider for AnthropicProvider {
         // truncated. Every other stop reason -- absent, null, non-string,
         // empty or a different string -- keeps the ordinary behavior.
         let truncated = object.get("stop_reason").and_then(Value::as_str) == Some("max_tokens");
+        let usage = decode_anthropic_usage(object.get("usage"));
 
         let blocks = match object.get("content") {
             Some(Value::Array(blocks)) => blocks,
@@ -150,7 +153,7 @@ impl LlmProvider for AnthropicProvider {
             // A response that stopped at the output limit before emitting a
             // content array still carries useful state: the loop must see an
             // empty assistant turn rather than a malformed response.
-            None if truncated => return Ok(empty_assistant(true)),
+            None if truncated => return Ok(empty_assistant(true, usage)),
             None => return Err(no_usable_content(object)),
         };
 
@@ -181,7 +184,7 @@ impl LlmProvider for AnthropicProvider {
         let tool_calls = (!calls.is_empty()).then_some(calls);
         if content.is_none() && tool_calls.is_none() {
             if truncated {
-                return Ok(empty_assistant(true));
+                return Ok(empty_assistant(true, usage));
             }
             return Err(no_usable_content(object));
         }
@@ -193,6 +196,7 @@ impl LlmProvider for AnthropicProvider {
             tool_call_id: None,
             reasoning_content: None,
             extra: Map::new(),
+            usage,
             truncated,
         })
     }
@@ -201,7 +205,7 @@ impl LlmProvider for AnthropicProvider {
 /// The assistant turn an output-limit stop produces when nothing replayable
 /// came back. It keeps the wire's role so the loop can treat it as a normal
 /// reply that merely ran out of budget.
-fn empty_assistant(truncated: bool) -> Message {
+fn empty_assistant(truncated: bool, usage: Option<TokenUsage>) -> Message {
     Message {
         role: Role::Assistant,
         content: None,
@@ -209,8 +213,47 @@ fn empty_assistant(truncated: bool) -> Message {
         tool_call_id: None,
         reasoning_content: None,
         extra: Map::new(),
+        usage,
         truncated,
     }
+}
+
+/// Decode the Messages API `usage` object tolerantly. Absent, `null`,
+/// non-object, or wholly non-numeric usage yields no usage at all; each counter
+/// that does not have a valid non-negative integer value simply contributes
+/// zero. Total input is the saturating sum of the reported input, cache-read
+/// and cache-creation counters; only cache reads are cached input, and this
+/// mapping has no reasoning counter.
+fn decode_anthropic_usage(raw_usage: Option<&Value>) -> Option<TokenUsage> {
+    let object = raw_usage?.as_object()?;
+    let input_tokens = object.get("input_tokens").and_then(Value::as_u64);
+    let cache_read_input_tokens = object
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64);
+    let cache_creation_input_tokens = object
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    let output_tokens = object.get("output_tokens").and_then(Value::as_u64);
+
+    if input_tokens.is_none()
+        && cache_read_input_tokens.is_none()
+        && cache_creation_input_tokens.is_none()
+        && output_tokens.is_none()
+    {
+        return None;
+    }
+
+    let input_tokens = input_tokens
+        .unwrap_or(0)
+        .saturating_add(cache_read_input_tokens.unwrap_or(0))
+        .saturating_add(cache_creation_input_tokens.unwrap_or(0));
+
+    Some(TokenUsage {
+        input_tokens,
+        cached_input_tokens: cache_read_input_tokens.unwrap_or(0),
+        output_tokens: output_tokens.unwrap_or(0),
+        reasoning_tokens: 0,
+    })
 }
 
 /// Concatenate every system turn into the one native `system` field. The
@@ -425,7 +468,9 @@ fn usable_metadata_string(value: Option<&Value>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Auth, CallError, FunctionCall, Message, RawResponse, Role, ToolCall};
+    use crate::api::{
+        Auth, CallError, FunctionCall, Message, RawResponse, Role, TokenUsage, ToolCall,
+    };
     use crate::llm::factory::SmollSettings;
     use crate::retry::should_retry;
     use crate::tools::{Phase, Tool};
@@ -588,6 +633,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: Map::new(),
+            usage: None,
             truncated: false,
         }
     }
@@ -2235,6 +2281,269 @@ mod tests {
                 ),
                 other => panic!("body {body}: expected a malformed error, got {}", other),
             }
+        }
+    }
+
+    /// Core entry-point behavior: Anthropic reports input, cache-read and
+    /// cache-creation tokens independently. Total input includes both cache
+    /// kinds; only cache reads count as cached input, and this wire mapping
+    /// supplies no reasoning counter.
+    #[test]
+    fn when_decoding_given_anthropic_usage_then_maps_cache_read_and_creation_separately() {
+        let message = decoded(
+            &provider(),
+            raw(
+                200,
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":5,"cache_read_input_tokens":3,"cache_creation_input_tokens":2,"output_tokens":4}}"#,
+            ),
+        );
+
+        assert_eq!(message.content.as_deref(), Some("hello"));
+        assert_eq!(
+            message.usage,
+            Some(TokenUsage {
+                input_tokens: 10,
+                cached_input_tokens: 3,
+                output_tokens: 4,
+                reasoning_tokens: 0,
+            })
+        );
+    }
+
+    /// Edge-case table: absent, null, non-object and malformed counters never
+    /// fail valid content. A valid zero or any single valid counter yields
+    /// usage; only the counters that are valid contribute.
+    #[test]
+    fn when_decoding_given_missing_or_malformed_usage_counters_then_keeps_valid_content_and_uses_only_valid_counts()
+     {
+        let cases: [(&str, Option<TokenUsage>); 13] = [
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}]}"#,
+                None,
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":null}"#,
+                None,
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":5}"#,
+                None,
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":[5,3,2,4]}"#,
+                None,
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":"5"}"#,
+                None,
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":-1,"cache_read_input_tokens":"3","cache_creation_input_tokens":2.5,"output_tokens":null}}"#,
+                None,
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":0}}"#,
+                Some(TokenUsage {
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":7}}"#,
+                Some(TokenUsage {
+                    input_tokens: 7,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"cache_read_input_tokens":7}}"#,
+                Some(TokenUsage {
+                    input_tokens: 7,
+                    cached_input_tokens: 7,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"cache_creation_input_tokens":7}}"#,
+                Some(TokenUsage {
+                    input_tokens: 7,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"output_tokens":7}}"#,
+                Some(TokenUsage {
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    output_tokens: 7,
+                    reasoning_tokens: 0,
+                }),
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":5,"cache_read_input_tokens":"bad","cache_creation_input_tokens":-2,"output_tokens":4.5}}"#,
+                Some(TokenUsage {
+                    input_tokens: 5,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":-1,"cache_read_input_tokens":"3","cache_creation_input_tokens":2.5,"output_tokens":null,"other":"x"}}"#,
+                None,
+            ),
+        ];
+
+        for (body, expected) in cases {
+            let message = decoded(&provider(), raw(200, body));
+            assert_eq!(message.content.as_deref(), Some("hello"), "body {body}");
+            assert_eq!(message.usage, expected, "body {body}");
+        }
+    }
+
+    /// Contract check: total input is the saturating sum of all three input
+    /// counters, while cached input is exactly the cache-read counter, so
+    /// cache-creation tokens are included in total but never cached input.
+    #[test]
+    fn when_decoding_given_large_input_components_then_total_input_saturates_and_cache_read_alone_is_cached()
+     {
+        let cases: [(&str, TokenUsage); 4] = [
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":18446744073709551615,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":9}}"#,
+                TokenUsage {
+                    input_tokens: u64::MAX,
+                    cached_input_tokens: 0,
+                    output_tokens: 9,
+                    reasoning_tokens: 0,
+                },
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":18446744073709551615,"cache_read_input_tokens":1,"cache_creation_input_tokens":1,"output_tokens":5}}"#,
+                TokenUsage {
+                    input_tokens: u64::MAX,
+                    cached_input_tokens: 1,
+                    output_tokens: 5,
+                    reasoning_tokens: 0,
+                },
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":1,"cache_read_input_tokens":18446744073709551615,"cache_creation_input_tokens":2,"output_tokens":0}}"#,
+                TokenUsage {
+                    input_tokens: u64::MAX,
+                    cached_input_tokens: u64::MAX,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                },
+            ),
+            (
+                r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":18446744073709551615,"output_tokens":4}}"#,
+                TokenUsage {
+                    input_tokens: u64::MAX,
+                    cached_input_tokens: 3,
+                    output_tokens: 4,
+                    reasoning_tokens: 0,
+                },
+            ),
+        ];
+
+        for (body, expected) in cases {
+            let message = decoded(&provider(), raw(200, body));
+            assert_eq!(message.usage, Some(expected), "body {body}");
+        }
+    }
+
+    /// Regression: an output-limit stop that yields an accepted empty
+    /// assistant message still carries the usage the wire reported, whether
+    /// content is absent or present with nothing replayable.
+    #[test]
+    fn when_decoding_given_max_tokens_stop_with_valid_usage_then_retains_usage_for_empty_truncated_message()
+     {
+        for body in [
+            r#"{"stop_reason":"max_tokens","usage":{"input_tokens":5,"cache_read_input_tokens":3,"cache_creation_input_tokens":2,"output_tokens":4}}"#,
+            r#"{"stop_reason":"max_tokens","content":[],"usage":{"input_tokens":5,"cache_read_input_tokens":3,"cache_creation_input_tokens":2,"output_tokens":4}}"#,
+            r#"{"stop_reason":"max_tokens","content":[{"type":"thinking","thinking":"quiet"}],"usage":{"input_tokens":5,"cache_read_input_tokens":3,"cache_creation_input_tokens":2,"output_tokens":4}}"#,
+        ] {
+            let message = decoded(&provider(), raw(200, body));
+            assert_eq!(message.role, Role::Assistant, "body {body}");
+            assert!(message.content.is_none(), "body {body}");
+            assert!(message.tool_calls.is_none(), "body {body}");
+            assert!(message.truncated, "body {body}");
+            assert_eq!(
+                message.usage,
+                Some(TokenUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: 3,
+                    output_tokens: 4,
+                    reasoning_tokens: 0,
+                }),
+                "body {body}"
+            );
+        }
+    }
+
+    /// Regression: valid usage never rescues invalid content or an API error;
+    /// the existing malformed and API-error classifications are preserved.
+    #[test]
+    fn when_receiving_given_invalid_content_or_api_error_with_valid_usage_then_preserves_existing_error_behavior()
+     {
+        let usage = r#""usage":{"input_tokens":5,"cache_read_input_tokens":3,"cache_creation_input_tokens":2,"output_tokens":4}"#;
+
+        for body in [
+            format!(r#"{{"stop_reason":"end_turn","content":null,{usage}}}"#),
+            format!(r#"{{"stop_reason":"end_turn","content":"text",{usage}}}"#),
+            format!(r#"{{"stop_reason":"max_tokens","content":42,{usage}}}"#),
+            format!(r#"{{"stop_reason":"end_turn","content":{{}},{usage}}}"#),
+        ] {
+            match decode_error(&provider(), raw(200, &body)) {
+                CallError::Malformed(detail) => assert_eq!(
+                    detail, "the response content was not an array",
+                    "body {body}"
+                ),
+                other => panic!("body {body}: expected a malformed error, got {}", other),
+            }
+        }
+
+        let absent = format!(r#"{{"stop_reason":"end_turn",{usage}}}"#);
+        match decode_error(&provider(), raw(200, &absent)) {
+            CallError::Malformed(detail) => assert!(
+                detail.starts_with("the response carried no usable content"),
+                "unexpected detail {detail}"
+            ),
+            other => panic!("expected a malformed error, got {}", other),
+        }
+
+        for (status, message) in [(401, "invalid x-api-key"), (500, "boom")] {
+            let body = format!(
+                r#"{{"type":"error","error":{{"type":"api_error","message":"{message}"}},{usage}}}"#
+            );
+            match decode_error(&provider(), raw(status, &body)) {
+                CallError::Api {
+                    status: actual_status,
+                    message: actual_message,
+                } => {
+                    assert_eq!(actual_status, status);
+                    assert_eq!(actual_message, message);
+                }
+                other => panic!("status {status}: expected an API error, got {}", other),
+            }
+        }
+
+        let embedded = format!(
+            r#"{{"type":"error","error":{{"message":"overloaded"}},"content":[{{"type":"text","text":"partial"}}],{usage}}}"#
+        );
+        match decode_error(&provider(), raw(200, &embedded)) {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 200);
+                assert_eq!(message, "overloaded");
+            }
+            other => panic!("expected an API error, got {}", other),
         }
     }
 }

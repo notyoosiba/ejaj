@@ -1964,6 +1964,7 @@ fn request_handover_summary(
             "the handover summary response requested a tool instead of returning text".to_string(),
         );
     }
+    let usage = message.usage;
     let Some(content) = message.content else {
         return Err("the handover summary response carried no text".to_string());
     };
@@ -1988,6 +1989,7 @@ fn request_handover_summary(
         tool_call_id: None,
         reasoning_content: None,
         extra: serde_json::Map::new(),
+        usage,
         truncated: false,
     })
 }
@@ -2200,7 +2202,7 @@ fn drop_calls_from(messages: &mut [Message], assistant_index: usize, call_id: &s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Auth, FunctionCall, Outgoing, RawResponse, Role, Transport};
+    use crate::api::{Auth, FunctionCall, Outgoing, RawResponse, Role, TokenUsage, Transport};
     use crate::triage::{AgentBrief, TriageCategory, TriageState, TriageTicket};
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2525,6 +2527,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: Some(format!("reasoning {index}")),
                 extra: serde_json::Map::new(),
+                usage: None,
                 truncated: false,
             },
             Message::tool(&call_id, result),
@@ -2551,6 +2554,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: Some("reasoning".to_string()),
             extra: serde_json::Map::new(),
+            usage: None,
             truncated: false,
         }
     }
@@ -2602,6 +2606,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: Some("older reasoning".to_string()),
                 extra: serde_json::Map::new(),
+                usage: None,
                 truncated: false,
             },
             Message::user("m".repeat(500 * 1024)),
@@ -3490,6 +3495,28 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_str(&reply(content, calls)).expect("the scripted reply is JSON");
         value["choices"][0]["message"]["reasoning_content"] = serde_json::json!(reasoning);
+        value.to_string()
+    }
+
+    /// The same reply as [`reply`], with a provider `usage` object carrying the
+    /// given counters. The decoder is the only thing that turns those wire
+    /// counters into internal usage.
+    fn reply_with_usage(
+        content: Option<&str>,
+        calls: &[(&str, String)],
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+    ) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&reply(content, calls)).expect("the scripted reply is JSON");
+        value["usage"] = serde_json::json!({
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "prompt_tokens_details": { "cached_tokens": cached_input_tokens },
+            "completion_tokens_details": { "reasoning_tokens": reasoning_tokens },
+        });
         value.to_string()
     }
 
@@ -6353,6 +6380,69 @@ mod tests {
         assert_complete_tool_pairing(&ordinary);
     }
 
+    /// Core entry-point behavior: an accepted handover response whose provider
+    /// `usage` decoded successfully hands that usage to the replacement
+    /// assistant message, while the ordinary request's wire shape stays
+    /// unchanged.
+    #[test]
+    fn when_summarizing_given_a_valid_handover_response_with_usage_then_replacement_retains_summary_usage()
+     {
+        const SUMMARY_USAGE: TokenUsage = TokenUsage {
+            input_tokens: 1_200,
+            cached_input_tokens: 200,
+            output_tokens: 340,
+            reasoning_tokens: 40,
+        };
+        let script = Script::new(vec![
+            reply_with_usage(Some(HANDOVER_REPLY), &[], 1_200, 200, 340, 40),
+            reply(Some("done"), &[]),
+        ]);
+        let config = config(script.clone());
+        let original = summary_history();
+        let mut messages = original.clone();
+
+        assert!(matches!(
+            run_agent_loop(&mut messages, &config, Phase::Code, Source::None),
+            Stop::TurnEnd
+        ));
+        assert_eq!(
+            script.requests(),
+            2,
+            "one summary then one ordinary request"
+        );
+
+        assert_eq!(
+            messages[2].content.as_deref(),
+            Some(HANDOVER_REPLY),
+            "the accepted summary replaces the compactable middle"
+        );
+        assert_eq!(
+            messages[2].usage,
+            Some(SUMMARY_USAGE),
+            "the replacement retains the usage decoded from the summary response"
+        );
+
+        let sent = script.sent();
+        let ordinary = recorded_messages(&sent[1], "messages");
+        assert_eq!(
+            ordinary[2].content.as_deref(),
+            Some(HANDOVER_REPLY),
+            "the message sent in the ordinary request carries the summary text"
+        );
+        assert_eq!(
+            ordinary[2].usage, None,
+            "the ordinary request's wire cannot carry the internal usage"
+        );
+        assert!(
+            sent[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message.get("usage").is_none()),
+            "no message sent in the ordinary request carries a usage field"
+        );
+    }
+
     /// Maximum/upper boundary: the synthetic Tier 2 summary request is appended
     /// without clearing reasoning from the retained tail, and it neither
     /// rewrites the pinned prefix nor any other retained field.
@@ -7259,6 +7349,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: serde_json::Map::new(),
+            usage: None,
             truncated: false,
         });
         let original = messages.clone();
@@ -7299,6 +7390,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: serde_json::Map::new(),
+            usage: None,
             truncated: false,
         });
         let original = messages.clone();
@@ -7455,6 +7547,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: serde_json::Map::new(),
+            usage: None,
             truncated: false,
         });
 
@@ -9089,6 +9182,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: serde_json::Map::new(),
+            usage: None,
             truncated: false,
         }
     }
@@ -9103,6 +9197,7 @@ mod tests {
             tool_call_id: Some(id.to_string()),
             reasoning_content: None,
             extra: serde_json::Map::new(),
+            usage: None,
             truncated: false,
         }
     }

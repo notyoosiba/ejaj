@@ -109,6 +109,8 @@ impl Config {
                 auth_disabled: false,
                 reasoning_effort: None,
                 input_price_per_million_usd: None,
+                cached_input_price_per_million_usd: None,
+                output_price_per_million_usd: None,
             },
             giga: None,
             smoll: None,
@@ -158,6 +160,8 @@ impl Config {
             auth_disabled: false,
             reasoning_effort: None,
             input_price_per_million_usd: None,
+            cached_input_price_per_million_usd: None,
+            output_price_per_million_usd: None,
         });
         self
     }
@@ -295,6 +299,40 @@ impl Config {
             "smoll" => self.smoll_settings().input_price_per_million_usd,
             "mid" => self.mid.input_price_per_million_usd,
             "giga" => self.giga_settings().input_price_per_million_usd,
+            role => unreachable!("{role} is not a provider role"),
+        }
+    }
+
+    /// The optional cached-input price of the provider that serves `phase`,
+    /// selected by exactly the same canonical routing as
+    /// [`Config::input_price`]: the Smoll rate for Summary, the mode's own rate
+    /// for every non-summary phase, and within hybrid mode the Mid rate for Code
+    /// and the Giga rate for the planning and audit phases.
+    ///
+    /// `None` means the selected provider itself is unpriced; no other
+    /// provider's cached-input rate is substituted.
+    pub fn cached_input_price(&self, phase: tools::Phase) -> Option<f64> {
+        match self.provider_role(phase) {
+            "smoll" => self.smoll_settings().cached_input_price_per_million_usd,
+            "mid" => self.mid.cached_input_price_per_million_usd,
+            "giga" => self.giga_settings().cached_input_price_per_million_usd,
+            role => unreachable!("{role} is not a provider role"),
+        }
+    }
+
+    /// The optional output price of the provider that serves `phase`, selected
+    /// by exactly the same canonical routing as [`Config::input_price`]: the
+    /// Smoll rate for Summary, the mode's own rate for every non-summary phase,
+    /// and within hybrid mode the Mid rate for Code and the Giga rate for the
+    /// planning and audit phases.
+    ///
+    /// `None` means the selected provider itself is unpriced; no other
+    /// provider's output rate is substituted.
+    pub fn output_price(&self, phase: tools::Phase) -> Option<f64> {
+        match self.provider_role(phase) {
+            "smoll" => self.smoll_settings().output_price_per_million_usd,
+            "mid" => self.mid.output_price_per_million_usd,
+            "giga" => self.giga_settings().output_price_per_million_usd,
             role => unreachable!("{role} is not a provider role"),
         }
     }
@@ -957,6 +995,47 @@ mod tests {
         assert_eq!(config.mid.model, MID_MODEL);
     }
 
+    /// Contract: directly constructed provider settings, `Config::new`,
+    /// `Config::with_giga` and `SmollSettings::new` leave every new rate
+    /// unset, and no role inherits another role's price.
+    #[test]
+    fn when_constructing_provider_settings_given_rates_are_not_supplied_then_all_roles_default_to_unset_prices()
+     {
+        let direct = llm::factory::ProviderSettings {
+            url: MID_URL.to_string(),
+            model: MID_MODEL.to_string(),
+            api_key: Some("direct-key".to_string()),
+            auth_disabled: false,
+            reasoning_effort: None,
+            input_price_per_million_usd: None,
+            cached_input_price_per_million_usd: None,
+            output_price_per_million_usd: None,
+        };
+        assert_eq!(direct.input_price_per_million_usd, None);
+        assert_eq!(direct.cached_input_price_per_million_usd, None);
+        assert_eq!(direct.output_price_per_million_usd, None);
+
+        let config = Config::new(MID_URL, MID_MODEL, Some("mid-key".to_string())).with_giga(
+            GIGA_URL,
+            GIGA_MODEL,
+            Some("giga-key".to_string()),
+        );
+        assert_eq!(config.mid.input_price_per_million_usd, None);
+        assert_eq!(config.mid.cached_input_price_per_million_usd, None);
+        assert_eq!(config.mid.output_price_per_million_usd, None);
+
+        let giga = config.giga.as_ref().expect("the giga block is recorded");
+        assert_eq!(giga.input_price_per_million_usd, None);
+        assert_eq!(giga.cached_input_price_per_million_usd, None);
+        assert_eq!(giga.output_price_per_million_usd, None);
+
+        let smoll = llm::factory::SmollSettings::new(SMOLL_URL, SMOLL_MODEL, "smoll-key")
+            .expect("a non-blank key configures Smoll");
+        assert_eq!(smoll.input_price_per_million_usd, None);
+        assert_eq!(smoll.cached_input_price_per_million_usd, None);
+        assert_eq!(smoll.output_price_per_million_usd, None);
+    }
+
     /// The triage pass designs rather than runs: in hybrid mode it goes to the
     /// giga provider, and the phases that already had a route keep it.
     #[test]
@@ -1301,17 +1380,149 @@ mod tests {
         }
     }
 
+    /// One provider's three optional per-million-token rates, as the fixtures
+    /// and expectations below express them: a whole role at a glance, so a test
+    /// can compare the serving provider's triple against a sibling's.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Rates {
+        input: Option<f64>,
+        cached_input: Option<f64>,
+        output: Option<f64>,
+    }
+
+    impl Rates {
+        /// Nothing configured: the empty/nil end of the rate table.
+        const NONE: Rates = Rates {
+            input: None,
+            cached_input: None,
+            output: None,
+        };
+
+        /// A provider priced for input tokens only, the shape every earlier
+        /// configuration and every example in `.env.example` before this ticket
+        /// has.
+        const fn input_only(input: Option<f64>) -> Rates {
+            Rates {
+                input,
+                cached_input: None,
+                output: None,
+            }
+        }
+
+        /// The three rates in the order the fixture writes them to the
+        /// environment: input, cached input, output.
+        const fn triple(self) -> [Option<f64>; 3] {
+            [self.input, self.cached_input, self.output]
+        }
+    }
+
+    /// One rate kind, so a table can step over input, cached input and output
+    /// without repeating the accessor call three times.
+    #[derive(Clone, Copy, Debug)]
+    enum RateKind {
+        Input,
+        CachedInput,
+        Output,
+    }
+
+    impl RateKind {
+        const ALL: [RateKind; 3] = [RateKind::Input, RateKind::CachedInput, RateKind::Output];
+
+        /// This kind of rate from one provider's fixture triple.
+        fn of(self, rates: Rates) -> Option<f64> {
+            match self {
+                RateKind::Input => rates.input,
+                RateKind::CachedInput => rates.cached_input,
+                RateKind::Output => rates.output,
+            }
+        }
+
+        /// This kind of rate for `phase`, read only through the public
+        /// accessors.
+        fn select(self, config: &Config, phase: Phase) -> Option<f64> {
+            match self {
+                RateKind::Input => config.input_price(phase),
+                RateKind::CachedInput => config.cached_input_price(phase),
+                RateKind::Output => config.output_price(phase),
+            }
+        }
+    }
+
+    /// The nine canonical rate variables, one triple per provider role in the
+    /// same order as [`Rates::triple`].
+    const RATE_VARIABLES: [(&str, [&str; 3]); 3] = [
+        (
+            "mid",
+            [
+                "LLM_MID_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_MID_CACHED_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_MID_OUTPUT_PRICE_PER_MILLION_USD",
+            ],
+        ),
+        (
+            "giga",
+            [
+                "LLM_GIGA_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_GIGA_CACHED_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_GIGA_OUTPUT_PRICE_PER_MILLION_USD",
+            ],
+        ),
+        (
+            "smoll",
+            [
+                "LLM_SMOLL_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_SMOLL_CACHED_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_SMOLL_OUTPUT_PRICE_PER_MILLION_USD",
+            ],
+        ),
+    ];
+
+    /// Each fixture role's three rates, distinct from the other roles' so a
+    /// phase's price identifies the provider that served it: mid 1.25 / 0.31 /
+    /// 5.0, giga 2.5 / 0.62 / 10.0, smoll 3.75 / 0.94 / 15.0.
+    const MID_RATES: Rates = Rates {
+        input: Some(1.25),
+        cached_input: Some(0.31),
+        output: Some(5.0),
+    };
+    const GIGA_RATES: Rates = Rates {
+        input: Some(2.5),
+        cached_input: Some(0.62),
+        output: Some(10.0),
+    };
+    const SMOLL_RATES: Rates = Rates {
+        input: Some(3.75),
+        cached_input: Some(0.94),
+        output: Some(15.0),
+    };
+
+    /// The fixture triple of one canonical provider role, or a panic naming the
+    /// role that is not one.
+    fn role_rates(role: &str) -> Rates {
+        match role {
+            "mid" => MID_RATES,
+            "giga" => GIGA_RATES,
+            "smoll" => SMOLL_RATES,
+            other => panic!("`{other}` is not a provider role"),
+        }
+    }
+
+    /// Every phase price of one configuration, read only through the public
+    /// accessors.
+    fn phase_rates(config: &Config, phase: Phase) -> Rates {
+        Rates {
+            input: config.input_price(phase),
+            cached_input: config.cached_input_price(phase),
+            output: config.output_price(phase),
+        }
+    }
+
     /// Build a configuration whose three provider blocks each carry the given
-    /// optional rate, through the same isolated environment seam production
+    /// optional rates, through the same isolated environment seam production
     /// uses. The phase-routed price tests can distinguish the serving
     /// provider's value from a sibling provider's value without mutating
     /// private settings.
-    fn priced_config(
-        mode: Mode,
-        mid_rate: Option<f64>,
-        giga_rate: Option<f64>,
-        smoll_rate: Option<f64>,
-    ) -> Config {
+    fn fully_priced_config(mode: Mode, mid: Rates, giga: Rates, smoll: Rates) -> Config {
         let mut values: Vec<(&'static str, String)> =
             canonical_environment(mode.label(), "high", "high")
                 .into_iter()
@@ -1325,13 +1536,11 @@ mod tests {
             *auth = "bearer".to_string();
         }
 
-        for (name, rate) in [
-            ("LLM_MID_INPUT_PRICE_PER_MILLION_USD", mid_rate),
-            ("LLM_GIGA_INPUT_PRICE_PER_MILLION_USD", giga_rate),
-            ("LLM_SMOLL_INPUT_PRICE_PER_MILLION_USD", smoll_rate),
-        ] {
-            if let Some(rate) = rate {
-                values.push((name, rate.to_string()));
+        for ((_, variables), rates) in RATE_VARIABLES.iter().zip([mid, giga, smoll]) {
+            for (variable, rate) in variables.iter().zip(rates.triple()) {
+                if let Some(rate) = rate {
+                    values.push((*variable, rate.to_string()));
+                }
             }
         }
 
@@ -1343,6 +1552,22 @@ mod tests {
         };
         Config::from_environment(&environment)
             .unwrap_or_else(|message| panic!("{mode:?} priced environment must resolve: {message}"))
+    }
+
+    /// The same fixture restricted to the input rate every earlier test
+    /// configures, so those tests keep saying only what they mean.
+    fn priced_config(
+        mode: Mode,
+        mid_rate: Option<f64>,
+        giga_rate: Option<f64>,
+        smoll_rate: Option<f64>,
+    ) -> Config {
+        fully_priced_config(
+            mode,
+            Rates::input_only(mid_rate),
+            Rates::input_only(giga_rate),
+            Rates::input_only(smoll_rate),
+        )
     }
 
     /// Core entry-point behavior: every phase selects the optional input rate of
@@ -1864,5 +2089,190 @@ mod tests {
             Some(1.25),
         );
         assert_eq!(retry.input_price(Phase::Summary), Some(3.75));
+    }
+
+    /// Core entry-point behavior: cached-input and output prices follow exactly
+    /// the routing the input price already uses -- Smoll for Summary in every
+    /// mode, Mid in Mid mode, Giga in Giga mode, and in Hybrid mode Mid for Code
+    /// against Giga for Plan, Spec, Tickets, Triage and Review. The three roles
+    /// carry 1.25 / 0.31 / 5.0, 2.5 / 0.62 / 10.0 and 3.75 / 0.94 / 15.0, so a
+    /// selected triple names the role that served the phase.
+    #[test]
+    fn when_selecting_phase_prices_given_each_provider_mode_then_returns_the_selected_roles_rates()
+    {
+        let configurations = [
+            (
+                Mode::Mid,
+                fully_priced_config(Mode::Mid, MID_RATES, GIGA_RATES, SMOLL_RATES),
+            ),
+            (
+                Mode::Giga,
+                fully_priced_config(Mode::Giga, MID_RATES, GIGA_RATES, SMOLL_RATES),
+            ),
+            (
+                Mode::Hybrid,
+                fully_priced_config(Mode::Hybrid, MID_RATES, GIGA_RATES, SMOLL_RATES),
+            ),
+        ];
+
+        for (mode, config) in configurations {
+            for phase in PHASES {
+                let expected = match (mode, phase) {
+                    (_, Phase::Summary) => SMOLL_RATES,
+                    (Mode::Mid, _) => MID_RATES,
+                    (Mode::Giga, _) => GIGA_RATES,
+                    (Mode::Hybrid, Phase::Code) => MID_RATES,
+                    (Mode::Hybrid, _) => GIGA_RATES,
+                };
+                assert_eq!(
+                    phase_rates(&config, phase),
+                    expected,
+                    "mode {mode:?} phase {phase:?}"
+                );
+                for kind in RateKind::ALL {
+                    assert_eq!(
+                        kind.select(&config, phase),
+                        kind.of(expected),
+                        "mode {mode:?} phase {phase:?} {kind:?}"
+                    );
+                }
+            }
+        }
+
+        // The hybrid split read straight off the accessors: Code is the Mid
+        // provider's rate and every planning or audit phase is Giga's.
+        let hybrid = fully_priced_config(Mode::Hybrid, MID_RATES, GIGA_RATES, SMOLL_RATES);
+        assert_eq!(hybrid.cached_input_price(Phase::Code), Some(0.31));
+        assert_eq!(hybrid.output_price(Phase::Code), Some(5.0));
+        assert_eq!(hybrid.cached_input_price(Phase::Plan), Some(0.62));
+        assert_eq!(hybrid.output_price(Phase::Review), Some(10.0));
+        assert_eq!(hybrid.cached_input_price(Phase::Summary), Some(0.94));
+        assert_eq!(hybrid.output_price(Phase::Summary), Some(15.0));
+    }
+
+    /// Edge-case table: when the selected role has no cached-input or output
+    /// rate, that rate stays `None`. The other providers' configured rates are
+    /// never substituted, whichever role is the unpriced one and whichever rate
+    /// kind is missing.
+    #[test]
+    fn when_selecting_phase_prices_given_the_selected_role_has_no_rate_then_does_not_fall_back() {
+        let cases = [
+            (
+                "mid mode, unpriced mid",
+                Mode::Mid,
+                "mid",
+                fully_priced_config(Mode::Mid, Rates::NONE, GIGA_RATES, SMOLL_RATES),
+            ),
+            (
+                "giga mode, unpriced giga",
+                Mode::Giga,
+                "giga",
+                fully_priced_config(Mode::Giga, MID_RATES, Rates::NONE, SMOLL_RATES),
+            ),
+            (
+                "hybrid, unpriced mid",
+                Mode::Hybrid,
+                "mid",
+                fully_priced_config(Mode::Hybrid, Rates::NONE, GIGA_RATES, SMOLL_RATES),
+            ),
+            (
+                "hybrid, unpriced giga",
+                Mode::Hybrid,
+                "giga",
+                fully_priced_config(Mode::Hybrid, MID_RATES, Rates::NONE, SMOLL_RATES),
+            ),
+            (
+                "hybrid, unpriced smoll",
+                Mode::Hybrid,
+                "smoll",
+                fully_priced_config(Mode::Hybrid, MID_RATES, GIGA_RATES, Rates::NONE),
+            ),
+        ];
+
+        for (label, mode, unpriced_role, config) in cases {
+            for phase in PHASES {
+                let (_, selected_role) = expected_route(mode, phase);
+                for kind in RateKind::ALL {
+                    let expected = if selected_role == unpriced_role {
+                        None
+                    } else {
+                        kind.of(role_rates(selected_role))
+                    };
+                    assert_eq!(
+                        kind.select(&config, phase),
+                        expected,
+                        "{label}: phase {phase:?} selected {selected_role} {kind:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Contract and invariant check: deriving the Hybrid Code retry keeps every
+    /// configured rate on both provider blocks, so the retry's Code route
+    /// selects Giga's rates while the configuration it derives from keeps Mid
+    /// for Code and Summary keeps the Smoll provider and rate.
+    #[test]
+    fn when_retrying_hybrid_code_given_giga_rates_are_configured_then_retry_uses_giga_without_changing_original_routing()
+     {
+        let hybrid = fully_priced_config(Mode::Hybrid, MID_RATES, GIGA_RATES, SMOLL_RATES);
+
+        let retry = hybrid.code_retry_config();
+
+        assert_eq!(retry.provider_role(Phase::Code), "giga");
+        assert_eq!(phase_rates(&retry, Phase::Code), GIGA_RATES);
+        assert_eq!(retry.cached_input_price(Phase::Code), Some(0.62));
+        assert_eq!(retry.output_price(Phase::Code), Some(10.0));
+        assert_eq!(retry.provider_role(Phase::Summary), "smoll");
+        assert_eq!(phase_rates(&retry, Phase::Summary), SMOLL_RATES);
+        assert_eq!(retry.cached_input_price(Phase::Summary), Some(0.94));
+        assert_eq!(retry.output_price(Phase::Summary), Some(15.0));
+
+        assert_eq!(hybrid.provider_role(Phase::Code), "mid");
+        assert_eq!(phase_rates(&hybrid, Phase::Code), MID_RATES);
+        assert_eq!(hybrid.cached_input_price(Phase::Code), Some(0.31));
+        assert_eq!(hybrid.output_price(Phase::Code), Some(5.0));
+        assert_eq!(hybrid.provider_role(Phase::Summary), "smoll");
+        assert_eq!(phase_rates(&hybrid, Phase::Summary), SMOLL_RATES);
+        assert_eq!(phase_rates(&hybrid, Phase::Plan), GIGA_RATES);
+    }
+
+    /// Regression: configurations that configure only the input rate keep their
+    /// existing input-price routing, and their cached-input and output prices
+    /// stay unset rather than being derived from the input price.
+    #[test]
+    fn when_resolving_phase_prices_given_existing_input_rates_then_preserves_input_price_routing() {
+        for mode in [Mode::Mid, Mode::Giga, Mode::Hybrid] {
+            let config = priced_config(mode, Some(1.25), Some(2.5), Some(3.75));
+            for phase in PHASES {
+                let expected = match (mode, phase) {
+                    (_, Phase::Summary) => Some(3.75),
+                    (Mode::Mid, _) => Some(1.25),
+                    (Mode::Giga, _) => Some(2.5),
+                    (Mode::Hybrid, Phase::Code) => Some(1.25),
+                    (Mode::Hybrid, _) => Some(2.5),
+                };
+                assert_eq!(
+                    config.input_price(phase),
+                    expected,
+                    "mode {mode:?} phase {phase:?} input"
+                );
+                assert_eq!(
+                    config.cached_input_price(phase),
+                    None,
+                    "mode {mode:?} phase {phase:?} cached input"
+                );
+                assert_eq!(
+                    config.output_price(phase),
+                    None,
+                    "mode {mode:?} phase {phase:?} output"
+                );
+            }
+        }
+
+        let hybrid = priced_config(Mode::Hybrid, Some(1.25), Some(2.5), Some(3.75));
+        assert_eq!(hybrid.input_price(Phase::Code), Some(1.25));
+        assert_eq!(hybrid.input_price(Phase::Plan), Some(2.5));
+        assert_eq!(hybrid.input_price(Phase::Summary), Some(3.75));
     }
 }

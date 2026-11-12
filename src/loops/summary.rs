@@ -1244,6 +1244,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: Some("group reasoning".to_string()),
             extra: evidence("provider_field", serde_json::json!("group")),
+            usage: None,
             truncated: false,
         });
         messages.push(Message {
@@ -1253,6 +1254,7 @@ mod tests {
             tool_call_id: Some("call-1".to_string()),
             reasoning_content: Some("tool reasoning one".to_string()),
             extra: evidence("trace", serde_json::json!(1)),
+            usage: None,
             truncated: false,
         });
         messages.push(Message {
@@ -1262,6 +1264,7 @@ mod tests {
             tool_call_id: Some("call-2".to_string()),
             reasoning_content: Some("tool reasoning two".to_string()),
             extra: evidence("trace", serde_json::json!(2)),
+            usage: None,
             truncated: false,
         });
         messages.push(Message {
@@ -1271,6 +1274,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: Some("narration reasoning".to_string()),
             extra: evidence("provider_field", serde_json::json!("narration")),
+            usage: None,
             truncated: false,
         });
         messages.push(Message {
@@ -1280,6 +1284,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: Some("user reasoning".to_string()),
             extra: evidence("provider_field", serde_json::json!("user")),
+            usage: None,
             truncated: false,
         });
         messages

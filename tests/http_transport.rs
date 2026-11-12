@@ -341,6 +341,8 @@ fn when_sending_given_existing_provider_authentication_then_preserves_json_conte
         auth_disabled: false,
         reasoning_effort: None,
         input_price_per_million_usd: None,
+        cached_input_price_per_million_usd: None,
+        output_price_per_million_usd: None,
     });
     let prepared = provider.prepare(&[Message::system("sys"), Message::user("hi")], Phase::Code);
     let expected_body = prepared.outgoing.body.clone();

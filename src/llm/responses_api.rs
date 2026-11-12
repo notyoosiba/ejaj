@@ -34,6 +34,8 @@ struct ResponsesResponse {
     status: Option<Value>,
     #[serde(default)]
     incomplete_details: Option<Value>,
+    #[serde(default)]
+    usage: Option<Value>,
 }
 
 /// A provider that speaks OpenAI's `/v1/responses` wire format.
@@ -140,6 +142,8 @@ impl LlmProvider for ResponsesProvider {
             response.status.as_ref(),
             response.incomplete_details.as_ref(),
         );
+        let usage = decode_responses_usage(response.usage.as_ref());
+
         // The exact signal is the only case where the provider may legitimately
         // send nothing to replay: an absent or empty output then decodes to an
         // empty assistant turn instead of the ordinary no-output error.
@@ -189,9 +193,46 @@ impl LlmProvider for ResponsesProvider {
             tool_call_id: None,
             reasoning_content: None,
             extra: Map::new(),
+            usage,
             truncated,
         })
     }
+}
+
+/// Decode the Responses API `usage` object tolerantly. Absent, `null`,
+/// non-object, or wholly non-numeric usage yields no usage at all; each counter
+/// that does not have a valid non-negative integer value simply contributes
+/// zero. The nested cached and reasoning counters are subsets of their parent
+/// totals, never additions to them.
+fn decode_responses_usage(raw_usage: Option<&Value>) -> Option<api::TokenUsage> {
+    let object = raw_usage?.as_object()?;
+    let input_tokens = object.get("input_tokens").and_then(Value::as_u64);
+    let cached_input_tokens = object
+        .get("input_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64);
+    let output_tokens = object.get("output_tokens").and_then(Value::as_u64);
+    let reasoning_tokens = object
+        .get("output_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(Value::as_u64);
+
+    if input_tokens.is_none()
+        && cached_input_tokens.is_none()
+        && output_tokens.is_none()
+        && reasoning_tokens.is_none()
+    {
+        return None;
+    }
+
+    Some(api::TokenUsage {
+        input_tokens: input_tokens.unwrap_or(0),
+        cached_input_tokens: cached_input_tokens.unwrap_or(0),
+        output_tokens: output_tokens.unwrap_or(0),
+        reasoning_tokens: reasoning_tokens.unwrap_or(0),
+    })
 }
 
 /// Whether the response reports the one exact output-limit signal: a status
@@ -332,7 +373,7 @@ fn output_text(item: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Auth, FunctionCall, ToolCall};
+    use crate::api::{Auth, FunctionCall, TokenUsage, ToolCall};
     use crate::llm::factory::ProviderSettings;
     use serde_json::Value;
 
@@ -345,6 +386,8 @@ mod tests {
             auth_disabled: false,
             reasoning_effort: reasoning_effort.map(str::to_string),
             input_price_per_million_usd: None,
+            cached_input_price_per_million_usd: None,
+            output_price_per_million_usd: None,
         })
     }
 
@@ -402,6 +445,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: Map::new(),
+            usage: None,
             truncated: false,
         }
     }
@@ -431,6 +475,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             extra: Map::new(),
+            usage: None,
             truncated: false,
         }];
         let prepared = provider(None).prepare(&messages, Phase::Code);
@@ -516,6 +561,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: Some("hidden chain of thought".to_string()),
             extra: serde_json::from_value(json!({"foo": "bar", "tool_call_id": "nope"})).unwrap(),
+            usage: None,
             truncated: false,
         };
         let prepared = provider(None).prepare(&[assistant], Phase::Code);
@@ -1080,6 +1126,265 @@ mod tests {
                 assert_eq!(message, "overloaded");
             }
             other => panic!("expected an API error, got {}", other),
+        }
+    }
+
+    /// Core entry-point behavior: every counter a Responses API provider
+    /// reports maps independently onto the shared usage type.
+    #[test]
+    fn when_decoding_given_responses_usage_then_maps_all_reported_counters() {
+        let body = r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":3},"output_tokens":4,"output_tokens_details":{"reasoning_tokens":2}}}"#;
+        let message = decoded(&provider(None), raw(200, body));
+
+        assert_eq!(
+            message.usage,
+            Some(TokenUsage {
+                input_tokens: 10,
+                cached_input_tokens: 3,
+                output_tokens: 4,
+                reasoning_tokens: 2,
+            })
+        );
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.content.as_deref(), Some("hello"));
+        assert!(!message.truncated);
+    }
+
+    /// Edge-case table: a usage payload that is absent, null, wrongly shaped,
+    /// negative, fractional, or otherwise non-numeric never fails an otherwise
+    /// valid response. Valid counters survive independently; a recognized zero
+    /// counts as valid; no valid counter means no usage at all.
+    #[test]
+    fn when_decoding_given_missing_or_malformed_usage_counters_then_keeps_valid_output_and_uses_only_valid_counts()
+     {
+        let zero = TokenUsage {
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let cases: [(&str, Option<&str>, Option<TokenUsage>); 18] = [
+            ("absent usage", None, None),
+            ("null usage", Some("null"), None),
+            ("numeric usage", Some("7"), None),
+            ("array usage", Some("[]"), None),
+            ("string usage", Some(r#""10""#), None),
+            ("empty usage object", Some("{}"), None),
+            ("negative counter", Some(r#"{"input_tokens":-1}"#), None),
+            ("fractional counter", Some(r#"{"input_tokens":10.5}"#), None),
+            ("string counter", Some(r#"{"input_tokens":"10"}"#), None),
+            ("null counter", Some(r#"{"input_tokens":null}"#), None),
+            (
+                "non-object input details",
+                Some(r#"{"input_tokens":5,"input_tokens_details":7}"#),
+                Some(TokenUsage {
+                    input_tokens: 5,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+            ),
+            (
+                "non-object output details",
+                Some(r#"{"output_tokens":6,"output_tokens_details":[]}"#),
+                Some(TokenUsage {
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    output_tokens: 6,
+                    reasoning_tokens: 0,
+                }),
+            ),
+            (
+                "all counters invalid",
+                Some(
+                    r#"{"input_tokens":-10,"output_tokens":-4.5,"input_tokens_details":{"cached_tokens":"3"},"output_tokens_details":{"reasoning_tokens":2.5}}"#,
+                ),
+                None,
+            ),
+            (
+                "valid zero input",
+                Some(r#"{"input_tokens":0}"#),
+                Some(zero),
+            ),
+            (
+                "valid zero nested counters",
+                Some(
+                    r#"{"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}"#,
+                ),
+                Some(zero),
+            ),
+            (
+                "one valid counter",
+                Some(
+                    r#"{"input_tokens":-1,"output_tokens":4,"input_tokens_details":{"cached_tokens":null}}"#,
+                ),
+                Some(TokenUsage {
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    output_tokens: 4,
+                    reasoning_tokens: 0,
+                }),
+            ),
+            (
+                "valid and invalid counters together",
+                Some(
+                    r#"{"input_tokens":10,"output_tokens":"4","input_tokens_details":{"cached_tokens":-3},"output_tokens_details":{"reasoning_tokens":2.5}}"#,
+                ),
+                Some(TokenUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+            ),
+            (
+                "maximum counter",
+                Some(r#"{"input_tokens":18446744073709551615}"#),
+                Some(TokenUsage {
+                    input_tokens: u64::MAX,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+            ),
+        ];
+
+        for (case, usage, expected) in cases {
+            let body = match usage {
+                Some(usage) => format!(
+                    r#"{{"output":[{{"type":"message","content":[{{"type":"output_text","text":"hello"}}]}}],"usage":{usage}}}"#
+                ),
+                None => {
+                    r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]}"#
+                        .to_string()
+                }
+            };
+            let message = decoded(&provider(None), raw(200, &body));
+
+            assert_eq!(message.role, Role::Assistant, "case {case}");
+            assert_eq!(message.content.as_deref(), Some("hello"), "case {case}");
+            assert!(!message.truncated, "case {case}");
+            assert_eq!(message.usage, expected, "case {case}");
+        }
+    }
+
+    /// Contract and invariant: the nested cached and reasoning counters are
+    /// already included in their parent totals, so they are never added to
+    /// them a second time.
+    #[test]
+    fn when_decoding_given_usage_details_then_does_not_add_cached_or_reasoning_counts_to_totals() {
+        let body = r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":40},"output_tokens":50,"output_tokens_details":{"reasoning_tokens":20}}}"#;
+        let message = decoded(&provider(None), raw(200, body));
+
+        let usage = message.usage.expect("the reported usage survives");
+        assert_eq!(
+            usage.input_tokens, 100,
+            "cached input tokens stay a subset of the input total"
+        );
+        assert_eq!(usage.cached_input_tokens, 40);
+        assert_eq!(
+            usage.output_tokens, 50,
+            "reasoning tokens stay a subset of the output total"
+        );
+        assert_eq!(usage.reasoning_tokens, 20);
+    }
+
+    /// Regression: the exact incomplete/max-output-token signal accepts an
+    /// absent or empty output as a truncated assistant turn and retains the
+    /// valid usage the same body reports.
+    #[test]
+    fn when_decoding_given_exact_max_output_signal_with_valid_usage_then_retains_usage_for_empty_output()
+     {
+        let usage = r#""usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":3},"output_tokens":4,"output_tokens_details":{"reasoning_tokens":2}}"#;
+        let expected = Some(TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 3,
+            output_tokens: 4,
+            reasoning_tokens: 2,
+        });
+
+        for body in [
+            format!(
+                r#"{{"status":"incomplete","incomplete_details":{{"reason":"max_output_tokens"}},{usage}}}"#
+            ),
+            format!(
+                r#"{{"status":"incomplete","incomplete_details":{{"reason":"max_output_tokens"}},"output":null,{usage}}}"#
+            ),
+            format!(
+                r#"{{"status":"incomplete","incomplete_details":{{"reason":"max_output_tokens"}},"output":[],{usage}}}"#
+            ),
+            format!(
+                r#"{{"status":"incomplete","incomplete_details":{{"reason":"max_output_tokens"}},"output":[{{"type":"message","content":[{{"type":"output_text","text":""}}]}}],{usage}}}"#
+            ),
+        ] {
+            let message = decoded(&provider(None), raw(200, &body));
+
+            assert!(message.truncated, "body {body}");
+            assert_eq!(message.role, Role::Assistant, "body {body}");
+            assert!(message.content.is_none(), "body {body}");
+            assert!(message.tool_calls.is_none(), "body {body}");
+            assert_eq!(message.usage, expected, "body {body}");
+        }
+    }
+
+    /// Regression: a rejected status, a 2xx error object, and every existing
+    /// no-output error keep their classification and message even when the body
+    /// carries a valid usage object.
+    #[test]
+    fn when_receiving_given_non_success_or_existing_no_output_error_with_valid_usage_then_returns_the_existing_error()
+     {
+        let usage = r#""usage":{"input_tokens":10,"output_tokens":4}"#;
+
+        let with_error_object = format!(r#"{{"error":{{"message":"overloaded"}},{usage}}}"#);
+        match decode_error(&provider(None), raw(503, &with_error_object)) {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 503);
+                assert_eq!(message, "overloaded");
+            }
+            other => panic!("expected an API error, got {}", other),
+        }
+
+        let without_error_object = format!(r#"{{"detail":"bad request",{usage}}}"#);
+        match decode_error(&provider(None), raw(400, &without_error_object)) {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 400);
+                assert_eq!(message, without_error_object);
+            }
+            other => panic!("expected an API error, got {}", other),
+        }
+
+        let overloaded = format!(r#"{{"error":{{"message":"overloaded"}},"output":[],{usage}}}"#);
+        match decode_error(&provider(None), raw(200, &overloaded)) {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 200);
+                assert_eq!(message, "overloaded");
+            }
+            other => panic!("expected an API error, got {}", other),
+        }
+
+        for body in [
+            format!(r#"{{"id":"resp_1",{usage}}}"#),
+            format!(r#"{{"output":[],{usage}}}"#),
+            format!(r#"{{"output":[{{"type":"reasoning","summary":[]}}],{usage}}}"#),
+            format!(r#"{{"status":"completed",{usage}}}"#),
+        ] {
+            match decode_error(&provider(None), raw(200, &body)) {
+                CallError::Malformed(message) => assert_eq!(
+                    message, "the response carried no output items",
+                    "body {body}"
+                ),
+                other => panic!("body {body}: expected a malformed error, got {}", other),
+            }
+        }
+
+        for body in ["not json", "[]"] {
+            match decode_error(&provider(None), raw(200, body)) {
+                CallError::Transport(message) => assert!(
+                    message.starts_with("invalid JSON response (HTTP 200): "),
+                    "body {body}: unexpected message: {message}"
+                ),
+                other => panic!("body {body}: expected a transport error, got {}", other),
+            }
         }
     }
 

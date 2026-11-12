@@ -111,6 +111,7 @@ impl LlmProvider for ChatProvider {
             });
         }
 
+        let usage = decode_chat_usage(response.usage.as_ref());
         response
             .choices
             .into_iter()
@@ -121,6 +122,7 @@ impl LlmProvider for ChatProvider {
                 // message as truncated; every other metadata shape, absent or
                 // present, leaves it false.
                 message.truncated = choice.finish_reason.as_deref() == Some("length");
+                message.usage = usage;
                 message
             })
             .ok_or_else(|| {
@@ -129,10 +131,55 @@ impl LlmProvider for ChatProvider {
     }
 }
 
+/// Decode the chat-completions `usage` object tolerantly. Absent, `null`,
+/// non-object, or wholly non-numeric usage yields no usage at all; each counter
+/// that does not have a valid non-negative integer value simply contributes
+/// zero. OpenAI's nested detail objects and DeepSeek's flat cache counter are
+/// both recognized.
+fn decode_chat_usage(raw_usage: Option<&serde_json::Value>) -> Option<api::TokenUsage> {
+    let object = raw_usage?.as_object()?;
+    let input_tokens = object
+        .get("prompt_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let cached_input_tokens = object
+        .get("prompt_tokens_details")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            object
+                .get("prompt_cache_hit_tokens")
+                .and_then(serde_json::Value::as_u64)
+        });
+    let output_tokens = object
+        .get("completion_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let reasoning_tokens = object
+        .get("completion_tokens_details")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(serde_json::Value::as_u64);
+
+    if input_tokens.is_none()
+        && cached_input_tokens.is_none()
+        && output_tokens.is_none()
+        && reasoning_tokens.is_none()
+    {
+        return None;
+    }
+
+    Some(api::TokenUsage {
+        input_tokens: input_tokens.unwrap_or(0),
+        cached_input_tokens: cached_input_tokens.unwrap_or(0),
+        output_tokens: output_tokens.unwrap_or(0),
+        reasoning_tokens: reasoning_tokens.unwrap_or(0),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Auth, Role};
+    use crate::api::{Auth, Role, TokenUsage};
     use crate::llm::factory::ProviderSettings;
     use serde_json::{Value, json};
 
@@ -145,6 +192,8 @@ mod tests {
             auth_disabled: false,
             reasoning_effort: reasoning_effort.map(str::to_string),
             input_price_per_million_usd: None,
+            cached_input_price_per_million_usd: None,
+            output_price_per_million_usd: None,
         })
     }
 
@@ -157,6 +206,8 @@ mod tests {
             auth_disabled,
             reasoning_effort: None,
             input_price_per_million_usd: None,
+            cached_input_price_per_million_usd: None,
+            output_price_per_million_usd: None,
         })
     }
 
@@ -568,6 +619,247 @@ mod tests {
                 assert_eq!(message, "the response carried no choices[0].message");
             }
             other => panic!("expected a malformed error, got {}", other),
+        }
+    }
+
+    /// Core entry-point behavior: every counter a chat-completions provider
+    /// reports maps independently onto the shared usage type.
+    #[test]
+    fn when_decoding_given_chat_completion_usage_then_maps_all_reported_counters() {
+        let body = r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":10,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}}"#;
+        let message = decoded(&provider(None), raw(200, body));
+
+        assert_eq!(
+            message.usage,
+            Some(TokenUsage {
+                input_tokens: 10,
+                cached_input_tokens: 3,
+                output_tokens: 4,
+                reasoning_tokens: 2,
+            })
+        );
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.content.as_deref(), Some("hello"));
+        assert!(!message.truncated);
+    }
+
+    /// Edge-case table: a usage payload that is absent, null, wrongly shaped,
+    /// negative, fractional, or otherwise non-numeric never fails an otherwise
+    /// valid response. Valid counters survive independently; a recognized zero
+    /// counts as valid; no valid counter means no usage at all.
+    #[test]
+    fn when_decoding_given_missing_or_malformed_usage_counters_then_keeps_valid_response_and_uses_only_valid_counts()
+     {
+        let zero = TokenUsage {
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let cases: [(&str, Option<&str>, Option<TokenUsage>); 16] = [
+            ("absent usage", None, None),
+            ("null usage", Some("null"), None),
+            ("numeric usage", Some("7"), None),
+            ("array usage", Some("[]"), None),
+            ("string usage", Some(r#""10""#), None),
+            ("empty usage object", Some("{}"), None),
+            ("negative counter", Some(r#"{"prompt_tokens":-1}"#), None),
+            (
+                "fractional counter",
+                Some(r#"{"prompt_tokens":10.5}"#),
+                None,
+            ),
+            ("string counter", Some(r#"{"prompt_tokens":"10"}"#), None),
+            ("null counter", Some(r#"{"prompt_tokens":null}"#), None),
+            (
+                "non-object details",
+                Some(r#"{"prompt_tokens_details":5,"completion_tokens_details":[]}"#),
+                None,
+            ),
+            (
+                "all counters invalid",
+                Some(
+                    r#"{"prompt_tokens":-10,"completion_tokens":-4.5,"prompt_tokens_details":{"cached_tokens":"3"},"completion_tokens_details":{"reasoning_tokens":2.5}}"#,
+                ),
+                None,
+            ),
+            (
+                "valid zero input",
+                Some(r#"{"prompt_tokens":0}"#),
+                Some(zero),
+            ),
+            (
+                "valid zero nested counters",
+                Some(
+                    r#"{"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":0}}"#,
+                ),
+                Some(zero),
+            ),
+            (
+                "one valid counter",
+                Some(
+                    r#"{"prompt_tokens":-1,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":null}}"#,
+                ),
+                Some(TokenUsage {
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    output_tokens: 4,
+                    reasoning_tokens: 0,
+                }),
+            ),
+            (
+                "valid and invalid counters together",
+                Some(
+                    r#"{"prompt_tokens":10,"completion_tokens":"4","prompt_tokens_details":{"cached_tokens":-3},"completion_tokens_details":{"reasoning_tokens":2.5}}"#,
+                ),
+                Some(TokenUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+            ),
+        ];
+
+        for (case, usage, expected) in cases {
+            let body = match usage {
+                Some(usage) => format!(
+                    r#"{{"choices":[{{"message":{{"role":"assistant","content":"hello"}}}}],"usage":{usage}}}"#
+                ),
+                None => r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#
+                    .to_string(),
+            };
+            let message = decoded(&provider(None), raw(200, &body));
+
+            assert_eq!(message.role, Role::Assistant, "case {case}");
+            assert_eq!(message.content.as_deref(), Some("hello"), "case {case}");
+            assert!(!message.truncated, "case {case}");
+            assert_eq!(message.usage, expected, "case {case}");
+        }
+    }
+
+    /// Contract: OpenAI's nested cached count is authoritative when valid,
+    /// while DeepSeek's root cache-hit counter is the fallback only when the
+    /// nested count is absent or invalid.
+    #[test]
+    fn when_decoding_given_nested_cache_count_and_root_fallback_then_prefers_nested_and_uses_valid_fallback()
+     {
+        let cases: [(&str, &str, u64); 10] = [
+            (
+                "valid nested count",
+                r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":3},"prompt_cache_hit_tokens":7}"#,
+                3,
+            ),
+            (
+                "absent nested count",
+                r#"{"prompt_tokens":10,"prompt_cache_hit_tokens":7}"#,
+                7,
+            ),
+            (
+                "null nested count",
+                r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":null},"prompt_cache_hit_tokens":7}"#,
+                7,
+            ),
+            (
+                "negative nested count",
+                r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":-1},"prompt_cache_hit_tokens":7}"#,
+                7,
+            ),
+            (
+                "fractional nested count",
+                r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":2.5},"prompt_cache_hit_tokens":7}"#,
+                7,
+            ),
+            (
+                "string nested count",
+                r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":"3"},"prompt_cache_hit_tokens":7}"#,
+                7,
+            ),
+            (
+                "object nested count",
+                r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":{}},"prompt_cache_hit_tokens":7}"#,
+                7,
+            ),
+            (
+                "non-object nested details",
+                r#"{"prompt_tokens":10,"prompt_tokens_details":5,"prompt_cache_hit_tokens":7}"#,
+                7,
+            ),
+            (
+                "valid zero nested count",
+                r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":0},"prompt_cache_hit_tokens":7}"#,
+                0,
+            ),
+            (
+                "no valid cache counter",
+                r#"{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":-1},"prompt_cache_hit_tokens":"7"}"#,
+                0,
+            ),
+        ];
+
+        for (case, usage, expected_cached) in cases {
+            let body = format!(
+                r#"{{"choices":[{{"message":{{"role":"assistant","content":"hello"}}}}],"usage":{usage}}}"#
+            );
+            let message = decoded(&provider(None), raw(200, &body));
+
+            assert_eq!(
+                message.usage,
+                Some(TokenUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: expected_cached,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                }),
+                "case {case}"
+            );
+            assert_eq!(message.content.as_deref(), Some("hello"), "case {case}");
+        }
+    }
+
+    /// Regression: an exact `length` stop with no replayable content is still
+    /// accepted, and its recognized usage survives the truncation signal.
+    #[test]
+    fn when_decoding_given_length_stop_with_valid_usage_then_retains_usage_without_replayable_content()
+     {
+        let body = r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":null}}],"usage":{"prompt_tokens":10,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}}"#;
+        let message = decoded(&provider(None), raw(200, body));
+
+        assert!(message.truncated);
+        assert_eq!(message.content, None);
+        assert!(message.tool_calls.is_none());
+        assert_eq!(
+            message.usage,
+            Some(TokenUsage {
+                input_tokens: 10,
+                cached_input_tokens: 3,
+                output_tokens: 4,
+                reasoning_tokens: 2,
+            })
+        );
+    }
+
+    /// Regression: a rejected status is still the existing API error even when
+    /// the body carries valid usage and a decodable choice.
+    #[test]
+    fn when_receiving_given_non_success_status_with_valid_usage_then_returns_the_existing_api_error()
+     {
+        let with_error_object = r#"{"error":{"message":"overloaded"},"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"partial"}}],"usage":{"prompt_tokens":10,"completion_tokens":4}}"#;
+        match decode_error(&provider(None), raw(503, with_error_object)) {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 503);
+                assert_eq!(message, "overloaded");
+            }
+            other => panic!("expected an API error, got {}", other),
+        }
+
+        let without_error_object = r#"{"detail":"bad request","usage":{"prompt_tokens":10}}"#;
+        match decode_error(&provider(None), raw(400, without_error_object)) {
+            CallError::Api { status, message } => {
+                assert_eq!(status, 400);
+                assert_eq!(message, without_error_object);
+            }
+            other => panic!("expected an API error, got {}", other),
         }
     }
 }

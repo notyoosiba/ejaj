@@ -39,6 +39,12 @@ pub struct ProviderSettings {
     /// local metadata only: missing means unpriced, and it never changes a
     /// credential, endpoint, model or request body.
     pub input_price_per_million_usd: Option<f64>,
+    /// Optional provider-specific cached-input price in USD per million tokens,
+    /// independent of the input rate. Local metadata only.
+    pub cached_input_price_per_million_usd: Option<f64>,
+    /// Optional provider-specific output price in USD per million tokens,
+    /// independent of the input rate. Local metadata only.
+    pub output_price_per_million_usd: Option<f64>,
 }
 
 impl ProviderSettings {
@@ -76,6 +82,12 @@ pub struct SmollSettings {
     /// Optional input price in USD per million tokens, carried beside the
     /// provider's own settings and never onto the wire.
     pub input_price_per_million_usd: Option<f64>,
+    /// Optional cached-input price in USD per million tokens, independent of
+    /// the input rate and never sent on the wire.
+    pub cached_input_price_per_million_usd: Option<f64>,
+    /// Optional output price in USD per million tokens, independent of the
+    /// input rate and never sent on the wire.
+    pub output_price_per_million_usd: Option<f64>,
 }
 
 impl SmollSettings {
@@ -97,6 +109,8 @@ impl SmollSettings {
             model: model.into(),
             api_key,
             input_price_per_million_usd: None,
+            cached_input_price_per_million_usd: None,
+            output_price_per_million_usd: None,
         })
     }
 
@@ -113,17 +127,22 @@ fn non_blank(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.trim().is_empty())
 }
 
-/// Parse one optional provider input rate. An absent or blank value is missing;
-/// a nonblank value must parse as a finite, non-negative number of USD per
-/// million input tokens, and the diagnostic always names the exact variable.
-fn input_price(variable: &str, raw: Option<String>) -> Result<Option<f64>, String> {
+/// Parse one optional provider rate. An absent or blank value is missing; a
+/// nonblank value must parse as a finite, non-negative number of USD per
+/// million `token_kind` tokens, and the diagnostic always names the exact
+/// variable.
+fn token_price(
+    variable: &str,
+    token_kind: &str,
+    raw: Option<String>,
+) -> Result<Option<f64>, String> {
     let Some(raw) = non_blank(raw) else {
         return Ok(None);
     };
     match raw.trim().parse::<f64>() {
         Ok(rate) if rate.is_finite() && rate >= 0.0 => Ok(Some(rate)),
         _ => Err(format!(
-            "{variable} must be a finite, non-negative number of USD per million input tokens."
+            "{variable} must be a finite, non-negative number of USD per million {token_kind} tokens."
         )),
     }
 }
@@ -153,6 +172,8 @@ fn settings(
         auth_disabled,
         reasoning_effort: non_blank(reasoning_effort),
         input_price_per_million_usd: None,
+        cached_input_price_per_million_usd: None,
+        output_price_per_million_usd: None,
     })
 }
 
@@ -195,9 +216,9 @@ pub fn mid_from_env() -> Result<ProviderSettings, String> {
 /// The mid provider's settings from `environment`. The key, auth and effort
 /// come only from `LLM_MID_API_KEY`, `LLM_MID_AUTH` and
 /// `LLM_MID_REASONING_EFFORT`; `LLM_MID_URL` and `LLM_MID_MODEL` override
-/// their own defaults independently. The optional price comes only from
-/// `LLM_MID_INPUT_PRICE_PER_MILLION_USD`; no old provider variable is
-/// consulted.
+/// their own defaults independently. The optional input, cached-input and
+/// output prices come only from their own `LLM_MID_*_PRICE_PER_MILLION_USD`
+/// variables; no old provider variable is consulted.
 pub fn mid_from_environment(environment: Environment<'_>) -> Result<ProviderSettings, String> {
     let mut resolved = mid_from_values(
         environment("LLM_MID_URL"),
@@ -206,9 +227,20 @@ pub fn mid_from_environment(environment: Environment<'_>) -> Result<ProviderSett
         environment("LLM_MID_AUTH"),
         environment("LLM_MID_REASONING_EFFORT"),
     );
-    resolved.input_price_per_million_usd = input_price(
+    resolved.input_price_per_million_usd = token_price(
         "LLM_MID_INPUT_PRICE_PER_MILLION_USD",
+        "input",
         environment("LLM_MID_INPUT_PRICE_PER_MILLION_USD"),
+    )?;
+    resolved.cached_input_price_per_million_usd = token_price(
+        "LLM_MID_CACHED_INPUT_PRICE_PER_MILLION_USD",
+        "cached input",
+        environment("LLM_MID_CACHED_INPUT_PRICE_PER_MILLION_USD"),
+    )?;
+    resolved.output_price_per_million_usd = token_price(
+        "LLM_MID_OUTPUT_PRICE_PER_MILLION_USD",
+        "output",
+        environment("LLM_MID_OUTPUT_PRICE_PER_MILLION_USD"),
     )?;
     Ok(resolved)
 }
@@ -234,15 +266,27 @@ pub fn giga_from_env() -> Result<Option<ProviderSettings>, String> {
 /// The giga provider's settings from `environment`. The key, auth and effort
 /// come only from `LLM_GIGA_API_KEY`, `LLM_GIGA_AUTH` and
 /// `LLM_GIGA_REASONING_EFFORT`; both `LLM_GIGA_URL` and `LLM_GIGA_MODEL` are
-/// required. The optional price comes only from
-/// `LLM_GIGA_INPUT_PRICE_PER_MILLION_USD`; no old provider variable is
+/// required. The optional input, cached-input and output prices come only
+/// from their own `LLM_GIGA_*_PRICE_PER_MILLION_USD` variables; they are all
+/// validated before the absent-coordinate result. No old provider variable is
 /// consulted.
 pub fn giga_from_environment(
     environment: Environment<'_>,
 ) -> Result<Option<ProviderSettings>, String> {
-    let input_price = input_price(
+    let input_price = token_price(
         "LLM_GIGA_INPUT_PRICE_PER_MILLION_USD",
+        "input",
         environment("LLM_GIGA_INPUT_PRICE_PER_MILLION_USD"),
+    )?;
+    let cached_input_price = token_price(
+        "LLM_GIGA_CACHED_INPUT_PRICE_PER_MILLION_USD",
+        "cached input",
+        environment("LLM_GIGA_CACHED_INPUT_PRICE_PER_MILLION_USD"),
+    )?;
+    let output_price = token_price(
+        "LLM_GIGA_OUTPUT_PRICE_PER_MILLION_USD",
+        "output",
+        environment("LLM_GIGA_OUTPUT_PRICE_PER_MILLION_USD"),
     )?;
     let Some(mut resolved) = giga_from_values(
         environment("LLM_GIGA_URL"),
@@ -254,6 +298,8 @@ pub fn giga_from_environment(
         return Ok(None);
     };
     resolved.input_price_per_million_usd = input_price;
+    resolved.cached_input_price_per_million_usd = cached_input_price;
+    resolved.output_price_per_million_usd = output_price;
     Ok(Some(resolved))
 }
 
@@ -280,7 +326,9 @@ pub fn smoll_from_env() -> Result<SmollSettings, String> {
 /// value, and the diagnostic names whichever is missing with the configuration
 /// guidance. `LLM_SMOLL_URL` is optional: an absent or blank value uses
 /// [`DEFAULT_SMOLL_URL`], and a nonblank override is carried through as
-/// supplied. No Mid or Giga variable is ever consulted.
+/// supplied. Its input, cached-input and output prices come only from their
+/// own `LLM_SMOLL_*_PRICE_PER_MILLION_USD` variables. No Mid or Giga variable
+/// is ever consulted.
 pub fn smoll_from_environment(environment: Environment<'_>) -> Result<SmollSettings, String> {
     let model = environment("LLM_SMOLL_MODEL");
     let api_key = environment("LLM_SMOLL_API_KEY");
@@ -292,9 +340,20 @@ pub fn smoll_from_environment(environment: Environment<'_>) -> Result<SmollSetti
         ));
     }
 
-    let input_price = input_price(
+    let input_price = token_price(
         "LLM_SMOLL_INPUT_PRICE_PER_MILLION_USD",
+        "input",
         environment("LLM_SMOLL_INPUT_PRICE_PER_MILLION_USD"),
+    )?;
+    let cached_input_price = token_price(
+        "LLM_SMOLL_CACHED_INPUT_PRICE_PER_MILLION_USD",
+        "cached input",
+        environment("LLM_SMOLL_CACHED_INPUT_PRICE_PER_MILLION_USD"),
+    )?;
+    let output_price = token_price(
+        "LLM_SMOLL_OUTPUT_PRICE_PER_MILLION_USD",
+        "output",
+        environment("LLM_SMOLL_OUTPUT_PRICE_PER_MILLION_USD"),
     )?;
 
     Ok(SmollSettings {
@@ -303,6 +362,8 @@ pub fn smoll_from_environment(environment: Environment<'_>) -> Result<SmollSetti
         model: non_blank(model).expect("the model was checked as present"),
         api_key: non_blank(api_key).expect("the key was checked as present"),
         input_price_per_million_usd: input_price,
+        cached_input_price_per_million_usd: cached_input_price,
+        output_price_per_million_usd: output_price,
     })
 }
 
@@ -436,6 +497,52 @@ mod tests {
         ] {
             if let Some(price) = price {
                 values.push((name, price));
+            }
+        }
+        values
+    }
+
+    /// A complete provider environment with optional input, cached-input and
+    /// output rates for each role, each added under its own canonical variable
+    /// name so every rate is independent.
+    fn rated_environment(
+        mid: (
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        ),
+        giga: (
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        ),
+        smoll: (
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        ),
+    ) -> Vec<(&'static str, &'static str)> {
+        let mut values = vec![
+            ("LLM_MID_URL", URL),
+            ("LLM_MID_MODEL", MODEL),
+            ("LLM_GIGA_URL", "http://giga.test/v1/responses"),
+            ("LLM_GIGA_MODEL", "giga-model"),
+            ("LLM_SMOLL_MODEL", SMOLL_MODEL),
+            ("LLM_SMOLL_API_KEY", "smoll-key"),
+        ];
+        for (name, value) in [
+            ("LLM_MID_INPUT_PRICE_PER_MILLION_USD", mid.0),
+            ("LLM_MID_CACHED_INPUT_PRICE_PER_MILLION_USD", mid.1),
+            ("LLM_MID_OUTPUT_PRICE_PER_MILLION_USD", mid.2),
+            ("LLM_GIGA_INPUT_PRICE_PER_MILLION_USD", giga.0),
+            ("LLM_GIGA_CACHED_INPUT_PRICE_PER_MILLION_USD", giga.1),
+            ("LLM_GIGA_OUTPUT_PRICE_PER_MILLION_USD", giga.2),
+            ("LLM_SMOLL_INPUT_PRICE_PER_MILLION_USD", smoll.0),
+            ("LLM_SMOLL_CACHED_INPUT_PRICE_PER_MILLION_USD", smoll.1),
+            ("LLM_SMOLL_OUTPUT_PRICE_PER_MILLION_USD", smoll.2),
+        ] {
+            if let Some(value) = value {
+                values.push((name, value));
             }
         }
         values
@@ -961,6 +1068,58 @@ mod tests {
         );
     }
 
+    /// Core entry-point behavior: every role's input, cached-input and output
+    /// rate comes from its own canonical variable and is retained beside the
+    /// other two, even when the sibling roles leave a rate unset.
+    #[test]
+    fn when_resolving_provider_prices_given_independent_role_variables_then_retains_each_configured_rate()
+     {
+        let values = rated_environment(
+            (Some("1.25"), Some("0.25"), Some("5")),
+            (Some("2.5"), Some("0.5"), Some("10")),
+            (Some("3.75"), Some("0.75"), Some("15")),
+        );
+
+        let mid = mid_from_environment(&environment(&values)).expect("the mid block resolves");
+        let giga = giga_from_environment(&environment(&values))
+            .expect("the giga block resolves")
+            .expect("the giga block is configured");
+        let smoll =
+            smoll_from_environment(&environment(&values)).expect("the smoll block resolves");
+
+        assert_eq!(mid.input_price_per_million_usd, Some(1.25));
+        assert_eq!(mid.cached_input_price_per_million_usd, Some(0.25));
+        assert_eq!(mid.output_price_per_million_usd, Some(5.0));
+        assert_eq!(giga.input_price_per_million_usd, Some(2.5));
+        assert_eq!(giga.cached_input_price_per_million_usd, Some(0.5));
+        assert_eq!(giga.output_price_per_million_usd, Some(10.0));
+        assert_eq!(smoll.input_price_per_million_usd, Some(3.75));
+        assert_eq!(smoll.cached_input_price_per_million_usd, Some(0.75));
+        assert_eq!(smoll.output_price_per_million_usd, Some(15.0));
+
+        let values = rated_environment(
+            (None, None, Some("7.5")),
+            (Some("4"), None, None),
+            (None, Some("0.125"), None),
+        );
+        let mid = mid_from_environment(&environment(&values)).expect("the mid block resolves");
+        let giga = giga_from_environment(&environment(&values))
+            .expect("the giga block resolves")
+            .expect("the giga block is configured");
+        let smoll =
+            smoll_from_environment(&environment(&values)).expect("the smoll block resolves");
+
+        assert_eq!(mid.input_price_per_million_usd, None);
+        assert_eq!(mid.cached_input_price_per_million_usd, None);
+        assert_eq!(mid.output_price_per_million_usd, Some(7.5));
+        assert_eq!(giga.input_price_per_million_usd, Some(4.0));
+        assert_eq!(giga.cached_input_price_per_million_usd, None);
+        assert_eq!(giga.output_price_per_million_usd, None);
+        assert_eq!(smoll.input_price_per_million_usd, None);
+        assert_eq!(smoll.cached_input_price_per_million_usd, Some(0.125));
+        assert_eq!(smoll.output_price_per_million_usd, None);
+    }
+
     /// Edge-case table: absent, empty and whitespace-only rates stay missing,
     /// while an explicit zero or a padded number is a configured rate.
     #[test]
@@ -992,6 +1151,181 @@ mod tests {
             )),
             (Some(1.25), Some(2.5), Some(3.75))
         );
+    }
+
+    /// Edge-case table: an absent or whitespace-only rate is unset, zero is the
+    /// minimum configured rate, and every negative, non-finite or malformed
+    /// value names its exact variable and token kind. The input diagnostic is
+    /// asserted with its unchanged literal text.
+    #[test]
+    fn when_resolving_provider_prices_given_blank_zero_negative_nonfinite_or_malformed_values_then_unsets_or_reports_the_exact_variable()
+     {
+        let blank = rated_environment(
+            (Some(""), Some("   "), Some("\t \n")),
+            (Some("  "), Some(""), Some(" \t")),
+            (Some("\n"), Some(" "), Some("")),
+        );
+        let mid = mid_from_environment(&environment(&blank)).expect("blank mid rates are unset");
+        let giga = giga_from_environment(&environment(&blank))
+            .expect("blank giga rates are unset")
+            .expect("the giga block is configured");
+        let smoll =
+            smoll_from_environment(&environment(&blank)).expect("blank smoll rates are unset");
+        for rate in [
+            mid.input_price_per_million_usd,
+            mid.cached_input_price_per_million_usd,
+            mid.output_price_per_million_usd,
+            giga.input_price_per_million_usd,
+            giga.cached_input_price_per_million_usd,
+            giga.output_price_per_million_usd,
+            smoll.input_price_per_million_usd,
+            smoll.cached_input_price_per_million_usd,
+            smoll.output_price_per_million_usd,
+        ] {
+            assert_eq!(rate, None);
+        }
+
+        let zero = rated_environment(
+            (Some("0"), Some("0.0"), Some(" 0.0 ")),
+            (Some("0"), Some("0.0"), Some(" 0.0 ")),
+            (Some("0"), Some("0.0"), Some(" 0.0 ")),
+        );
+        let mid = mid_from_environment(&environment(&zero)).expect("zero mid rates are configured");
+        let giga = giga_from_environment(&environment(&zero))
+            .expect("zero giga rates are configured")
+            .expect("the giga block is configured");
+        let smoll =
+            smoll_from_environment(&environment(&zero)).expect("zero smoll rates are configured");
+        for rate in [
+            mid.input_price_per_million_usd,
+            mid.cached_input_price_per_million_usd,
+            mid.output_price_per_million_usd,
+            giga.input_price_per_million_usd,
+            giga.cached_input_price_per_million_usd,
+            giga.output_price_per_million_usd,
+            smoll.input_price_per_million_usd,
+            smoll.cached_input_price_per_million_usd,
+            smoll.output_price_per_million_usd,
+        ] {
+            assert_eq!(rate, Some(0.0));
+        }
+
+        // (role index, rate slot, variable, exact diagnostic)
+        let cases: [(usize, usize, &str, &str); 9] = [
+            (
+                0,
+                0,
+                "LLM_MID_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_MID_INPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million input tokens.",
+            ),
+            (
+                0,
+                1,
+                "LLM_MID_CACHED_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_MID_CACHED_INPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million cached input tokens.",
+            ),
+            (
+                0,
+                2,
+                "LLM_MID_OUTPUT_PRICE_PER_MILLION_USD",
+                "LLM_MID_OUTPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million output tokens.",
+            ),
+            (
+                1,
+                0,
+                "LLM_GIGA_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_GIGA_INPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million input tokens.",
+            ),
+            (
+                1,
+                1,
+                "LLM_GIGA_CACHED_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_GIGA_CACHED_INPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million cached input tokens.",
+            ),
+            (
+                1,
+                2,
+                "LLM_GIGA_OUTPUT_PRICE_PER_MILLION_USD",
+                "LLM_GIGA_OUTPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million output tokens.",
+            ),
+            (
+                2,
+                0,
+                "LLM_SMOLL_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_SMOLL_INPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million input tokens.",
+            ),
+            (
+                2,
+                1,
+                "LLM_SMOLL_CACHED_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_SMOLL_CACHED_INPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million cached input tokens.",
+            ),
+            (
+                2,
+                2,
+                "LLM_SMOLL_OUTPUT_PRICE_PER_MILLION_USD",
+                "LLM_SMOLL_OUTPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million output tokens.",
+            ),
+        ];
+
+        for (role, slot, variable, expected) in cases {
+            for value in ["abc", "-1", "-0.5", "NaN", "inf", "-inf"] {
+                let mut roles = [(None, None, None); 3];
+                match slot {
+                    0 => roles[role].0 = Some(value),
+                    1 => roles[role].1 = Some(value),
+                    _ => roles[role].2 = Some(value),
+                }
+                let values = rated_environment(roles[0], roles[1], roles[2]);
+                let error = match role {
+                    0 => mid_from_environment(&environment(&values))
+                        .err()
+                        .unwrap_or_else(|| panic!("mid must refuse {variable}={value:?}")),
+                    1 => giga_from_environment(&environment(&values))
+                        .err()
+                        .unwrap_or_else(|| panic!("giga must refuse {variable}={value:?}")),
+                    _ => smoll_from_environment(&environment(&values))
+                        .err()
+                        .unwrap_or_else(|| panic!("smoll must refuse {variable}={value:?}")),
+                };
+                assert_eq!(error, expected, "variable {variable} value {value:?}");
+            }
+        }
+    }
+
+    /// Contract: every Giga rate is validated before the absent-coordinate
+    /// result, so an invalid price is still a configuration error even when
+    /// neither the URL nor the model is configured.
+    #[test]
+    fn when_resolving_giga_given_absent_coordinates_and_invalid_price_then_returns_the_price_error()
+    {
+        for (variable, expected) in [
+            (
+                "LLM_GIGA_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_GIGA_INPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million input tokens.",
+            ),
+            (
+                "LLM_GIGA_CACHED_INPUT_PRICE_PER_MILLION_USD",
+                "LLM_GIGA_CACHED_INPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million cached input tokens.",
+            ),
+            (
+                "LLM_GIGA_OUTPUT_PRICE_PER_MILLION_USD",
+                "LLM_GIGA_OUTPUT_PRICE_PER_MILLION_USD must be a finite, non-negative number of USD per million output tokens.",
+            ),
+        ] {
+            let values = [
+                ("LLM_MID_URL", URL),
+                ("LLM_MID_MODEL", MODEL),
+                ("LLM_SMOLL_MODEL", SMOLL_MODEL),
+                ("LLM_SMOLL_API_KEY", "smoll-key"),
+                (variable, "not-a-rate"),
+            ];
+            let error = giga_from_environment(&environment(&values))
+                .err()
+                .unwrap_or_else(|| panic!("giga must refuse an invalid {variable}"));
+
+            assert_eq!(error, expected, "variable {variable}");
+        }
     }
 
     /// Minimum valid boundary: zero is a configured rate, not a missing one.
