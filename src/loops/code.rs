@@ -29,8 +29,8 @@ pub enum Outcome {
     Failed(FailureKind),
 }
 
-/// One completed code-agent attempt: its stop outcome and the last assistant
-/// narration it left, when it narrated at all.
+/// One completed code-agent attempt: its stop outcome, the last assistant
+/// narration it left, and a bounded summary of the tool activity it delivered.
 ///
 /// The queue's retry path reads this to seed the next attempt's handover. The
 /// ordinary [`Session::run_ticket`] callers keep the unchanged [`Outcome`].
@@ -40,6 +40,9 @@ pub struct Attempt {
     pub outcome: Outcome,
     /// The last printable assistant narration, if any reply carried one.
     pub narration: Option<String>,
+    /// A bounded summary of the latest delivered tool-call/result pairs, when
+    /// the attempt delivered any.
+    pub tool_activity: Option<String>,
 }
 
 impl Attempt {
@@ -48,6 +51,7 @@ impl Attempt {
         Attempt {
             outcome,
             narration: None,
+            tool_activity: None,
         }
     }
 }
@@ -164,6 +168,7 @@ impl Session {
         Attempt {
             outcome,
             narration: run.narration,
+            tool_activity: run.tool_activity,
         }
     }
 }

@@ -341,6 +341,9 @@ pub(crate) struct AgentAttempt {
     pub stop: Stop,
     /// The last printable assistant narration, if any turn carried one.
     pub narration: Option<String>,
+    /// A bounded summary of the latest delivered tool-call/result pairs, when
+    /// the attempt delivered any.
+    pub tool_activity: Option<String>,
 }
 
 /// Run one loop and keep the last assistant narration it saw.
@@ -385,7 +388,12 @@ pub(crate) fn run_agent_loop_attempt_in(
         contributions,
         &mut narration,
     );
-    AgentAttempt { stop, narration }
+    let tool_activity = summarize_tool_activity(messages);
+    AgentAttempt {
+        stop,
+        narration,
+        tool_activity,
+    }
 }
 
 /// The provider and pricing identity one model turn reports on every attempt.
@@ -1157,6 +1165,267 @@ fn format_tool_target(step: usize, tool: &Tool) -> String {
         Tool::ExecuteScript(args) => format!("[{step}/{MAX_STEPS}] js: {}", args.code),
         _ => format!("[{step}/{MAX_STEPS}] {}", tool.target()),
     }
+}
+
+/// How many of the newest delivered tool-call/result pairs the attempt trail
+/// keeps, in their original chronological order.
+const TOOL_ACTIVITY_PAIRS: usize = 3;
+
+/// The largest raw argument string parsed as JSON for a call preview.
+const TOOL_ACTIVITY_JSON_BYTES: usize = 16_384;
+
+/// The most raw argument bytes inspected for the fallback preview.
+const TOOL_ACTIVITY_FALLBACK_BYTES: usize = 512;
+
+/// The most bytes one complete call preview may carry, ellipsis included.
+const TOOL_ACTIVITY_PREVIEW_BYTES: usize = 160;
+
+/// The most bytes one error status may carry, ellipsis and spill footer
+/// included.
+const TOOL_ACTIVITY_STATUS_BYTES: usize = 240;
+
+/// The most bytes the complete activity trail may carry, ellipsis included.
+const TOOL_ACTIVITY_TRAIL_BYTES: usize = 1_500;
+
+/// The prefix of the line a spilled Bash digest appends after its output.
+const SPILL_FOOTER_PREFIX: &str = "[full output saved to";
+
+/// The prefix of the loop's step-budget warning line.
+const STEP_WARNING_PREFIX: &str = "[WARN: step ";
+
+/// The prefix of the loop's repeated-call warning line.
+const REPEATED_WARNING_PREFIX: &str = "[WARN: repeated tool calls]";
+
+/// Collapse consecutive whitespace so one preview or status stays on one line.
+fn collapse_activity_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Bound one activity text to a UTF-8-safe prefix, marking every cut with an
+/// ellipsis that stays inside the byte limit.
+fn bound_activity_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    const ELLIPSIS: &str = "…";
+    if limit < ELLIPSIS.len() {
+        return String::new();
+    }
+    let end = floor_char_boundary(text, limit - ELLIPSIS.len());
+    format!("{}{ELLIPSIS}", &text[..end])
+}
+
+/// Render one assistant tool call for the activity trail. The known Bash and
+/// execute-script argument fields are unwrapped only when the raw arguments are
+/// small enough to parse; every other shape falls back to a bounded raw prefix.
+fn format_tool_activity_call(call: &ToolCall) -> String {
+    let name = call.function.name.as_str();
+    let arguments = call.function.arguments.as_str();
+    let field = match name {
+        "bash" => Some("command"),
+        "execute_script" => Some("code"),
+        _ => None,
+    };
+    let parsed = if arguments.len() <= TOOL_ACTIVITY_JSON_BYTES {
+        serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|value| field.and_then(|field| value.get(field).cloned()))
+            .and_then(|value| value.as_str().map(str::to_string))
+    } else {
+        None
+    };
+    let preview = match parsed {
+        Some(text) => format!("{name}({})", collapse_activity_text(&text)),
+        None => {
+            let end =
+                floor_char_boundary(arguments, arguments.len().min(TOOL_ACTIVITY_FALLBACK_BYTES));
+            let fallback = collapse_activity_text(&arguments[..end]);
+            if fallback.is_empty() || fallback == "{}" {
+                format!("{name}()")
+            } else {
+                format!("{name}({fallback})")
+            }
+        }
+    };
+    bound_activity_text(&preview, TOOL_ACTIVITY_PREVIEW_BYTES)
+}
+
+/// The first non-empty trimmed line of a result, when there is one.
+fn first_non_empty_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+/// Whether a line is one of the loop's injected trailing warnings.
+fn is_loop_warning(line: &str) -> bool {
+    line.starts_with(STEP_WARNING_PREFIX) || line.starts_with(REPEATED_WARNING_PREFIX)
+}
+
+/// Remove only contiguous loop-injected warning lines from the end of a result.
+fn without_trailing_warnings(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    while lines
+        .last()
+        .is_some_and(|line| is_loop_warning(line.trim()))
+    {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// Find the spill footer line an oversized Bash digest appended, if any.
+fn spill_footer(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(SPILL_FOOTER_PREFIX))
+        .map(str::to_string)
+}
+
+/// Remove the spill footer from the text used for status classification.
+fn without_spill_footer(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim().starts_with(SPILL_FOOTER_PREFIX))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The first non-empty diagnostic line after a command-exit or timeout error's
+/// first line, preferring the digest's explicit diagnostics marker.
+fn first_diagnostic_after(text: &str, first: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    if let Some(marker) = lines.iter().position(|line| *line == "[diagnostics]") {
+        return lines[marker + 1..]
+            .iter()
+            .find(|line| !line.is_empty())
+            .map(|line| (*line).to_string());
+    }
+    let first_index = lines.iter().position(|line| *line == first)?;
+    lines[first_index + 1..]
+        .iter()
+        .find(|line| !line.is_empty() && **line != "[diagnostics]")
+        .map(|line| (*line).to_string())
+}
+
+/// Classify one error result into its bounded one-line status text.
+fn error_activity_text(text: &str) -> String {
+    let Some(first) = first_non_empty_line(text) else {
+        return String::new();
+    };
+    if first == "[ERROR: execute_script failed]" {
+        let detail = first_error_line(text);
+        if detail.is_empty() || detail == first {
+            return first.to_string();
+        }
+        return format!("{first}: {detail}");
+    }
+    if first.starts_with("[ERROR: exit code ") || first.starts_with("[ERROR: command timed out") {
+        return match first_diagnostic_after(text, first) {
+            Some(detail) => format!("{first} — {detail}"),
+            None => first.to_string(),
+        };
+    }
+    first_error_line(text).to_string()
+}
+
+/// Join one status text with an optional spill footer, keeping the footer as a
+/// suffix and shortening diagnostic text first when a byte limit applies.
+fn join_activity_status(text: &str, footer: Option<&str>, limit: Option<usize>) -> String {
+    let text = collapse_activity_text(text);
+    let footer = footer
+        .map(collapse_activity_text)
+        .filter(|footer| !footer.is_empty());
+    match (footer, limit) {
+        (None, Some(limit)) => bound_activity_text(&text, limit),
+        (None, None) => text,
+        (Some(footer), None) => {
+            if text.contains(&footer) {
+                text
+            } else if text.is_empty() {
+                footer
+            } else {
+                format!("{text} {footer}")
+            }
+        }
+        (Some(footer), Some(limit)) => {
+            if footer.len() >= limit {
+                return bound_activity_text(&footer, limit);
+            }
+            let separator = if text.is_empty() { "" } else { " " };
+            let budget = limit - footer.len() - separator.len();
+            let head = if text.contains(&footer) && text.ends_with(&footer) {
+                text[..text.len() - footer.len()].trim_end()
+            } else {
+                text.as_str()
+            };
+            let head = bound_activity_text(head, budget);
+            if head.is_empty() {
+                footer
+            } else {
+                format!("{head}{separator}{footer}")
+            }
+        }
+    }
+}
+
+/// Summarize one delivered tool result for the activity trail.
+fn format_tool_activity_status(content: Option<&str>) -> String {
+    let Some(content) = content else {
+        return "ok".to_string();
+    };
+    let footer = spill_footer(content);
+    let without_warnings = without_trailing_warnings(content);
+    let classification = without_spill_footer(&without_warnings);
+    let trimmed = classification.trim();
+    if trimmed.is_empty() {
+        return join_activity_status("ok", footer.as_deref(), None);
+    }
+    if is_tool_result_stub(trimmed) {
+        return join_activity_status(trimmed, footer.as_deref(), None);
+    }
+    if trimmed.starts_with("[ERROR") || trimmed.starts_with("Error:") {
+        let text = error_activity_text(trimmed);
+        return join_activity_status(&text, footer.as_deref(), Some(TOOL_ACTIVITY_STATUS_BYTES));
+    }
+    join_activity_status("ok", footer.as_deref(), None)
+}
+
+/// Summarize the last three delivered assistant tool-call/result pairs, in
+/// chronological order. A call counts only when a later tool message carries
+/// its exact id.
+fn summarize_tool_activity(messages: &[Message]) -> Option<String> {
+    let mut delivered: Vec<(&ToolCall, &Message)> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        let Some(calls) = message.tool_calls.as_deref() else {
+            continue;
+        };
+        for call in calls {
+            let result = messages[index + 1..].iter().find(|later| {
+                later.role == Role::Tool && later.tool_call_id.as_deref() == Some(call.id.as_str())
+            });
+            if let Some(result) = result {
+                delivered.push((call, result));
+            }
+        }
+    }
+
+    let start = delivered.len().saturating_sub(TOOL_ACTIVITY_PAIRS);
+    let lines: Vec<String> = delivered[start..]
+        .iter()
+        .map(|(call, result)| {
+            format!(
+                "- {} -> {}",
+                format_tool_activity_call(call),
+                format_tool_activity_status(result.content.as_deref())
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let trail = lines.join("\n");
+    Some(bound_activity_text(&trail, TOOL_ACTIVITY_TRAIL_BYTES))
 }
 
 /// Extract the first informative line of a tool error for stderr `[WARN]` logs.
@@ -8797,5 +9066,457 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One assistant tool call for the activity-trail tests.
+    fn activity_call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    /// One assistant message issuing calls in order.
+    fn activity_assistant(calls: Vec<ToolCall>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: Some("calling".to_string()),
+            tool_calls: Some(calls),
+            tool_call_id: None,
+            reasoning_content: None,
+            extra: serde_json::Map::new(),
+            truncated: false,
+        }
+    }
+
+    /// One tool result addressed to an id; a None content is the provider's
+    /// empty-result shape.
+    fn activity_result(id: &str, content: Option<&str>) -> Message {
+        Message {
+            role: Role::Tool,
+            content: content.map(str::to_string),
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+            extra: serde_json::Map::new(),
+            truncated: false,
+        }
+    }
+
+    /// The activity trail for one assistant call paired with one result.
+    fn single_activity(name: &str, arguments: &str, result: Option<&str>) -> Option<String> {
+        summarize_tool_activity(&[
+            activity_assistant(vec![activity_call("call-only", name, arguments)]),
+            activity_result("call-only", result),
+        ])
+    }
+
+    /// Core entry point: an outcome-only attempt carries no narration and no
+    /// tool activity, whether it was built directly or converted from an
+    /// outcome, while the code session's ordinary entry point still returns
+    /// only the outcome.
+    #[test]
+    fn when_constructing_given_outcome_only_result_then_leaves_attempt_activity_empty() {
+        use crate::loops::code::{Attempt, Outcome, Session};
+
+        for outcome in [
+            Outcome::Complete,
+            Outcome::TurnEnd,
+            Outcome::Failed(FailureKind::StepLimit),
+        ] {
+            let direct = Attempt::new(outcome);
+            assert_eq!(direct.outcome, outcome);
+            assert_eq!(direct.narration, None);
+            assert_eq!(direct.tool_activity, None);
+
+            let converted: Attempt = outcome.into();
+            assert_eq!(converted.outcome, outcome);
+            assert_eq!(converted.narration, None);
+            assert_eq!(converted.tool_activity, None);
+        }
+
+        let script = Script::new(vec![reply(Some("finished"), &[])]);
+        let config = config(script.clone());
+        let session = Session::new(&config, "scope");
+        let outcome: Outcome = session.run_ticket("do the work");
+        assert_eq!(outcome, Outcome::TurnEnd);
+        assert_eq!(script.requests(), 1);
+    }
+
+    /// Edge case: transcripts with no delivered pair -- empty, tool-free,
+    /// unanswered, mismatched, and result-before-call -- carry no trail.
+    #[test]
+    fn when_summarizing_given_calls_without_matching_deliveries_then_returns_no_trail() {
+        assert_eq!(summarize_tool_activity(&[]), None);
+        assert_eq!(
+            summarize_tool_activity(&[Message::system("sys"), Message::assistant("hello")]),
+            None
+        );
+
+        let unanswered = vec![
+            activity_assistant(vec![activity_call(
+                "call-a",
+                "bash",
+                r#"{"command":"printf a"}"#,
+            )]),
+            activity_result("call-b", Some("a")),
+        ];
+        assert_eq!(summarize_tool_activity(&unanswered), None);
+
+        let unpaired_handoff = vec![activity_assistant(vec![activity_call(
+            "call-plan",
+            "finish_plan",
+            r##"{"plan":"# Plan"}"##,
+        )])];
+        assert_eq!(summarize_tool_activity(&unpaired_handoff), None);
+
+        let result_before_call = vec![
+            activity_result("call-a", Some("ok")),
+            activity_assistant(vec![activity_call(
+                "call-a",
+                "bash",
+                r#"{"command":"printf a"}"#,
+            )]),
+        ];
+        assert_eq!(summarize_tool_activity(&result_before_call), None);
+    }
+
+    /// Edge case: calls pair by exact id in call order, not by result order,
+    /// unanswered calls in the same group are skipped, and only the last three
+    /// delivered pairs survive in chronological order.
+    #[test]
+    fn when_summarizing_given_mixed_tool_deliveries_then_keeps_last_three_in_chronological_order() {
+        let transcript = vec![
+            activity_assistant(vec![
+                activity_call("call-a", "bash", r#"{"command":"printf a"}"#),
+                activity_call("call-b", "execute_script", r#"{"code":"return \"b\";"}"#),
+                activity_call("call-x", "bash", r#"{"command":"printf x"}"#),
+            ]),
+            activity_result("call-b", Some("b")),
+            activity_result("call-a", Some("a")),
+            activity_assistant(vec![activity_call(
+                "call-c",
+                "bash",
+                r#"{"command":"printf c"}"#,
+            )]),
+            activity_result("call-c", Some("c")),
+            activity_assistant(vec![
+                activity_call("call-d", "bash", r#"{"command":"printf d"}"#),
+                activity_call("call-e", "bash", r#"{"command":"printf e"}"#),
+            ]),
+            activity_result("call-e", Some("e")),
+            activity_result("call-d", Some("d")),
+        ];
+
+        assert_eq!(
+            summarize_tool_activity(&transcript).as_deref(),
+            Some("- bash(printf c) -> ok\n- bash(printf d) -> ok\n- bash(printf e) -> ok")
+        );
+    }
+
+    /// Regression: undelivered calls -- including an aborted repeated-call turn
+    /// and an accepted control-tool handoff -- never enter the trail, and a
+    /// real attempt carries the delivered activity beside its stop and
+    /// narration.
+    #[test]
+    fn when_summarizing_given_unanswered_or_aborted_calls_then_excludes_undelivered_activity() {
+        let transcript = vec![
+            activity_assistant(vec![activity_call(
+                "call-delivered",
+                "bash",
+                r#"{"command":"printf delivered"}"#,
+            )]),
+            activity_result("call-delivered", Some("delivered")),
+            activity_assistant(vec![activity_call(
+                "call-aborted",
+                "bash",
+                r#"{"command":"printf aborted"}"#,
+            )]),
+            activity_assistant(vec![activity_call("call-handoff", "task_complete", "{}")]),
+        ];
+        assert_eq!(
+            summarize_tool_activity(&transcript).as_deref(),
+            Some("- bash(printf delivered) -> ok")
+        );
+
+        let arguments = serde_json::json!({ "code": "return 1;" }).to_string();
+        let script = Script::new(vec![
+            reply(None, &[("execute_script", arguments)]),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = vec![Message::system("sys"), Message::user("work")];
+        let attempt =
+            run_agent_loop_attempt(&mut messages, &settings, Phase::Code, Source::None, None);
+        assert!(matches!(attempt.stop, Stop::TurnEnd));
+        assert_eq!(attempt.narration.as_deref(), Some("done"));
+        assert_eq!(
+            attempt.tool_activity.as_deref(),
+            Some("- execute_script(return 1;) -> ok")
+        );
+
+        let arguments = serde_json::json!({ "code": "return 2;" }).to_string();
+        let script = Script::new(vec![
+            reply(None, &[("execute_script", arguments)]),
+            reply(Some("finished"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let session = crate::loops::code::Session::new(&settings, "scope");
+        let attempt = session.run_ticket_attempt("do the work", None, None);
+        assert_eq!(attempt.outcome, crate::loops::code::Outcome::TurnEnd);
+        assert_eq!(attempt.narration.as_deref(), Some("finished"));
+        assert_eq!(
+            attempt.tool_activity.as_deref(),
+            Some("- execute_script(return 2;) -> ok")
+        );
+    }
+
+    /// Edge case table for call previews: known Bash and execute-script
+    /// strings unwrap and collapse, every unsupported shape falls back to the
+    /// raw arguments, and the parse, fallback and preview byte bounds never
+    /// split a UTF-8 character.
+    #[test]
+    fn when_summarizing_given_tool_arguments_at_boundary_sizes_then_formats_bounded_previews() {
+        assert_eq!(
+            single_activity(
+                "bash",
+                "{\"command\":\"printf\\n   hello\\tworld\"}",
+                Some("ok"),
+            )
+            .as_deref(),
+            Some("- bash(printf hello world) -> ok")
+        );
+        assert_eq!(
+            single_activity("execute_script", "{\"code\":\"return\\n  1;\"}", Some("ok"),)
+                .as_deref(),
+            Some("- execute_script(return 1;) -> ok")
+        );
+
+        assert_eq!(
+            single_activity("bash", "not json", Some("ok")).as_deref(),
+            Some("- bash(not json) -> ok")
+        );
+        assert_eq!(
+            single_activity("bash", r#"{"cmd":"x"}"#, Some("ok")).as_deref(),
+            Some("- bash({\"cmd\":\"x\"}) -> ok")
+        );
+        assert_eq!(
+            single_activity("bash", r#"{"command":42}"#, Some("ok")).as_deref(),
+            Some("- bash({\"command\":42}) -> ok")
+        );
+
+        for arguments in ["", "   \n ", "{}"] {
+            assert_eq!(
+                single_activity("bash", arguments, Some("ok")).as_deref(),
+                Some("- bash() -> ok"),
+                "arguments {arguments:?} render as an empty call"
+            );
+        }
+
+        let prefix = r#"{"command":"hi""#;
+        let at_limit = format!("{prefix}{}{}", " ".repeat(16_384 - prefix.len() - 1), "}");
+        assert_eq!(at_limit.len(), 16_384);
+        assert_eq!(
+            single_activity("bash", &at_limit, Some("ok")).as_deref(),
+            Some("- bash(hi) -> ok")
+        );
+
+        let over_limit = format!("{prefix}{}{}", " ".repeat(16_385 - prefix.len() - 1), "}");
+        assert_eq!(over_limit.len(), 16_385);
+        assert_eq!(
+            single_activity("bash", &over_limit, Some("ok")).as_deref(),
+            Some("- bash({\"command\":\"hi\") -> ok")
+        );
+
+        let whitespace_then_text = format!("{}after", " ".repeat(600));
+        assert_eq!(
+            single_activity("bash", &whitespace_then_text, Some("ok")).as_deref(),
+            Some("- bash() -> ok"),
+            "only the first 512 raw bytes are inspected before whitespace collapses"
+        );
+
+        let multibyte_at_fallback_edge = format!("{}{}", " ".repeat(511), "€".repeat(10));
+        assert_eq!(
+            single_activity("bash", &multibyte_at_fallback_edge, Some("ok")).as_deref(),
+            Some("- bash() -> ok"),
+            "the 512-byte fallback cut never splits a UTF-8 character"
+        );
+
+        let exact_preview = format!("bash({})", "a".repeat(154));
+        assert_eq!(exact_preview.len(), 160);
+        assert_eq!(
+            single_activity(
+                "bash",
+                &serde_json::json!({ "command": "a".repeat(154) }).to_string(),
+                Some("ok"),
+            )
+            .as_deref(),
+            Some(format!("- {exact_preview} -> ok").as_str())
+        );
+
+        let over_preview = format!("bash({})", "a".repeat(155));
+        assert_eq!(over_preview.len(), 161);
+        let bounded_preview = format!("bash({}…", "a".repeat(152));
+        assert_eq!(
+            single_activity(
+                "bash",
+                &serde_json::json!({ "command": "a".repeat(155) }).to_string(),
+                Some("ok"),
+            )
+            .as_deref(),
+            Some(format!("- {bounded_preview} -> ok").as_str())
+        );
+
+        let multibyte_preview = format!("bash({}…", "€".repeat(50));
+        assert_eq!(multibyte_preview.len(), 158);
+        assert_eq!(
+            single_activity(
+                "bash",
+                &serde_json::json!({ "command": "€".repeat(100) }).to_string(),
+                Some("ok"),
+            )
+            .as_deref(),
+            Some(format!("- {multibyte_preview} -> ok").as_str())
+        );
+    }
+
+    /// Contract and invariant table for result statuses: empty and stub
+    /// results, both error forms, exit/timeout diagnostics, trailing warnings,
+    /// spill footers, and the UTF-8-safe 240-byte status and 1,500-byte trail
+    /// limits.
+    #[test]
+    fn when_summarizing_given_tool_results_with_errors_warnings_and_spills_then_preserves_bounded_statuses()
+     {
+        for content in [None, Some(""), Some("   \n  ")] {
+            assert_eq!(
+                single_activity("bash", r#"{"command":"printf x"}"#, content).as_deref(),
+                Some("- bash(printf x) -> ok")
+            );
+        }
+
+        let stub = "  [tool result omitted: bash target printf x; 1234 bytes omitted]  ";
+        assert_eq!(
+            single_activity("bash", r#"{"command":"printf x"}"#, Some(stub)).as_deref(),
+            Some(
+                "- bash(printf x) -> [tool result omitted: bash target printf x; 1234 bytes omitted]"
+            )
+        );
+
+        for (content, status) in [
+            (
+                "[ERROR: execute_script failed]\nError: boom",
+                "[ERROR: execute_script failed]: Error: boom",
+            ),
+            (
+                "[ERROR: unexpected failure]\nsecond line",
+                "[ERROR: unexpected failure]",
+            ),
+            ("Error: plain failure\nmore detail", "Error: plain failure"),
+            ("[ERROR] tagged failure", "tagged failure"),
+        ] {
+            assert_eq!(
+                single_activity("bash", r#"{"command":"printf x"}"#, Some(content)).as_deref(),
+                Some(format!("- bash(printf x) -> {status}").as_str())
+            );
+        }
+
+        let footer = "[full output saved to .ejaj/run/tools-output/step-9-call-1.log; inspect it with tools.read through execute_script]";
+        let exit_with_diagnostics = format!(
+            "[ERROR: exit code 101 for cargo test]\nstartup banner\n[diagnostics]\nerror[E0425]: cannot find value x\ntail\n{footer}\n[WARN: step 99/100; 1 steps remaining before the step limit]"
+        );
+        let trail = single_activity(
+            "bash",
+            r#"{"command":"printf x"}"#,
+            Some(&exit_with_diagnostics),
+        )
+        .expect("the delivered pair keeps its trail");
+        assert_eq!(
+            trail,
+            format!(
+                "- bash(printf x) -> [ERROR: exit code 101 for cargo test] — error[E0425]: cannot find value x {footer}"
+            )
+        );
+        assert_eq!(
+            trail.matches(footer).count(),
+            1,
+            "the spill footer is preserved exactly once: {trail:?}"
+        );
+
+        let timed_out = "[ERROR: exit code -1 for sleep 1]\ncommand timed out after 3s\n[WARN: repeated tool calls] Your last turns issued the same tool calls.";
+        assert_eq!(
+            single_activity("bash", r#"{"command":"printf x"}"#, Some(timed_out)).as_deref(),
+            Some(
+                "- bash(printf x) -> [ERROR: exit code -1 for sleep 1] — command timed out after 3s"
+            )
+        );
+
+        for warning in [
+            "[WARN: step 99/100; 1 steps remaining before the step limit]",
+            "[WARN: repeated tool calls] Your last turns issued the same tool calls.",
+        ] {
+            let content = format!("command output\n{warning}");
+            assert_eq!(
+                single_activity("bash", r#"{"command":"printf x"}"#, Some(&content)).as_deref(),
+                Some("- bash(printf x) -> ok"),
+                "the trailing loop warning never enters the status"
+            );
+        }
+
+        let successful_spill = format!("command output\n{footer}");
+        let trail = single_activity("bash", r#"{"command":"printf x"}"#, Some(&successful_spill))
+            .expect("the delivered pair keeps its trail");
+        assert_eq!(trail, format!("- bash(printf x) -> ok {footer}"));
+        assert_eq!(trail.matches(footer).count(), 1);
+
+        let multibyte_error = format!("Error: {}", "€".repeat(200));
+        assert_eq!(
+            single_activity("bash", r#"{"command":"printf x"}"#, Some(&multibyte_error)).as_deref(),
+            Some(format!("- bash(printf x) -> Error: {}…", "€".repeat(76)).as_str())
+        );
+
+        let diagnostic_head = "[ERROR: exit code 1 for x] — ";
+        let diagnostic_full = format!("{diagnostic_head}{}", "d".repeat(500));
+        let error_with_footer = format!("{diagnostic_full}\n{footer}");
+        let expected_head = format!("{diagnostic_head}{}…", "d".repeat(91));
+        assert_eq!(
+            single_activity(
+                "bash",
+                r#"{"command":"printf x"}"#,
+                Some(&error_with_footer)
+            )
+            .as_deref(),
+            Some(format!("- bash(printf x) -> {expected_head} {footer}").as_str())
+        );
+
+        let long_footer = format!("[full output saved to {}]", "p".repeat(300));
+        let error_with_long_footer = format!("Error: boom\n{long_footer}");
+        let expected_footer = format!("{}…", &long_footer[..237]);
+        assert_eq!(
+            single_activity(
+                "bash",
+                r#"{"command":"printf x"}"#,
+                Some(&error_with_long_footer),
+            )
+            .as_deref(),
+            Some(format!("- bash(printf x) -> {expected_footer}").as_str())
+        );
+
+        let long_stub = format!("[tool result omitted: x{}", "€".repeat(600));
+        let trail = single_activity("bash", r#"{"command":"printf x"}"#, Some(&long_stub))
+            .expect("the delivered pair keeps its trail");
+        let expected_trail = format!(
+            "- bash(printf x) -> [tool result omitted: x{}…",
+            "€".repeat(484)
+        );
+        assert_eq!(trail, expected_trail);
+        assert!(
+            trail.len() <= 1_500,
+            "the complete trail is {} bytes",
+            trail.len()
+        );
     }
 }

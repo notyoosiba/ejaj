@@ -759,6 +759,7 @@ fn work_with_retry(
                         ticket,
                         id,
                         first.narration.as_deref(),
+                        first.tool_activity.as_deref(),
                         "task_complete, but the first verification gate failed",
                         Some(&output),
                         contributions,
@@ -775,6 +776,7 @@ fn work_with_retry(
                 ticket,
                 id,
                 first.narration.as_deref(),
+                first.tool_activity.as_deref(),
                 "turn end without task_complete",
                 None,
                 contributions,
@@ -790,6 +792,7 @@ fn work_with_retry(
                 ticket,
                 id,
                 first.narration.as_deref(),
+                first.tool_activity.as_deref(),
                 &format!("agent loop stopped: {}", kind.label()),
                 None,
                 contributions,
@@ -810,6 +813,7 @@ fn retry_once(
     ticket: &Ticket,
     id: &str,
     narration: Option<&str>,
+    tool_activity: Option<&str>,
     stop_reason: &str,
     first_gate_output: Option<&str>,
     mut contributions: Option<&mut QueueContributions>,
@@ -819,6 +823,7 @@ fn retry_once(
         narration,
         stop_reason,
         first_gate_output,
+        tool_activity,
         diff.as_deref().map_err(String::as_str),
     );
     let second = lifecycle.work(ticket, Some(&handover), contributions.as_deref_mut());
@@ -894,11 +899,14 @@ fn report_gate_output(output: &str) {
 
 /// Render the explicit retry handover. Absent narration and an unchanged
 /// working tree are named rather than omitted, and a diff collection failure
-/// carries its own error instead of pretending the tree was empty.
+/// carries its own error instead of pretending the tree was empty. Recent tool
+/// activity is its own section only when the first attempt delivered some: an
+/// absent or blank trail leaves the handover byte-for-byte as it was.
 fn render_retry_handover(
     narration: Option<&str>,
     stop_reason: &str,
     first_gate_output: Option<&str>,
+    tool_activity: Option<&str>,
     diff: Result<&str, &str>,
 ) -> String {
     let narration = match narration.map(str::trim) {
@@ -909,6 +917,10 @@ fn render_retry_handover(
         Some(text) if !text.is_empty() => text,
         Some(_) => "(empty verification gate output)",
         None => "(the first attempt did not reach a failed verification gate)",
+    };
+    let activity = match tool_activity.map(str::trim) {
+        Some(text) if !text.is_empty() => format!("Recent tool activity:\n{text}\n\n"),
+        _ => String::new(),
     };
     let diff = match diff {
         Ok(text) if !text.trim().is_empty() => text.to_string(),
@@ -921,7 +933,7 @@ fn render_retry_handover(
          Previous attempt stop reason: {stop_reason}\n\n\
          Last assistant narration:\n{narration}\n\n\
          First verification gate output:\n{gate}\n\n\
-         Repository working-tree diff (staged, unstaged, and non-ignored untracked changes; .ejaj/ excluded):\n{diff}\n"
+         {activity}Repository working-tree diff (staged, unstaged, and non-ignored untracked changes; .ejaj/ excluded):\n{diff}\n"
     )
 }
 
@@ -1610,6 +1622,79 @@ mod tests {
         assert!(
             subsequent.starts_with("[WARN] ticket 1-first: the first verification gate failed"),
             "the queue's follow-up must begin right after the forwarded event: {subsequent:?}"
+        );
+    }
+
+    /// Edge case: an attempt that delivered no tool call forwards no activity,
+    /// so the retry handover is the exact pre-existing format -- heading,
+    /// narration, gate placeholder, diff and final newline included.
+    #[test]
+    fn when_retrying_given_no_activity_then_preserves_original_handover_bytes() {
+        let handover = render_retry_handover(
+            Some("first attempt narration"),
+            "turn end without task_complete",
+            None,
+            None,
+            Ok("scripted diff body"),
+        );
+
+        assert_eq!(
+            handover,
+            "[RETRY HANDOVER]\n\
+             This is a fresh code-agent attempt for the same ticket. The ticket kickoff above is unchanged.\n\n\
+             Previous attempt stop reason: turn end without task_complete\n\n\
+             Last assistant narration:\nfirst attempt narration\n\n\
+             First verification gate output:\n(the first attempt did not reach a failed verification gate)\n\n\
+             Repository working-tree diff (staged, unstaged, and non-ignored untracked changes; .ejaj/ excluded):\nscripted diff body\n"
+        );
+    }
+
+    /// Edge case: whitespace-only activity is absent activity. The handover is
+    /// byte-for-byte as it was before activity existed.
+    #[test]
+    fn when_retrying_given_blank_activity_then_preserves_original_handover_bytes() {
+        let handover = render_retry_handover(
+            None,
+            "agent loop stopped: step limit reached",
+            None,
+            Some("  \n\t "),
+            Ok(""),
+        );
+
+        assert_eq!(
+            handover,
+            "[RETRY HANDOVER]\n\
+             This is a fresh code-agent attempt for the same ticket. The ticket kickoff above is unchanged.\n\n\
+             Previous attempt stop reason: agent loop stopped: step limit reached\n\n\
+             Last assistant narration:\n(empty narration)\n\n\
+             First verification gate output:\n(the first attempt did not reach a failed verification gate)\n\n\
+             Repository working-tree diff (staged, unstaged, and non-ignored untracked changes; .ejaj/ excluded):\n(empty diff)\n"
+        );
+    }
+
+    /// Contract: a non-blank trail is its own section after the first gate
+    /// output and immediately before the repository diff. The kickoff,
+    /// narration, stop reason, gate output and diff keep their exact contents
+    /// and ordering.
+    #[test]
+    fn when_retrying_given_recent_activity_then_places_it_before_the_repository_diff() {
+        let handover = render_retry_handover(
+            Some("first attempt narration"),
+            "task_complete, but the first verification gate failed",
+            Some("first gate output"),
+            Some("- bash(printf 'activity' > probe.txt) -> ok"),
+            Ok("scripted diff body"),
+        );
+
+        assert_eq!(
+            handover,
+            "[RETRY HANDOVER]\n\
+             This is a fresh code-agent attempt for the same ticket. The ticket kickoff above is unchanged.\n\n\
+             Previous attempt stop reason: task_complete, but the first verification gate failed\n\n\
+             Last assistant narration:\nfirst attempt narration\n\n\
+             First verification gate output:\nfirst gate output\n\n\
+             Recent tool activity:\n- bash(printf 'activity' > probe.txt) -> ok\n\n\
+             Repository working-tree diff (staged, unstaged, and non-ignored untracked changes; .ejaj/ excluded):\nscripted diff body\n"
         );
     }
 }

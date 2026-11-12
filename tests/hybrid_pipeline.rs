@@ -883,6 +883,34 @@ fn when_hybrid_code_attempt_ends_given_retryable_turn_end_then_escalates_once_an
         "the handover names the retryable stop: {}",
         retry_users[1]
     );
+
+    // Attempt 1 delivered a real bash call and its result. The retry's
+    // separate handover message forwards that trail as its own section, after
+    // the first-gate output and immediately before the repository diff.
+    let handover = &retry_users[1];
+    let gate_section = handover
+        .find("First verification gate output:")
+        .unwrap_or_else(|| panic!("the handover carries the first gate section: {handover}"));
+    let activity_section = handover.find("Recent tool activity:").unwrap_or_else(|| {
+        panic!("the handover carries the delivered tool activity section: {handover}")
+    });
+    let diff_section = handover
+        .find("Repository working-tree diff")
+        .unwrap_or_else(|| panic!("the handover carries the repository diff section: {handover}"));
+    assert!(
+        gate_section < activity_section,
+        "the activity section must follow the first gate output: {handover}"
+    );
+    assert!(
+        activity_section < diff_section,
+        "the activity section must precede the repository diff: {handover}"
+    );
+    assert!(
+        handover.contains("bash(")
+            && handover.contains("retry-change.txt")
+            && handover.contains("-> ok"),
+        "the activity section names the delivered call and its ok status: {handover}"
+    );
     assert!(
         !carries_retry_handover(&exchanges[0].1) && !carries_retry_handover(&exchanges[1].1),
         "the first attempt must not carry a retry handover"
