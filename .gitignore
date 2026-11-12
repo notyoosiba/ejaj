@@ -11,7 +11,7 @@ lcov.info
 # working dir
 /.ejaj/
 
-# a recording is staged next to its fixture while a live test runs
+# temporary files
 *.tmp
 
 # secrets

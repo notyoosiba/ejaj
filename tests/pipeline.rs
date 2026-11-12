@@ -6,9 +6,9 @@
 //! ticket queue -- all through the production types, anchored to a disposable
 //! repository that begins clean and is left unchanged.
 //!
-//! Every test comes in two forms: the default replays a committed fixture with
-//! no network, and the `live_` twin (ignored) runs against a real model --
-//! recording the fixture when `EJAJ_LLM_RECORD=1` is set. See `tests/common/mod.rs`.
+//! Every test runs against the deterministic in-memory `ScriptedTransport` with
+//! no network access and no live model dependency. See `tests/common/mod.rs`
+//! for the scripted provider responses and disposable repository helpers.
 
 mod common;
 

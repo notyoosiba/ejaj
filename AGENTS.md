@@ -2,9 +2,8 @@
 
 ## Scope
 
-This file tells contributors how to configure, test, and record the `ejaj`
-crate. Read it before you change a prompt, a tool, or an agent loop.
-`tests/fixtures/README.md` gives more detail about the fixtures.
+This file tells contributors how to configure and test the `ejaj` crate. Read
+it before you change a prompt, a tool, or an agent loop.
 
 README.md and AGENTS.md must always be written in ASD-STE100 Simplified Technical English.
 
@@ -12,7 +11,6 @@ README.md and AGENTS.md must always be written in ASD-STE100 Simplified Technica
 
 - Read this guide before you change a prompt, a tool, or an agent loop.
 - Run `cargo test` after each change.
-- Do not edit a fixture by hand. Record it again.
 - Keep the crate warning-free.
 
 ## Configuration
@@ -141,67 +139,12 @@ in it.
 
 ## Tests
 
-`cargo test` is the offline default. It uses committed fixtures or a
-deterministic in-memory model transport. It does not need a live model.
+`cargo test` is the offline default. It uses a deterministic in-memory model
+transport and local loopback sockets. It does not need a live model.
 
-The ignored live tests use the network. They read these settings:
-
-- `EJAJ_TEST_LLM_URL`
-- `EJAJ_TEST_LLM_MODEL`
-- `EJAJ_TEST_LLM_API_KEY` (optional)
-- `EJAJ_TEST_ARCHITECT_URL` for two-provider tests
-- `EJAJ_TEST_ARCHITECT_MODEL` for two-provider tests
-
-The `llm_wire` test binary is the wire boundary check. Run it against a live
-endpoint with the values from your `.env`:
-
-```sh
-set -a && . ./.env && set +a
-EJAJ_TEST_LLM_URL="$LLM_MID_URL" \
-EJAJ_TEST_LLM_MODEL="$LLM_MID_MODEL" \
-EJAJ_TEST_LLM_API_KEY="$LLM_MID_API_KEY" \
-  cargo test --test llm_wire -- --ignored --test-threads=1
-```
+The HTTP boundary tests (`http_transport`) check real HTTP requests on a local
+loopback socket.
 
 The pipeline tests (`pipeline` and `hybrid_pipeline`) use a deterministic
 scripted transport. They check artifact persistence, validation, and provider
 routing without network access.
-
-## Replay and fixtures
-
-Replay does not use the network. It checks the request data against committed
-fixtures.
-
-A fixture path is `tests/fixtures/<test binary>/<test name>.json`.
-`tests/llm.env` holds the local recording configuration.
-
-Record the wire fixtures with:
-
-```sh
-EJAJ_LLM_RECORD=1 cargo test --test llm_wire -- --ignored --test-threads=1
-```
-
-The committed fixtures must name the local endpoints in `tests/llm.env`. The
-recorder refuses a different hosted endpoint override while
-`EJAJ_LLM_RECORD=1` is set.
-
-Do not edit a fixture by hand. Recording stages each exchange to
-`<name>.json.tmp` as it arrives. The test moves that file onto the fixture only
-after the run reaches its terminal step.
-
-## Replay failures
-
-A replay failure shows a contract change. Read the message.
-
-- `missing fixture ...`: The test has no fixture. Run the command in the
-  message.
-- `request drift at exchange N: ...`: The code builds a different request. For
-  example, a prompt, a tool schema, or the transcript changed. If the change is
-  correct, record the fixture again.
-- `the run made N requests, the fixture records M`: The loop makes a different
-  number of requests.
-- `fixture ... names the model ... instead of the local ...`: A hosted
-  recording reached the tree. Delete it and record it again against the local
-  endpoint.
-
-`tests/fixtures/README.md` gives more detail.

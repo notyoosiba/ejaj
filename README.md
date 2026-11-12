@@ -286,9 +286,6 @@ The application does not force a push. It does not roll back automatically.
 
 ## Test
 
-Run `cargo test`. This is the normal test command. The normal test suite uses
-offline fixtures or a deterministic in-memory model transport. It does not need
-a live model.
-
-The ignored live tests use the network. `AGENTS.md` gives the live commands,
-recording rules, and fixture guidance.
+Run `cargo test`. This is the normal test command. The test suite uses a
+deterministic in-memory model transport and local loopback sockets. It does not
+need a live model. `AGENTS.md` gives more test guidance.
