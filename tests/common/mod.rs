@@ -1481,11 +1481,18 @@ fn code_reply_response(
 
     if is_responses {
         let mut output = Vec::new();
-        if let Some(text) = narration {
+        if narration.is_some() || call.is_none() {
+            // A tool-free turn is still an assistant message: an explicit,
+            // possibly empty, content array. An empty output array would be a
+            // malformed response instead of an ordinary turn end.
+            let content = match narration {
+                Some(text) => serde_json::json!([{ "type": "output_text", "text": text }]),
+                None => serde_json::json!([]),
+            };
             output.push(serde_json::json!({
                 "type": "message",
                 "role": "assistant",
-                "content": [{ "type": "output_text", "text": text }],
+                "content": content,
             }));
         }
         if let Some(name) = call {

@@ -151,6 +151,7 @@ impl LlmProvider for ResponsesProvider {
 
         let mut text = String::new();
         let mut calls = Vec::new();
+        let mut explicit_empty_message = false;
         for item in &output {
             match item.get("type").and_then(Value::as_str) {
                 Some("function_call") => calls.push(ToolCall {
@@ -161,7 +162,10 @@ impl LlmProvider for ResponsesProvider {
                         arguments: string_field(item, "arguments"),
                     },
                 }),
-                Some("message") => text.push_str(&output_text(item)),
+                Some("message") => {
+                    text.push_str(&output_text(item));
+                    explicit_empty_message |= is_empty_assistant_message(item);
+                }
                 // Reasoning items and item types we do not model carry nothing
                 // the loop replays, so they are ignored.
                 _ => {}
@@ -170,7 +174,11 @@ impl LlmProvider for ResponsesProvider {
 
         let content = (!text.is_empty()).then_some(text);
         let tool_calls = (!calls.is_empty()).then_some(calls);
-        if content.is_none() && tool_calls.is_none() && !truncated {
+        // An explicit empty assistant message is itself a complete turn: the
+        // assistant answered with nothing, which the loop ends like any other
+        // tool-free turn. Every other shape that yields neither text nor calls
+        // is still malformed.
+        if content.is_none() && tool_calls.is_none() && !truncated && !explicit_empty_message {
             return Err(no_output_items());
         }
 
@@ -196,6 +204,19 @@ fn reached_max_output_tokens(status: Option<&Value>, incomplete_details: Option<
             .and_then(|details| details.get("reason"))
             .and_then(Value::as_str)
             == Some("max_output_tokens")
+}
+
+/// Whether an output item is the wire's explicit empty assistant message: a
+/// `message` item addressed to the assistant whose `content` array is present
+/// and empty. Only that exact shape is a complete tool-free turn; a `message`
+/// item missing its role or its content stays unusable output.
+fn is_empty_assistant_message(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("message")
+        && item.get("role").and_then(Value::as_str) == Some("assistant")
+        && item
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| parts.is_empty())
 }
 
 /// The one malformed-response message, shared by a missing `output` and an
@@ -700,37 +721,58 @@ mod tests {
         assert_eq!(message.tool_calls.expect("the tool calls survive").len(), 1);
     }
 
-    /// An `output` array with nothing to replay is malformed.
+    /// An explicit empty assistant message item -- `type: message`,
+    /// `role: assistant` and a present but empty `content` array -- is a
+    /// complete, tool-free assistant turn rather than a malformed reply.
     #[test]
-    fn decode_rejects_an_empty_output_array_as_malformed() {
-        match decode_error(&provider(None), raw(200, r#"{"output":[]}"#)) {
-            CallError::Malformed(message) => {
-                assert_eq!(message, "the response carried no output items");
-            }
-            other => panic!("expected a malformed error, got {}", other),
-        }
+    fn when_decoding_given_empty_assistant_message_item_then_returns_tool_free_turn_end() {
+        let body = r#"{"output":[{"type":"message","role":"assistant","content":[]}]}"#;
+        let message = decoded(&provider(None), raw(200, body));
+
+        assert_eq!(message.role, Role::Assistant);
+        assert!(message.content.is_none(), "no text means no content");
+        assert!(message.tool_calls.is_none(), "no calls means no tool calls");
+        assert!(message.tool_call_id.is_none());
+        assert!(message.reasoning_content.is_none());
+        assert!(message.extra.is_empty());
+        assert!(!message.truncated);
+
+        // The same item stays a tool-free turn when reasoning items, which
+        // carry nothing to replay, accompany it.
+        let body = r#"{"output":[{"type":"reasoning","summary":[]},{"type":"message","role":"assistant","content":[]}]}"#;
+        let message = decoded(&provider(None), raw(200, body));
+
+        assert_eq!(message.role, Role::Assistant);
+        assert!(message.content.is_none());
+        assert!(message.tool_calls.is_none());
+        assert!(!message.truncated);
     }
 
-    /// An array that yields neither text nor calls is malformed too.
+    /// Anything short of a usable assistant turn stays the one malformed
+    /// diagnostic: an absent `output`, an empty array, an array carrying only
+    /// items we do not recognize, and `message` items without the explicit
+    /// assistant-with-empty-content shape.
     #[test]
-    fn decode_rejects_output_with_neither_text_nor_calls_as_malformed() {
-        let body = r#"{"output":[{"type":"reasoning","summary":[]}]}"#;
-        match decode_error(&provider(None), raw(200, body)) {
-            CallError::Malformed(message) => {
-                assert_eq!(message, "the response carried no output items");
+    fn when_decoding_given_empty_missing_or_unrecognized_output_then_keeps_no_output_malformed_error()
+     {
+        for body in [
+            r#"{"id":"resp_1"}"#,
+            r#"{}"#,
+            r#"{"output":null}"#,
+            r#"{"output":[]}"#,
+            r#"{"output":[{"type":"reasoning","summary":[]}]}"#,
+            r#"{"output":[{"type":"web_search_call","id":"ws-1"}]}"#,
+            r#"{"output":[{"type":"message","content":[]}]}"#,
+            r#"{"output":[{"type":"message","role":"user","content":[]}]}"#,
+            r#"{"output":[{"type":"message","role":"assistant"}]}"#,
+        ] {
+            match decode_error(&provider(None), raw(200, body)) {
+                CallError::Malformed(message) => assert_eq!(
+                    message, "the response carried no output items",
+                    "body {body}"
+                ),
+                other => panic!("body {body}: expected a malformed error, got {}", other),
             }
-            other => panic!("expected a malformed error, got {}", other),
-        }
-    }
-
-    /// A missing `output` key is malformed.
-    #[test]
-    fn decode_rejects_a_missing_output_key_as_malformed() {
-        match decode_error(&provider(None), raw(200, r#"{"id":"resp_1"}"#)) {
-            CallError::Malformed(message) => {
-                assert_eq!(message, "the response carried no output items");
-            }
-            other => panic!("expected a malformed error, got {}", other),
         }
     }
 

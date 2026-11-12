@@ -299,6 +299,30 @@ impl Config {
         }
     }
 
+    /// Configuration for a ticket's second (retry) code-agent attempt: a hybrid
+    /// configuration with a giga block escalates to giga, so the retry's code
+    /// phase runs on the responses provider with the giga role, model and
+    /// configured rate. A mid or giga configuration -- and a hybrid
+    /// configuration without a giga block -- keeps its mode, so it never
+    /// selects a provider it does not have.
+    ///
+    /// Only the mode changes: both provider blocks, the optional prices, every
+    /// credential and reasoning setting, the Smoll block and the transport are
+    /// carried over unchanged, and the configuration this is derived from keeps
+    /// its own routing. Summary is routed before the mode is consulted, so it
+    /// stays on the Smoll Anthropic Messages provider in the derived
+    /// configuration too.
+    ///
+    /// The ticket lifecycle's retry attempt selects this configuration; the
+    /// first attempt always keeps the original routing.
+    pub(crate) fn code_retry_config(&self) -> Config {
+        let mut retry = self.clone();
+        if retry.mode == llm::Mode::Hybrid && retry.giga.is_some() {
+            retry.mode = llm::Mode::Giga;
+        }
+        retry
+    }
+
     /// The giga configured model, or the fixed panic that says the mode needs a
     /// giga block.
     fn giga_model(&self) -> &str {
@@ -548,6 +572,56 @@ mod tests {
             description.contains(&format!("summary -> anthropic-messages ({model})")),
             "description does not expose the Smoll summary route: {description}"
         );
+    }
+
+    /// Assert one phase's route through the public surface only: wire protocol,
+    /// role, model, encoded model and optional input rate.
+    fn assert_phase_route(
+        config: &Config,
+        phase: Phase,
+        protocol: &str,
+        role: &str,
+        model: &str,
+        price: Option<f64>,
+    ) {
+        let provider = config.provider(phase);
+        assert_eq!(provider.name(), protocol, "phase {phase:?} protocol");
+        assert_eq!(config.provider_role(phase), role, "phase {phase:?} role");
+        assert_eq!(config.provider_model(phase), model, "phase {phase:?} model");
+        assert_eq!(
+            provider
+                .prepare(&[Message::user("hi")], phase)
+                .outgoing
+                .body["model"],
+            json!(model),
+            "phase {phase:?} wire model"
+        );
+        assert_eq!(config.input_price(phase), price, "phase {phase:?} price");
+    }
+
+    /// A transport double at the external HTTP boundary: it records the requests
+    /// it is handed and answers with an empty success, so a test observes which
+    /// configuration sent through it without touching the network.
+    #[derive(Default)]
+    struct RecordingTransport {
+        sent: std::sync::Mutex<Vec<(String, Auth, serde_json::Value)>>,
+    }
+
+    impl api::Transport for RecordingTransport {
+        fn send(&self, outgoing: &api::Outgoing) -> Result<api::RawResponse, api::CallError> {
+            self.sent
+                .lock()
+                .expect("the recording transport is never poisoned")
+                .push((
+                    outgoing.url.clone(),
+                    outgoing.auth.clone(),
+                    outgoing.body.clone(),
+                ));
+            Ok(api::RawResponse {
+                status: 200,
+                body: "{}".to_string(),
+            })
+        }
     }
 
     /// Core entry-point behavior: Summary is the one phase that leaves the mode's
@@ -1568,5 +1642,227 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Core entry-point behavior (minimum valid boundary): a hybrid
+    /// configuration with a configured giga block derives a retry whose Code
+    /// route is the responses provider with the giga role, model and configured
+    /// rate, while the original configuration still runs Code on mid.
+    #[test]
+    fn when_deriving_code_retry_given_hybrid_with_giga_then_selects_giga_and_preserves_original_route()
+     {
+        let hybrid = priced_config(Mode::Hybrid, Some(1.25), Some(2.5), Some(3.75));
+
+        let retry = hybrid.code_retry_config();
+
+        assert_phase_route(
+            &retry,
+            Phase::Code,
+            "responses",
+            "giga",
+            GIGA_MODEL,
+            Some(2.5),
+        );
+        assert_phase_route(
+            &hybrid,
+            Phase::Code,
+            "chat-completions",
+            "mid",
+            MID_MODEL,
+            Some(1.25),
+        );
+        assert_eq!(
+            retry
+                .provider(Phase::Code)
+                .prepare(&[Message::user("hi")], Phase::Code)
+                .outgoing
+                .url,
+            GIGA_URL
+        );
+        assert_eq!(
+            hybrid
+                .provider(Phase::Code)
+                .prepare(&[Message::user("hi")], Phase::Code)
+                .outgoing
+                .url,
+            MID_URL
+        );
+    }
+
+    /// Edge-case table (empty/nil and minimum valid boundaries): Mid, Giga and a
+    /// hybrid configuration without a giga block keep their own Code route, and
+    /// the absent giga provider is never selected.
+    #[test]
+    fn when_deriving_code_retry_given_mid_giga_or_hybrid_without_giga_then_preserves_mode_specific_route()
+     {
+        let mid = priced_config(Mode::Mid, Some(1.25), Some(2.5), Some(3.75));
+        let giga = priced_config(Mode::Giga, Some(1.25), Some(2.5), Some(3.75));
+        let unpriced_mid = Config::new(MID_URL, MID_MODEL, None);
+        let hybrid_without_giga = mid_config().with_mode(Mode::Hybrid);
+
+        let cases = [
+            (
+                "mid",
+                &mid,
+                "chat-completions",
+                "mid",
+                MID_MODEL,
+                Some(1.25),
+            ),
+            ("giga", &giga, "responses", "giga", GIGA_MODEL, Some(2.5)),
+            (
+                "unpriced mid",
+                &unpriced_mid,
+                "chat-completions",
+                "mid",
+                MID_MODEL,
+                None,
+            ),
+            (
+                "hybrid without giga",
+                &hybrid_without_giga,
+                "chat-completions",
+                "mid",
+                MID_MODEL,
+                None,
+            ),
+        ];
+
+        for (_case, config, protocol, role, model, price) in cases {
+            let retry = config.code_retry_config();
+            assert_phase_route(&retry, Phase::Code, protocol, role, model, price);
+            assert_phase_route(config, Phase::Code, protocol, role, model, price);
+        }
+
+        // The two configurations that are not hybrid keep their mode, and the
+        // hybrid configuration without a giga block never escalates.
+        assert_eq!(mid.code_retry_config().describe(), mid.describe());
+        assert_eq!(giga.code_retry_config().describe(), giga.describe());
+        assert_eq!(
+            hybrid_without_giga
+                .code_retry_config()
+                .provider(Phase::Code)
+                .name(),
+            "chat-completions"
+        );
+        let retry_summary = hybrid_without_giga
+            .code_retry_config()
+            .provider(Phase::Summary);
+        assert_eq!(retry_summary.name(), "anthropic-messages");
+        let prepared = retry_summary.prepare(&[Message::user("hi")], Phase::Summary);
+        assert_eq!(prepared.outgoing.url, SMOLL_URL);
+        assert_eq!(prepared.outgoing.body["model"], json!(SMOLL_MODEL));
+        assert_eq!(
+            prepared.outgoing.auth,
+            Auth::Anthropic("smoll-key".to_string())
+        );
+    }
+
+    /// Contract and invariant check: deriving a retry changes only the mode --
+    /// the giga block's credentials, reasoning settings, prices and Summary's
+    /// Smoll provider, model and rate survive unchanged, and both configurations
+    /// still send through the transport the caller installed.
+    #[test]
+    fn when_deriving_code_retry_given_configured_provider_blocks_then_changes_only_mode_and_preserves_summary_route()
+     {
+        let recording = Arc::new(RecordingTransport::default());
+        let hybrid = priced_config(Mode::Hybrid, Some(1.25), Some(2.5), Some(3.75))
+            .with_transport(recording.clone());
+
+        let retry = hybrid.code_retry_config();
+
+        for phase in [
+            Phase::Plan,
+            Phase::Spec,
+            Phase::Tickets,
+            Phase::Triage,
+            Phase::Review,
+        ] {
+            assert_phase_route(&retry, phase, "responses", "giga", GIGA_MODEL, Some(2.5));
+            let derived = retry
+                .provider(phase)
+                .prepare(&[Message::user("hi")], phase)
+                .outgoing;
+            let original = hybrid
+                .provider(phase)
+                .prepare(&[Message::user("hi")], phase)
+                .outgoing;
+            assert_eq!(derived.url, GIGA_URL, "phase {phase:?} endpoint");
+            assert_eq!(
+                derived.auth,
+                Auth::Bearer("sk-giga".to_string()),
+                "phase {phase:?} credential"
+            );
+            assert_eq!(
+                derived.body["reasoning"],
+                json!({ "effort": "high" }),
+                "phase {phase:?} reasoning"
+            );
+            assert_eq!(derived.body, original.body, "phase {phase:?} payload");
+        }
+
+        // The mid block derivation started from keeps its own credential, model
+        // and reasoning setting for the original configuration's Code route.
+        let original_code = hybrid
+            .provider(Phase::Code)
+            .prepare(&[Message::user("hi")], Phase::Code)
+            .outgoing;
+        assert_eq!(original_code.url, MID_URL);
+        assert_eq!(original_code.auth, Auth::Bearer("sk-mid".to_string()));
+        assert_eq!(original_code.body["model"], json!(MID_MODEL));
+        assert_eq!(original_code.body["reasoning_effort"], json!("high"));
+        assert_eq!(hybrid.input_price(Phase::Code), Some(1.25));
+
+        let retry_code = retry
+            .provider(Phase::Code)
+            .prepare(&[Message::user("hi")], Phase::Code)
+            .outgoing;
+        assert_eq!(retry_code.url, GIGA_URL);
+        assert_eq!(retry_code.auth, Auth::Bearer("sk-giga".to_string()));
+        assert_eq!(retry_code.body["model"], json!(GIGA_MODEL));
+        assert_eq!(retry_code.body["reasoning"], json!({ "effort": "high" }));
+        assert_eq!(retry.input_price(Phase::Code), Some(2.5));
+
+        // Summary stays on the configured Smoll Anthropic Messages provider on
+        // both the original and the derived configuration.
+        for config in [&hybrid, &retry] {
+            assert_summary_settings(config, SMOLL_URL, SMOLL_MODEL, "sk-smoll");
+            assert_eq!(config.input_price(Phase::Summary), Some(3.75));
+        }
+
+        hybrid
+            .send(&original_code)
+            .unwrap_or_else(|error| panic!("the original configuration must send: {error}"));
+        retry
+            .send(&retry_code)
+            .unwrap_or_else(|error| panic!("the derived configuration must send: {error}"));
+        let sent = recording
+            .sent
+            .lock()
+            .expect("the recording transport is never poisoned");
+        assert_eq!(sent.len(), 2, "both configurations share one transport");
+        assert_eq!(sent[0].0, MID_URL);
+        assert_eq!(sent[1].0, GIGA_URL);
+    }
+
+    /// Edge-case table (empty/nil): a hybrid configuration with an unpriced giga
+    /// block derives a giga Code route that stays unpriced instead of inheriting
+    /// the mid rate.
+    #[test]
+    fn when_deriving_code_retry_given_unpriced_giga_then_does_not_inherit_mid_price() {
+        let hybrid = priced_config(Mode::Hybrid, Some(1.25), None, Some(3.75));
+
+        let retry = hybrid.code_retry_config();
+
+        assert_phase_route(&retry, Phase::Code, "responses", "giga", GIGA_MODEL, None);
+        assert_phase_route(
+            &hybrid,
+            Phase::Code,
+            "chat-completions",
+            "mid",
+            MID_MODEL,
+            Some(1.25),
+        );
+        assert_eq!(retry.input_price(Phase::Summary), Some(3.75));
     }
 }

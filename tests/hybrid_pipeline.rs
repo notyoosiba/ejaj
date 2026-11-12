@@ -16,10 +16,12 @@ use ejaj::llm::Mode;
 use ejaj::pipeline::{Pipeline, Step};
 use ejaj::plan_document::Plan;
 use ejaj::specification::Specification;
+use ejaj::tickets::TicketSet;
 use ejaj::tools::Phase;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -598,4 +600,637 @@ fn when_hybrid_pipeline_runs_given_scripted_providers_then_preserves_routing_and
         })
         .collect();
     assert_eq!(labels, HYBRID_PHASE_LABELS, "{transcript}");
+}
+
+// ---------------------------------------------------------------------------
+// T26: the one Giga handover retry
+// ---------------------------------------------------------------------------
+
+/// The environment variable a child copy of the retry test sets on itself: a
+/// copy that sees it performs the run for real, so the parent reads the
+/// production status output at the process boundary.
+const HYBRID_RETRY_STATUS_CHILD: &str = "EJAJ_HYBRID_RETRY_STATUS_CHILD";
+
+/// The configured input rates the production configuration carries. The code
+/// phase starts on Mid; only the derived Giga retry selects the Giga rate.
+const MID_INPUT_PRICE: f64 = 1.25;
+const GIGA_INPUT_PRICE: f64 = 2.5;
+const SMOLL_INPUT_PRICE: f64 = 3.75;
+
+/// The harmless one-ticket set with a chosen shell gate.
+fn tickets_with_gate(gate: &str) -> TicketSet {
+    let value: serde_json::Value =
+        serde_json::from_str(common::harmless_tickets_json()).expect("the ticket fixture is JSON");
+    let mut set: TicketSet = serde_json::from_value(value["tickets"].clone())
+        .expect("the ticket fixture carries a ticket set");
+    for ticket in &mut set.tickets {
+        ticket.verification_gate = gate.to_string();
+    }
+    set
+}
+
+/// A shell gate that logs every invocation and then does the given thing.
+fn logging_gate(log: &Path, result: &str) -> String {
+    format!("printf 'gate run\n' >> {}; {result}", log.display())
+}
+
+/// How many times a logging shell gate really ran. A missing log means zero.
+fn gate_runs(log: &Path) -> usize {
+    fs::read_to_string(log)
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
+}
+
+/// A hybrid configuration resolved from explicit environment values, so the
+/// per-role configured input rates are part of the same configuration the
+/// production lifecycle reads. The transport is the only scripted boundary.
+fn priced_config(mode: Mode, transport: Arc<common::ScriptedTransport>) -> Config {
+    let values: Vec<(&str, String)> = vec![
+        ("AGENT_MODE", mode.label().to_string()),
+        ("LLM_MID_URL", common::DEFAULT_TEST_URL.to_string()),
+        ("LLM_MID_MODEL", common::TEST_MODEL.to_string()),
+        ("LLM_MID_API_KEY", common::TEST_API_KEY.to_string()),
+        (
+            "LLM_MID_INPUT_PRICE_PER_MILLION_USD",
+            MID_INPUT_PRICE.to_string(),
+        ),
+        ("LLM_GIGA_URL", common::TEST_GIGA_URL.to_string()),
+        ("LLM_GIGA_MODEL", common::TEST_GIGA_MODEL.to_string()),
+        ("LLM_GIGA_API_KEY", common::TEST_API_KEY.to_string()),
+        (
+            "LLM_GIGA_INPUT_PRICE_PER_MILLION_USD",
+            GIGA_INPUT_PRICE.to_string(),
+        ),
+        ("LLM_SMOLL_URL", common::TEST_SMOLL_URL.to_string()),
+        ("LLM_SMOLL_MODEL", common::TEST_SMOLL_MODEL.to_string()),
+        ("LLM_SMOLL_API_KEY", common::TEST_SMOLL_API_KEY.to_string()),
+        (
+            "LLM_SMOLL_INPUT_PRICE_PER_MILLION_USD",
+            SMOLL_INPUT_PRICE.to_string(),
+        ),
+    ];
+    let environment = |name: &str| {
+        values
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.clone())
+    };
+    Config::from_environment(&environment)
+        .unwrap_or_else(|message| panic!("the priced hybrid configuration resolves: {message}"))
+        .with_transport(transport)
+}
+
+/// Run one production hybrid pipeline over a disposable repository, keeping
+/// the run's session artifacts under its real .ejaj directory so the
+/// trajectories persist exactly as they do in production.
+fn run_hybrid(
+    mode: Mode,
+    replies: Vec<common::CodeReply>,
+    tickets: TicketSet,
+) -> (
+    Step,
+    PathBuf,
+    Arc<common::ScriptedTransport>,
+    common::TempRepo,
+) {
+    let transport = Arc::new(
+        common::ScriptedTransport::new()
+            .with_tickets(tickets)
+            .with_code_replies(replies),
+    );
+    let config = priced_config(mode, transport.clone());
+    let work = scratch_dir();
+    let repository = common::TempRepo::at(work);
+    repository.commit_baseline();
+    let dir = repository.path().join(".ejaj/run");
+    let mut pipeline = Pipeline::new(&config, common::scope(), repository.path());
+    let step = pipeline.ask(&common::harmless_plan_request(), &dir);
+    (step, dir, transport, repository)
+}
+
+/// Every code-agent request the run made, with its outgoing URL, in order.
+fn code_exchanges(transport: &common::ScriptedTransport) -> Vec<(String, serde_json::Value)> {
+    let urls = transport.urls_called.lock().unwrap();
+    let requests = transport.requests.lock().unwrap();
+    urls.iter()
+        .cloned()
+        .zip(requests.iter().cloned())
+        .filter(|(_, body)| body.to_string().contains(common::CODE_MARKER))
+        .collect()
+}
+
+/// Every user message one request carried, in order, on either wire format:
+/// the chat-completions messages array or the Responses API input array.
+fn user_messages(body: &serde_json::Value) -> Vec<String> {
+    let items = body["messages"]
+        .as_array()
+        .or_else(|| body["input"].as_array());
+    items
+        .into_iter()
+        .flatten()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether one request carried the retry handover.
+fn carries_retry_handover(body: &serde_json::Value) -> bool {
+    body.to_string().contains("[RETRY HANDOVER]")
+}
+
+/// Read one persisted trajectory snapshot.
+fn trajectory(dir: &Path, name: &str) -> serde_json::Value {
+    let path = dir.join("trajectories").join(name);
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} is readable: {e}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{} is trajectory JSON: {e}", path.display()))
+}
+
+/// Every status line the production transcript carried for the code phase, as
+/// its (provider role, configured model) pair, in order.
+fn code_thinking_reports(transcript: &str) -> Vec<(String, String)> {
+    transcript
+        .lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once("#thinking (")?;
+            let (_, rest) = rest.split_once("s) ")?;
+            let mut fields = rest.split_whitespace();
+            let provider = fields.next()?.to_string();
+            let model = fields.next()?.strip_prefix("model=")?.to_string();
+            let phase = fields.next()?.strip_prefix("phase=")?;
+            (phase == "code").then_some((provider, model))
+        })
+        .collect()
+}
+
+/// The production run at the retry seam: a Mid tool call followed by a
+/// tool-free turn end, then a Giga handover retry whose tool-free Responses API
+/// turn is an explicit empty assistant message. A passing gate makes the queue
+/// resolve without that retry ever declaring completion.
+#[test]
+fn when_hybrid_code_attempt_ends_given_retryable_turn_end_then_escalates_once_and_preserves_other_routes()
+ {
+    let state = scratch_dir();
+    fs::create_dir_all(&state).expect("the retry state directory is creatable");
+    let gate_log = state.join("gate-runs.log");
+    let gate = logging_gate(&gate_log, "exit 0");
+    let tickets = tickets_with_gate(&gate);
+    let replies = vec![
+        common::CodeReply::ToolCall {
+            narration: None,
+            command: "printf 'first attempt change\n' > retry-change.txt".to_string(),
+        },
+        common::CodeReply::TurnEnd(None),
+        common::CodeReply::TurnEnd(None),
+    ];
+
+    if std::env::var_os(HYBRID_RETRY_STATUS_CHILD).is_some() {
+        println!();
+        let (step, _dir, _transport, _repository) = run_hybrid(Mode::Hybrid, replies, tickets);
+        assert!(matches!(&step, Step::Complete), "{step:?}");
+        let _ = fs::remove_dir_all(&state);
+        return;
+    }
+
+    // The configured rates live on the very configuration the production
+    // lifecycle reads: the initial code attempt selects the Mid rate, while the
+    // Giga block (which the handover retry inherits) carries the Giga rate.
+    let hybrid = priced_config(Mode::Hybrid, Arc::new(common::ScriptedTransport::new()));
+    assert_eq!(
+        hybrid.input_price(Phase::Code),
+        Some(MID_INPUT_PRICE),
+        "the initial code attempt is priced at the configured mid rate"
+    );
+    assert_eq!(
+        hybrid.input_price(Phase::Review),
+        Some(GIGA_INPUT_PRICE),
+        "the hybrid giga block carries the configured giga rate"
+    );
+    let giga = priced_config(Mode::Giga, Arc::new(common::ScriptedTransport::new()));
+    assert_eq!(
+        giga.input_price(Phase::Code),
+        Some(GIGA_INPUT_PRICE),
+        "a giga code route is priced at the configured giga rate"
+    );
+    assert_hybrid_routing(&hybrid);
+
+    let (step, dir, transport, _repository) = run_hybrid(Mode::Hybrid, replies, tickets);
+    assert!(matches!(&step, Step::Complete), "{step:?}");
+
+    // Attempt 1 makes both of its code requests to the mid endpoint and only
+    // stops after the real tool call (so a follow-up turn was needed). Attempt
+    // 2 is the one Giga Responses API request, carrying a separate handover.
+    let exchanges = code_exchanges(&transport);
+    assert_eq!(
+        exchanges.len(),
+        3,
+        "two mid turns for the first attempt and one giga turn for the retry"
+    );
+    assert_eq!(exchanges[0].0, common::test_url(), "first code turn is mid");
+    assert_eq!(exchanges[1].0, common::test_url(), "tool follow-up is mid");
+    assert_eq!(
+        exchanges[2].0,
+        common::test_giga_url(),
+        "the handover retry must use the giga Responses API endpoint"
+    );
+    for (index, (_, body)) in exchanges[..2].iter().enumerate() {
+        assert_eq!(
+            body["model"],
+            serde_json::json!(common::TEST_MODEL),
+            "mid code turn {index} must request the configured mid model"
+        );
+    }
+    let retry = &exchanges[2].1;
+    assert_eq!(
+        retry["model"],
+        serde_json::json!(common::TEST_GIGA_MODEL),
+        "the retry must request the configured giga model"
+    );
+    assert!(
+        retry.get("input").is_some(),
+        "the retry must be a Responses API body: {retry}"
+    );
+    let first_users = user_messages(&exchanges[0].1);
+    let retry_users = user_messages(retry);
+    assert_eq!(
+        first_users.len(),
+        1,
+        "the first attempt carries only the ticket kickoff"
+    );
+    assert_eq!(
+        retry_users.len(),
+        2,
+        "the retry adds one separate handover user message"
+    );
+    assert_eq!(
+        retry_users[0], first_users[0],
+        "the retry keeps the unchanged ticket kickoff"
+    );
+    assert!(
+        retry_users[1].contains("[RETRY HANDOVER]"),
+        "the separate retry message must be the handover: {}",
+        retry_users[1]
+    );
+    assert!(
+        retry_users[1].contains("(empty narration)"),
+        "the first attempt narrated nothing, so the handover says so: {}",
+        retry_users[1]
+    );
+    assert!(
+        retry_users[1].contains("turn end without task_complete"),
+        "the handover names the retryable stop: {}",
+        retry_users[1]
+    );
+    assert!(
+        !carries_retry_handover(&exchanges[0].1) && !carries_retry_handover(&exchanges[1].1),
+        "the first attempt must not carry a retry handover"
+    );
+
+    // The first attempt really called the bash tool and then ended its turn;
+    // the retry's tool-free Responses API turn decoded as an ordinary turn end
+    // through the explicit empty assistant message, not as malformed output.
+    let first_trajectory = trajectory(&dir, "code.traj.json");
+    assert_eq!(first_trajectory["role"], serde_json::json!("mid"));
+    assert_eq!(
+        first_trajectory["model"],
+        serde_json::json!(common::TEST_MODEL)
+    );
+    assert_eq!(
+        first_trajectory["exit_status"],
+        serde_json::json!("turn_end")
+    );
+    let first_messages = first_trajectory["messages"]
+        .as_array()
+        .expect("the trajectory carries its messages");
+    assert!(
+        first_messages
+            .iter()
+            .any(|message| message["role"] == serde_json::json!("tool")),
+        "the first attempt must have run a real tool: {first_trajectory}"
+    );
+    let retry_trajectory = trajectory(&dir, "code-1.traj.json");
+    assert_eq!(retry_trajectory["role"], serde_json::json!("giga"));
+    assert_eq!(
+        retry_trajectory["model"],
+        serde_json::json!(common::TEST_GIGA_MODEL)
+    );
+    assert_eq!(
+        retry_trajectory["exit_status"],
+        serde_json::json!("turn_end")
+    );
+    let retry_messages = retry_trajectory["messages"]
+        .as_array()
+        .expect("the retry trajectory carries its messages");
+    assert!(
+        !retry_messages
+            .iter()
+            .any(|message| message["tool_calls"].is_array()),
+        "an empty assistant turn must call no tool: {retry_trajectory}"
+    );
+
+    // Only the final gate ran: the first attempt never declared completion, so
+    // it never reached the first gate, and the passing final gate resolved the
+    // ticket without a declaration.
+    assert_eq!(
+        gate_runs(&gate_log),
+        1,
+        "only the second attempt's final gate runs"
+    );
+    let report = fs::read_to_string(dir.join("queue-report.md"))
+        .expect("the queue report artifact is readable");
+    assert!(
+        report.contains("- Ended: gate accepted without declaration"),
+        "the passing final gate is authoritative: {report}"
+    );
+
+    // The normal hybrid routes survive the retry: plan/spec/tickets/triage and
+    // the review stay on giga, and summary stays on Smoll.
+    let urls = transport.urls_called.lock().unwrap().clone();
+    assert_eq!(
+        urls.len(),
+        9,
+        "plan, spec, tickets, triage, three code turns, review and summary"
+    );
+    for (index, url) in urls[..4].iter().enumerate() {
+        assert_eq!(url, &common::test_giga_url(), "planning step {index}");
+    }
+    assert_eq!(urls[6], common::test_giga_url(), "the review is giga");
+    assert_eq!(urls[7], common::test_giga_url(), "the review is giga");
+    assert_eq!(urls[8], common::TEST_SMOLL_URL, "the summary is Smoll");
+
+    // The production status output names the retry's provider identity and
+    // model: two mid code turns, then one giga code turn. The same giga
+    // identity and model are what the persisted trajectory recorded above.
+    let transcript = common::captured_transcript(
+        "when_hybrid_code_attempt_ends_given_retryable_turn_end_then_escalates_once_and_preserves_other_routes",
+        &[(HYBRID_RETRY_STATUS_CHILD, "1")],
+    );
+    let reports = code_thinking_reports(&transcript);
+    assert_eq!(
+        reports.len(),
+        3,
+        "one status line per code request: {transcript}"
+    );
+    assert_eq!(
+        reports[0],
+        ("mid".to_string(), common::TEST_MODEL.to_string()),
+        "{transcript}"
+    );
+    assert_eq!(
+        reports[1],
+        ("mid".to_string(), common::TEST_MODEL.to_string()),
+        "{transcript}"
+    );
+    assert_eq!(
+        reports[2],
+        ("giga".to_string(), common::TEST_GIGA_MODEL.to_string()),
+        "{transcript}"
+    );
+
+    let _ = fs::remove_dir_all(&state);
+}
+
+/// Contract: a failed first verification gate buys the same one fresh retry as
+/// an eligible stop, and that retry runs the derived Giga configuration. The
+/// second attempt here ends without declaring completion, so only the passing
+/// final gate resolves the ticket.
+#[test]
+fn when_hybrid_code_attempt_retries_given_first_gate_failure_then_uses_giga_for_single_handover() {
+    let state = scratch_dir();
+    fs::create_dir_all(&state).expect("the retry state directory is creatable");
+    let gate_log = state.join("gate-runs.log");
+    let failed_once = state.join("first-gate-failed");
+    let gate = format!(
+        "printf 'gate run\n' >> {log}; if [ ! -e {state} ]; then : > {state}; \
+         printf 'FIRST-GATE-DIAGNOSTIC\n' >&2; \
+         printf 'first gate change\n' > first-gate-change.txt; exit 1; else exit 0; fi",
+        log = gate_log.display(),
+        state = failed_once.display(),
+    );
+    let tickets = tickets_with_gate(&gate);
+    let replies = vec![
+        common::CodeReply::Complete(None),
+        common::CodeReply::TurnEnd(None),
+    ];
+
+    let (step, dir, transport, _repository) = run_hybrid(Mode::Hybrid, replies, tickets);
+    assert!(matches!(&step, Step::Complete), "{step:?}");
+
+    let exchanges = code_exchanges(&transport);
+    assert_eq!(
+        exchanges.len(),
+        2,
+        "exactly the first attempt and its one fresh handover retry"
+    );
+    assert_eq!(
+        exchanges[0].0,
+        common::test_url(),
+        "the first attempt keeps the mid code route"
+    );
+    assert_eq!(
+        exchanges[1].0,
+        common::test_giga_url(),
+        "the first-gate retry must use the giga Responses API route"
+    );
+    assert!(
+        !carries_retry_handover(&exchanges[0].1),
+        "the first attempt must not carry a retry handover"
+    );
+    let retry_users = user_messages(&exchanges[1].1);
+    assert_eq!(
+        retry_users.len(),
+        2,
+        "the retry carries the unchanged kickoff plus one separate handover"
+    );
+    assert!(
+        retry_users[1].contains("[RETRY HANDOVER]"),
+        "the second attempt's separate message is the handover: {}",
+        retry_users[1]
+    );
+    assert!(
+        retry_users[1].contains("task_complete, but the first verification gate failed"),
+        "the handover names the failed first gate: {}",
+        retry_users[1]
+    );
+    assert!(
+        retry_users[1].contains("FIRST-GATE-DIAGNOSTIC"),
+        "the handover carries the first gate's own output: {}",
+        retry_users[1]
+    );
+
+    assert_eq!(
+        gate_runs(&gate_log),
+        2,
+        "the failed first gate and the authoritative final gate"
+    );
+    let first_trajectory = trajectory(&dir, "code.traj.json");
+    assert_eq!(first_trajectory["role"], serde_json::json!("mid"));
+    assert_eq!(
+        first_trajectory["exit_status"],
+        serde_json::json!("complete"),
+        "the first attempt declared completion before its gate failed"
+    );
+    let retry_trajectory = trajectory(&dir, "code-1.traj.json");
+    assert_eq!(retry_trajectory["role"], serde_json::json!("giga"));
+    assert_eq!(
+        retry_trajectory["model"],
+        serde_json::json!(common::TEST_GIGA_MODEL)
+    );
+    assert_eq!(
+        retry_trajectory["exit_status"],
+        serde_json::json!("turn_end")
+    );
+
+    let report = fs::read_to_string(dir.join("queue-report.md"))
+        .expect("the queue report artifact is readable");
+    assert!(
+        report.contains("- Status: completed")
+            && report.contains("- Ended: gate accepted without declaration"),
+        "the passing final gate controls completion: {report}"
+    );
+
+    let urls = transport.urls_called.lock().unwrap().clone();
+    assert_eq!(
+        urls.len(),
+        8,
+        "four planning steps, the two code turns, review and summary"
+    );
+    assert_eq!(urls[4], common::test_url(), "the first code turn is mid");
+    assert_eq!(urls[5], common::test_giga_url(), "the retry is giga");
+    assert_eq!(urls[6], common::test_giga_url(), "review stays on giga");
+    assert_eq!(urls[7], common::TEST_SMOLL_URL, "summary stays on Smoll");
+
+    let _ = fs::remove_dir_all(&state);
+}
+
+/// Regression and boundary table: an unauthorized or forbidden API refusal, a
+/// terminal transport exhaustion, and a malformed response are all fatal on the
+/// first code attempt. None earns a ticket-level handover retry or reaches the
+/// first verification gate.
+#[test]
+fn when_hybrid_first_code_attempt_fails_given_fatal_api_transport_or_malformed_response_then_skips_retry_and_gate()
+ {
+    struct Case {
+        label: &'static str,
+        replies: Vec<common::CodeReply>,
+        code_requests: usize,
+        ended: &'static str,
+    }
+
+    let cases = vec![
+        Case {
+            label: "HTTP 401 unauthorized",
+            replies: vec![common::CodeReply::Api {
+                status: 401,
+                message: "unauthorized".to_string(),
+            }],
+            code_requests: 1,
+            ended: "agent failure: API error",
+        },
+        Case {
+            label: "HTTP 403 forbidden",
+            replies: vec![common::CodeReply::Api {
+                status: 403,
+                message: "forbidden".to_string(),
+            }],
+            code_requests: 1,
+            ended: "agent failure: API error",
+        },
+        Case {
+            label: "terminal transport exhaustion",
+            replies: vec![
+                common::CodeReply::Transport("connection reset".to_string()),
+                common::CodeReply::Transport("connection reset".to_string()),
+                common::CodeReply::Transport("connection reset".to_string()),
+            ],
+            code_requests: 3,
+            ended: "agent failure: transport error",
+        },
+        Case {
+            label: "malformed response",
+            replies: vec![common::CodeReply::Malformed],
+            code_requests: 1,
+            ended: "agent failure: malformed response",
+        },
+    ];
+
+    for case in cases {
+        let state = scratch_dir();
+        fs::create_dir_all(&state).expect("the fatal case state directory is creatable");
+        let gate_log = state.join("gate-runs.log");
+        let gate = logging_gate(&gate_log, "exit 0");
+        let tickets = tickets_with_gate(&gate);
+
+        let (step, dir, transport, _repository) = run_hybrid(Mode::Hybrid, case.replies, tickets);
+        assert!(
+            matches!(&step, Step::Retry),
+            "{}: a fatal first attempt leaves the queue incomplete: {step:?}",
+            case.label
+        );
+
+        let exchanges = code_exchanges(&transport);
+        assert_eq!(
+            exchanges.len(),
+            case.code_requests,
+            "{}: the fatal first attempt must not earn a ticket-level retry",
+            case.label
+        );
+        for (url, body) in &exchanges {
+            assert_eq!(
+                url,
+                &common::test_url(),
+                "{}: every fatal code request stays on mid",
+                case.label
+            );
+            assert!(
+                !carries_retry_handover(body),
+                "{}: no handover may be sent on a fatal first attempt",
+                case.label
+            );
+        }
+        assert_eq!(
+            gate_runs(&gate_log),
+            0,
+            "{}: a fatal first attempt never reaches a verification gate",
+            case.label
+        );
+
+        let report = fs::read_to_string(dir.join("queue-report.md"))
+            .expect("the queue report artifact is readable");
+        assert!(
+            report.contains("- Status: failed"),
+            "{}: the ticket is failed: {report}",
+            case.label
+        );
+        assert!(
+            report.contains(&format!("- Ended: {}", case.ended)),
+            "{}: the report names the fatal failure: {report}",
+            case.label
+        );
+
+        let urls = transport.urls_called.lock().unwrap().clone();
+        assert_eq!(
+            urls.len(),
+            5 + case.code_requests,
+            "{}: four planning steps, the fatal code requests and the summary",
+            case.label
+        );
+        assert!(
+            urls[4..4 + case.code_requests]
+                .iter()
+                .all(|url| url == &common::test_url()),
+            "{}: no giga retry follows the fatal code failure: {urls:?}",
+            case.label
+        );
+        assert_eq!(
+            urls[4 + case.code_requests],
+            common::TEST_SMOLL_URL,
+            "{}: the run skips review and finishes with the Smoll summary: {urls:?}",
+            case.label
+        );
+
+        let _ = fs::remove_dir_all(&state);
+    }
 }

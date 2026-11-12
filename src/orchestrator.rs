@@ -305,7 +305,12 @@ impl Lifecycle for Production<'_> {
         handover: Option<&str>,
         contributions: Option<&mut QueueContributions>,
     ) -> code::Attempt {
-        let session = code::Session::new(self.config, self.scope);
+        // Attempt 1 uses the shipped configuration unchanged. Only a handover
+        // argument, which the queue supplies solely for its one retry, selects
+        // the derived configuration that escalates a hybrid code phase to giga.
+        let retry_config = handover.map(|_| self.config.code_retry_config());
+        let config = retry_config.as_ref().unwrap_or(self.config);
+        let session = code::Session::new(config, self.scope);
         let mut kickoff = ticket.to_markdown();
         if let Some(context) = self
             .triage
