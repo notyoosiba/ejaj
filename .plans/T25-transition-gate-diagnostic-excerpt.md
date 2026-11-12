@@ -1,4 +1,4 @@
-# Proposal 22: High-Signal Failure Extraction in `transition_failure_excerpt` (`src/tools.rs`, `src/pipeline.rs`)
+# T25: High-Signal Failure Extraction in `transition_failure_excerpt` (`src/tools.rs`, `src/pipeline.rs`)
 
 ## Problem
 
@@ -45,7 +45,7 @@ This fails on oversized test-suite runs for two interacting reasons:
 - **Preserve caller-intent test-title rules (`tests/test_titles.rs`):**
   - Name every new test `when_<action>_given_<context>_then_<outcome>` without internal helper identifiers.
 - **Scope tracker updates strictly to `TODO.md`:**
-  - Update `TODO.md` only; do not edit `.plans/PROPOSAL-22-transition-gate-diagnostic-excerpt.md` during implementation.
+  - Mark the `T25` row `[x]` in `TODO.md` right before running the verification gate; do not edit `.plans/T25-transition-gate-diagnostic-excerpt.md`.
 
 ---
 
