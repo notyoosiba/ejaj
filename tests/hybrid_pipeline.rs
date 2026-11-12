@@ -776,7 +776,10 @@ fn when_hybrid_code_attempt_ends_given_retryable_turn_end_then_escalates_once_an
     fs::create_dir_all(&state).expect("the retry state directory is creatable");
     let gate_log = state.join("gate-runs.log");
     let gate = logging_gate(&gate_log, "exit 0");
-    let tickets = tickets_with_gate(&gate);
+    let mut tickets = tickets_with_gate(&gate);
+    // Production ticket work trims the originating id before it reaches a
+    // trajectory; the padded fixture proves the persisted identity is trimmed.
+    tickets.tickets[0].id = "  1-verify-command-output  ".to_string();
     let replies = vec![
         common::CodeReply::ToolCall {
             narration: None,
@@ -920,6 +923,20 @@ fn when_hybrid_code_attempt_ends_given_retryable_turn_end_then_escalates_once_an
     // the retry's tool-free Responses API turn decoded as an ordinary turn end
     // through the explicit empty assistant message, not as malformed output.
     let first_trajectory = trajectory(&dir, "code.traj.json");
+    assert_eq!(
+        first_trajectory["ticket_id"],
+        serde_json::json!("1-verify-command-output"),
+        "the first attempt persists the trimmed ticket id"
+    );
+    assert!(
+        first_trajectory["ticket_id"].is_string(),
+        "the ticket id is a JSON string: {first_trajectory}"
+    );
+    assert_eq!(
+        first_trajectory["attempt"],
+        serde_json::json!(1),
+        "the first attempt persists attempt 1 as a JSON number"
+    );
     assert_eq!(first_trajectory["role"], serde_json::json!("mid"));
     assert_eq!(
         first_trajectory["model"],
@@ -939,6 +956,15 @@ fn when_hybrid_code_attempt_ends_given_retryable_turn_end_then_escalates_once_an
         "the first attempt must have run a real tool: {first_trajectory}"
     );
     let retry_trajectory = trajectory(&dir, "code-1.traj.json");
+    assert_eq!(
+        retry_trajectory["ticket_id"], first_trajectory["ticket_id"],
+        "both attempts of one ticket persist the same trimmed ticket id"
+    );
+    assert_eq!(
+        retry_trajectory["attempt"],
+        serde_json::json!(2),
+        "the handover retry persists attempt 2 as a JSON number"
+    );
     assert_eq!(retry_trajectory["role"], serde_json::json!("giga"));
     assert_eq!(
         retry_trajectory["model"],

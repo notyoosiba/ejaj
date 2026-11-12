@@ -13,7 +13,7 @@ use crate::tools::{Phase, Source};
 
 use super::FailureKind;
 use super::InvocationContext;
-use super::agent::{self, Stop};
+use super::agent::{self, LoopTelemetry, Stop};
 
 /// Why one `run_ticket` returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +43,8 @@ pub struct Attempt {
     /// A bounded summary of the latest delivered tool-call/result pairs, when
     /// the attempt delivered any.
     pub tool_activity: Option<String>,
+    /// The invocation's accumulated telemetry.
+    pub telemetry: LoopTelemetry,
 }
 
 impl Attempt {
@@ -52,6 +54,7 @@ impl Attempt {
             outcome,
             narration: None,
             tool_activity: None,
+            telemetry: LoopTelemetry::default(),
         }
     }
 }
@@ -169,6 +172,7 @@ impl Session {
             outcome,
             narration: run.narration,
             tool_activity: run.tool_activity,
+            telemetry: run.telemetry,
         }
     }
 }

@@ -16,6 +16,7 @@ use crate::review::ReviewReport;
 use crate::specification::Specification;
 use crate::status;
 use crate::tickets::TicketSet;
+use crate::timing::Clock;
 use crate::tools::{
     MAX_STEPS, Phase, STEP_WARN_REMAINING, Source, TOOL_OUTPUT_LIMIT_BYTES, Tool, ToolContext,
 };
@@ -147,6 +148,142 @@ pub enum Stop {
 /// trajectories (`<phase>.traj.json`) are persisted.
 const TRAJECTORY_DIRECTORY: &str = "trajectories";
 
+/// The counters one agent-loop invocation accumulates.
+///
+/// Every numeric field starts at zero and only ever grows: the loop adds one
+/// contribution at a time and the queue merges finished attempts, so both
+/// addition and conversion are saturating. The token usage is the canonical
+/// provider-reported type, and the one boolean is sticky through a merge so an
+/// invocation that aborted on a repeated turn can never be mistaken for one
+/// that did not.
+///
+/// Serialization always writes the complete object, but deserialization
+/// tolerates a payload that omits fields: a trajectory written before a counter
+/// existed still decodes, with every absent field supplied by `Default`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LoopTelemetry {
+    /// Wall time spent inside the loop body, floored to whole milliseconds.
+    pub elapsed_ms: u64,
+    /// Every actual call to the configured provider transport, retries included.
+    pub provider_send_attempts: u64,
+    /// Retries the existing retry policy actually scheduled.
+    pub transient_retries: u64,
+    /// Sum of every scheduled retry delay, floored to whole milliseconds.
+    pub retry_backoff_ms: u64,
+    /// The largest provider-prepared context among requests actually sent.
+    pub peak_context_bytes: usize,
+    /// Recognized provider-reported usage from successfully decoded responses.
+    pub token_usage: crate::api::TokenUsage,
+    /// Tier 1 compactions performed for this invocation.
+    pub tier1_compactions: u64,
+    /// Handover summaries accepted for this invocation.
+    pub tier2_summaries_accepted: u64,
+    /// Handover summary requests that failed validation or transport.
+    pub tier2_summary_failures: u64,
+    /// Overflow compactions that recovered the invocation.
+    pub overflow_compaction_recoveries: u64,
+    /// Truncation recoveries appended to the transcript.
+    pub truncation_recoveries: u64,
+    /// Repeated-tool-call warnings emitted.
+    pub repeated_tool_warnings: u64,
+    /// Repeated-tool-call aborts emitted.
+    pub repeated_tool_aborts: u64,
+    /// Whether the loop stopped on a repeated-turn abort.
+    pub repeated_turn_aborted: bool,
+    /// Step-budget warnings emitted.
+    pub step_budget_warnings: u64,
+    /// Plan turns suspended so the user could answer.
+    pub plan_turns_suspended_for_user_answers: u64,
+    /// Bash tool calls dispatched.
+    pub bash_calls: u64,
+    /// Bash calls that failed.
+    pub bash_failures: u64,
+    /// Bash calls that timed out.
+    pub bash_timeouts: u64,
+    /// Bash results whose full output spilled to a file.
+    pub bash_output_spills: u64,
+    /// Execute-script tool calls dispatched.
+    pub execute_script_calls: u64,
+    /// Execute-script calls that failed.
+    pub execute_script_failures: u64,
+    /// Execute-script calls that timed out.
+    pub execute_script_timeouts: u64,
+    /// Control-tool calls the parser rejected.
+    pub rejected_control_tool_calls: u64,
+    /// Other tool calls the parser rejected.
+    pub rejected_other_tool_calls: u64,
+}
+
+impl LoopTelemetry {
+    /// Add another invocation's telemetry into this one.
+    ///
+    /// Every counter and every token-usage field saturates at its own ceiling,
+    /// the peak keeps the larger context size, and the abort flag is the OR of
+    /// both sides. Counters never borrow from or wrap into one another.
+    pub fn merge(&mut self, other: LoopTelemetry) -> () {
+        self.elapsed_ms = self.elapsed_ms.saturating_add(other.elapsed_ms);
+        self.provider_send_attempts = self
+            .provider_send_attempts
+            .saturating_add(other.provider_send_attempts);
+        self.transient_retries = self
+            .transient_retries
+            .saturating_add(other.transient_retries);
+        self.retry_backoff_ms = self.retry_backoff_ms.saturating_add(other.retry_backoff_ms);
+        self.peak_context_bytes = self.peak_context_bytes.max(other.peak_context_bytes);
+        self.token_usage = self.token_usage.saturating_add(other.token_usage);
+        self.tier1_compactions = self
+            .tier1_compactions
+            .saturating_add(other.tier1_compactions);
+        self.tier2_summaries_accepted = self
+            .tier2_summaries_accepted
+            .saturating_add(other.tier2_summaries_accepted);
+        self.tier2_summary_failures = self
+            .tier2_summary_failures
+            .saturating_add(other.tier2_summary_failures);
+        self.overflow_compaction_recoveries = self
+            .overflow_compaction_recoveries
+            .saturating_add(other.overflow_compaction_recoveries);
+        self.truncation_recoveries = self
+            .truncation_recoveries
+            .saturating_add(other.truncation_recoveries);
+        self.repeated_tool_warnings = self
+            .repeated_tool_warnings
+            .saturating_add(other.repeated_tool_warnings);
+        self.repeated_tool_aborts = self
+            .repeated_tool_aborts
+            .saturating_add(other.repeated_tool_aborts);
+        self.repeated_turn_aborted = self.repeated_turn_aborted || other.repeated_turn_aborted;
+        self.step_budget_warnings = self
+            .step_budget_warnings
+            .saturating_add(other.step_budget_warnings);
+        self.plan_turns_suspended_for_user_answers = self
+            .plan_turns_suspended_for_user_answers
+            .saturating_add(other.plan_turns_suspended_for_user_answers);
+        self.bash_calls = self.bash_calls.saturating_add(other.bash_calls);
+        self.bash_failures = self.bash_failures.saturating_add(other.bash_failures);
+        self.bash_timeouts = self.bash_timeouts.saturating_add(other.bash_timeouts);
+        self.bash_output_spills = self
+            .bash_output_spills
+            .saturating_add(other.bash_output_spills);
+        self.execute_script_calls = self
+            .execute_script_calls
+            .saturating_add(other.execute_script_calls);
+        self.execute_script_failures = self
+            .execute_script_failures
+            .saturating_add(other.execute_script_failures);
+        self.execute_script_timeouts = self
+            .execute_script_timeouts
+            .saturating_add(other.execute_script_timeouts);
+        self.rejected_control_tool_calls = self
+            .rejected_control_tool_calls
+            .saturating_add(other.rejected_control_tool_calls);
+        self.rejected_other_tool_calls = self
+            .rejected_other_tool_calls
+            .saturating_add(other.rejected_other_tool_calls);
+    }
+}
+
 /// Serializable snapshot of one agent-loop invocation's final transcript and
 /// exit metadata.
 #[derive(serde::Serialize)]
@@ -154,9 +291,14 @@ struct TrajectorySnapshot<'a> {
     phase: &'static str,
     role: &'static str,
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ticket_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<u32>,
     steps_taken: usize,
     exit_status: &'static str,
     messages: &'a [Message],
+    telemetry: &'a LoopTelemetry,
 }
 
 impl Stop {
@@ -261,6 +403,11 @@ pub(crate) struct InvocationContext<'a> {
     pub root: Option<&'a Path>,
     /// The session directory of this invocation, when one was supplied.
     pub session_dir: Option<&'a Path>,
+    /// The trimmed id of the ticket this invocation works, when it works one.
+    pub ticket_id: Option<&'a str>,
+    /// The per-ticket attempt number: 1 for the first attempt, 2 for the one
+    /// retry handover. Absent for non-ticket invocations.
+    pub attempt: Option<u32>,
 }
 
 impl<'a> InvocationContext<'a> {
@@ -270,7 +417,21 @@ impl<'a> InvocationContext<'a> {
         InvocationContext {
             root: Some(root),
             session_dir: Some(session_dir),
+            ticket_id: None,
+            attempt: None,
         }
+    }
+
+    /// The same root and session with the ticket identity set, so a saved
+    /// trajectory can be correlated with the production ticket attempt.
+    pub(crate) fn with_ticket_identity(
+        mut self,
+        ticket_id: &'a str,
+        attempt: u32,
+    ) -> InvocationContext<'a> {
+        self.ticket_id = Some(ticket_id);
+        self.attempt = Some(attempt);
+        self
     }
 }
 
@@ -321,6 +482,8 @@ fn run_agent_loop_in(
     contributions: Option<&mut crate::timing::QueueContributions>,
 ) -> Stop {
     let mut ignored_narration = None;
+    let mut telemetry = LoopTelemetry::default();
+    let clock = crate::timing::MonotonicClock::new();
     run_agent_loop_capturing(
         messages,
         config,
@@ -329,6 +492,8 @@ fn run_agent_loop_in(
         invocation,
         contributions,
         &mut ignored_narration,
+        &mut telemetry,
+        &clock,
     )
 }
 
@@ -344,6 +509,8 @@ pub(crate) struct AgentAttempt {
     /// A bounded summary of the latest delivered tool-call/result pairs, when
     /// the attempt delivered any.
     pub tool_activity: Option<String>,
+    /// The invocation's accumulated telemetry.
+    pub telemetry: LoopTelemetry,
 }
 
 /// Run one loop and keep the last assistant narration it saw.
@@ -379,6 +546,8 @@ pub(crate) fn run_agent_loop_attempt_in(
     contributions: Option<&mut crate::timing::QueueContributions>,
 ) -> AgentAttempt {
     let mut narration = None;
+    let mut telemetry = LoopTelemetry::default();
+    let clock = crate::timing::MonotonicClock::new();
     let stop = run_agent_loop_capturing(
         messages,
         config,
@@ -387,12 +556,15 @@ pub(crate) fn run_agent_loop_attempt_in(
         invocation,
         contributions,
         &mut narration,
+        &mut telemetry,
+        &clock,
     );
     let tool_activity = summarize_tool_activity(messages);
     AgentAttempt {
         stop,
         narration,
         tool_activity,
+        telemetry,
     }
 }
 
@@ -429,6 +601,7 @@ fn send_turn_with_retry(
     report: &TurnReport<'_>,
     status: &mut status::Status,
     mut contributions: Option<&mut crate::timing::QueueContributions>,
+    telemetry: &mut LoopTelemetry,
 ) -> Result<Message, CallError> {
     let mut attempt = 1;
     loop {
@@ -438,6 +611,8 @@ fn send_turn_with_retry(
             prepared.context_bytes,
             report.input_price,
         ));
+        telemetry.provider_send_attempts = telemetry.provider_send_attempts.saturating_add(1);
+        telemetry.peak_context_bytes = telemetry.peak_context_bytes.max(prepared.context_bytes);
         // One attempt is exactly the send and the provider's decode. The
         // measured interval ends before the retry decision, so the warning and
         // backoff that follow are never part of the attempt.
@@ -462,10 +637,19 @@ fn send_turn_with_retry(
             elapsed,
         );
         match result {
-            Ok(message) => return Ok(message),
+            Ok(message) => {
+                if let Some(usage) = message.usage {
+                    telemetry.token_usage = telemetry.token_usage.saturating_add(usage);
+                }
+                return Ok(message);
+            }
             Err(error) => match retry::should_retry(&error, attempt) {
                 Some(delay) => {
                     status.clear();
+                    telemetry.transient_retries = telemetry.transient_retries.saturating_add(1);
+                    telemetry.retry_backoff_ms = telemetry
+                        .retry_backoff_ms
+                        .saturating_add(floor_duration_millis(delay));
                     // A retry warning is a stderr diagnostic: one
                     // status::OutputKind::Log message, framed by the
                     // coordinator, on the same stream it always used.
@@ -514,6 +698,7 @@ struct CallRunner<'a, 'b> {
     invocation: InvocationContext<'a>,
     status: &'b mut status::Status,
     contributions: Option<&'b mut crate::timing::QueueContributions>,
+    telemetry: &'b mut LoopTelemetry,
     bash_calls: usize,
 }
 
@@ -668,11 +853,16 @@ impl CallRunner<'_, '_> {
         // handoff carry no duration.
         let context = if matches!(&tool, Tool::Bash(_)) {
             self.bash_calls += 1;
+            self.telemetry.bash_calls = self.telemetry.bash_calls.saturating_add(1);
             ToolContext {
                 step: self.step,
                 call_index: self.bash_calls,
             }
         } else {
+            if matches!(&tool, Tool::ExecuteScript(_)) {
+                self.telemetry.execute_script_calls =
+                    self.telemetry.execute_script_calls.saturating_add(1);
+            }
             ToolContext {
                 step: self.step,
                 call_index: 1,
@@ -693,6 +883,7 @@ impl CallRunner<'_, '_> {
         if let (Some(contributions), Some(elapsed)) = (self.contributions.as_deref_mut(), elapsed) {
             contributions.record_executed_tool(elapsed);
         }
+        self.record_command_outcome(&tool, &result);
         if let Err(error) = &result {
             let _ = status::shared().stderr_log(&format!(
                 "[WARN] {} failed: {}",
@@ -704,6 +895,44 @@ impl CallRunner<'_, '_> {
             display,
             result,
             elapsed,
+        }
+    }
+
+    /// Classify one dispatched command's returned result. A Bash or
+    /// execute-script call was already counted at dispatch; a returned error is
+    /// a failure, and the existing timeout text is also a timeout on top of
+    /// that failure. A Bash result carrying the spill footer is a spill whether
+    /// the command succeeded or failed.
+    fn record_command_outcome(&mut self, tool: &Tool, result: &Result<String, String>) {
+        match tool {
+            Tool::Bash(_) => {
+                if let Err(error) = result {
+                    self.telemetry.bash_failures = self.telemetry.bash_failures.saturating_add(1);
+                    if error.contains(BASH_TIMEOUT_MARKER) {
+                        self.telemetry.bash_timeouts =
+                            self.telemetry.bash_timeouts.saturating_add(1);
+                    }
+                }
+                let text = match result {
+                    Ok(text) => text.as_str(),
+                    Err(error) => error.as_str(),
+                };
+                if text.contains(SPILL_FOOTER_PREFIX) {
+                    self.telemetry.bash_output_spills =
+                        self.telemetry.bash_output_spills.saturating_add(1);
+                }
+            }
+            Tool::ExecuteScript(_) => {
+                if let Err(error) = result {
+                    self.telemetry.execute_script_failures =
+                        self.telemetry.execute_script_failures.saturating_add(1);
+                    if error.contains(SCRIPT_TIMEOUT_MARKER) {
+                        self.telemetry.execute_script_timeouts =
+                            self.telemetry.execute_script_timeouts.saturating_add(1);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -727,6 +956,13 @@ impl CallRunner<'_, '_> {
             "[WARN] {} rejected: {}",
             call.function.name, reason
         ));
+        if is_control_tool_name(&call.function.name) {
+            self.telemetry.rejected_control_tool_calls =
+                self.telemetry.rejected_control_tool_calls.saturating_add(1);
+        } else {
+            self.telemetry.rejected_other_tool_calls =
+                self.telemetry.rejected_other_tool_calls.saturating_add(1);
+        }
         // The function name is the display of a call that never ran, and it
         // carries no duration.
         (call.function.name.clone(), Err(error), None)
@@ -753,9 +989,29 @@ impl CallRunner<'_, '_> {
         let _ = status::shared().tool_call(&line);
 
         let text = result.unwrap_or_else(|error| error);
+        if step_warning_applies(self.step) {
+            self.telemetry.step_budget_warnings =
+                self.telemetry.step_budget_warnings.saturating_add(1);
+        }
         let capped = with_step_warning(cap_tool_result(text), self.step);
         messages.push(Message::tool(&call.id, capped));
     }
+}
+
+/// Whether one parsed tool name is one of the six control tools. A parse
+/// rejection of any of these is a control rejection; every other rejected name
+/// is an ordinary tool rejection. The classification is by name because the
+/// payload may be exactly what failed to parse.
+fn is_control_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "finish_plan"
+            | "finish_spec"
+            | "finish_tickets"
+            | "finish_triage"
+            | "finish_review"
+            | "task_complete"
+    )
 }
 
 /// The loop body shared by every caller. The caller supplies the slot that
@@ -768,7 +1024,10 @@ fn run_agent_loop_capturing(
     invocation: InvocationContext<'_>,
     contributions: Option<&mut crate::timing::QueueContributions>,
     last_narration: &mut Option<String>,
+    telemetry: &mut LoopTelemetry,
+    clock: &dyn Clock,
 ) -> Stop {
+    let started = clock.now();
     let (stop, steps_taken) = run_agent_loop_inner(
         messages,
         config,
@@ -777,8 +1036,18 @@ fn run_agent_loop_capturing(
         invocation,
         contributions,
         last_narration,
+        telemetry,
     );
-    if let Err(error) = save_trajectory(invocation, config, phase, steps_taken, &stop, messages) {
+    telemetry.elapsed_ms = floor_duration_millis(clock.now().saturating_sub(started));
+    if let Err(error) = save_trajectory(
+        invocation,
+        config,
+        phase,
+        steps_taken,
+        &stop,
+        messages,
+        telemetry,
+    ) {
         let _ =
             status::shared().stderr_log(&format!("[WARN] could not persist trajectory: {error}"));
     }
@@ -793,6 +1062,7 @@ fn run_agent_loop_inner(
     invocation: InvocationContext<'_>,
     mut contributions: Option<&mut crate::timing::QueueContributions>,
     last_narration: &mut Option<String>,
+    telemetry: &mut LoopTelemetry,
 ) -> (Stop, usize) {
     // Drawn before every blocking operation below and erased before every
     // write; Drop covers the error returns and the final break. The size shown
@@ -815,10 +1085,11 @@ fn run_agent_loop_inner(
         // ceiling before any send. The check recurs every turn, so a transcript
         // that grows past a watermark later is handled again rather than only
         // once.
-        let mut prepared = match prepare_for_send(messages, config, phase, provider.as_ref()) {
-            Ok(prepared) => prepared,
-            Err(detail) => return (context_guard_stop(&detail), step_idx),
-        };
+        let mut prepared =
+            match prepare_for_send(messages, config, phase, provider.as_ref(), telemetry) {
+                Ok(prepared) => prepared,
+                Err(detail) => return (context_guard_stop(&detail), step_idx),
+            };
         // The role, model, input rate and canonical phase label named on every
         // report and status line for this turn. Config resolves all of them
         // from the same mode-and-phase split that picked provider, so none can
@@ -847,12 +1118,21 @@ fn run_agent_loop_inner(
             &report,
             &mut status,
             contributions.as_deref_mut(),
+            telemetry,
         ) {
             Ok(assistant) => assistant,
             Err(error) if is_context_overflow_error(&error) => {
-                match force_compact_on_overflow(messages, config, phase, provider.as_ref(), &error)
-                {
+                match force_compact_on_overflow(
+                    messages,
+                    config,
+                    phase,
+                    provider.as_ref(),
+                    &error,
+                    telemetry,
+                ) {
                     Ok(Some(compacted_prepared)) => {
+                        telemetry.overflow_compaction_recoveries =
+                            telemetry.overflow_compaction_recoveries.saturating_add(1);
                         let _ = status::shared().stderr_log(&format!(
                             "[WARN] turn failed with context overflow ({error}); compacted history and retrying once."
                         ));
@@ -865,6 +1145,7 @@ fn run_agent_loop_inner(
                             &report,
                             &mut status,
                             contributions.as_deref_mut(),
+                            telemetry,
                         ) {
                             Ok(assistant) => assistant,
                             Err(retry_error) => {
@@ -930,6 +1211,8 @@ fn run_agent_loop_inner(
         if abort_repeated_turn {
             // The response is already received, but none of its calls may run:
             // no result is appended and no further request is sent.
+            telemetry.repeated_tool_aborts = telemetry.repeated_tool_aborts.saturating_add(1);
+            telemetry.repeated_turn_aborted = true;
             let _ = status::shared().stderr_log(REPEATED_TOOL_CALL_ABORT_WARNING);
             return (Stop::Failed(FailureKind::StepLimit), step);
         }
@@ -950,6 +1233,7 @@ fn run_agent_loop_inner(
                 && consecutive_recoveries < MAX_TRUNCATION_RECOVERIES
             {
                 messages.push(Message::user(TRUNCATION_RECOVERY_INSTRUCTION));
+                telemetry.truncation_recoveries = telemetry.truncation_recoveries.saturating_add(1);
                 consecutive_recoveries += 1;
                 continue;
             }
@@ -960,6 +1244,11 @@ fn run_agent_loop_inner(
             if phase == Phase::Summary {
                 let answer = messages[assistant_index].content.clone();
                 return (Stop::Summary(answer), step);
+            }
+            if waiting {
+                telemetry.plan_turns_suspended_for_user_answers = telemetry
+                    .plan_turns_suspended_for_user_answers
+                    .saturating_add(1);
             }
             return (Stop::TurnEnd, step);
         }
@@ -975,6 +1264,7 @@ fn run_agent_loop_inner(
             invocation,
             status: &mut status,
             contributions: contributions.as_deref_mut(),
+            telemetry: &mut *telemetry,
             bash_calls: 0,
         };
         let outcome = runner.run(messages, assistant_index, &tool_calls, waiting);
@@ -982,6 +1272,7 @@ fn run_agent_loop_inner(
             // The calls have now delivered their results; point the model at the
             // repetition. A turn that delivered no result still gets the warning,
             // it simply has nothing to annotate.
+            telemetry.repeated_tool_warnings = telemetry.repeated_tool_warnings.saturating_add(1);
             let _ = status::shared().stderr_log(REPEATED_TOOL_CALL_WARNING);
             annotate_last_tool_result(messages, assistant_index, &tool_turn_signature(&tool_calls));
         }
@@ -993,12 +1284,21 @@ fn run_agent_loop_inner(
             // The reply asked the user something, so the turn belongs to the
             // user: return to the plan prompt and let the answer come back as
             // the next user message.
+            telemetry.plan_turns_suspended_for_user_answers = telemetry
+                .plan_turns_suspended_for_user_answers
+                .saturating_add(1);
             return (Stop::TurnEnd, step);
         }
     }
 
     let _ = status::shared().stderr_log("[WARN] step limit reached; the task may be incomplete");
     (Stop::Failed(FailureKind::StepLimit), MAX_STEPS)
+}
+
+/// Floor a monotonic duration to whole milliseconds and convert it without
+/// ever wrapping. A duration larger than the u64 millisecond range saturates.
+fn floor_duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Persist the conversation trajectory to `<session-dir>/trajectories/<phase>.traj.json`
@@ -1010,6 +1310,7 @@ fn save_trajectory(
     steps_taken: usize,
     stop: &Stop,
     messages: &[Message],
+    telemetry: &LoopTelemetry,
 ) -> Result<(), String> {
     if phase == Phase::Plan && !matches!(stop, Stop::Handoff(_)) {
         return Ok(());
@@ -1034,9 +1335,12 @@ fn save_trajectory(
         phase: phase.label(),
         role: config.provider_role(phase),
         model: config.provider_model(phase),
+        ticket_id: invocation.ticket_id,
+        attempt: invocation.attempt,
         steps_taken,
         exit_status: stop.exit_status_label(),
         messages,
+        telemetry,
     };
     let encoded = serde_json::to_vec_pretty(&snapshot)
         .map_err(|e| format!("could not serialize trajectory JSON: {e}"))?;
@@ -1189,6 +1493,13 @@ const TOOL_ACTIVITY_TRAIL_BYTES: usize = 1_500;
 
 /// The prefix of the line a spilled Bash digest appends after its output.
 const SPILL_FOOTER_PREFIX: &str = "[full output saved to";
+
+/// The returned-error text that classifies a Bash result as a timeout.
+const BASH_TIMEOUT_MARKER: &str = "command timed out after";
+
+/// The returned-error text that classifies an execute-script result as a
+/// sandbox timeout.
+const SCRIPT_TIMEOUT_MARKER: &str = "wall-clock deadline";
 
 /// The prefix of the loop's step-budget warning line.
 const STEP_WARNING_PREFIX: &str = "[WARN: step ";
@@ -1438,14 +1749,21 @@ fn first_error_line(error: &str) -> &str {
     line.strip_prefix("[ERROR] ").unwrap_or(line)
 }
 
+/// Whether one step's delivered tool result receives the existing step-budget
+/// warning. The same predicate drives the delivered text and the counter, so
+/// they cannot disagree at the boundary.
+fn step_warning_applies(step: usize) -> bool {
+    MAX_STEPS.saturating_sub(step) <= STEP_WARN_REMAINING
+}
+
 /// Append a step-budget warning when `STEP_WARN_REMAINING` or fewer steps
 /// remain, cutting the body first so the delivered result -- warning included --
 /// never exceeds the cap and the whole warning survives at the tail.
 fn with_step_warning(text: String, step: usize) -> String {
-    let remaining = MAX_STEPS.saturating_sub(step);
-    if remaining > STEP_WARN_REMAINING {
+    if !step_warning_applies(step) {
         return text;
     }
+    let remaining = MAX_STEPS.saturating_sub(step);
 
     let warning = format!(
         "[WARN: step {step}/{MAX_STEPS}; {remaining} steps remaining before the step limit]"
@@ -1657,6 +1975,7 @@ fn prepare_for_send(
     config: &Config,
     phase: Phase,
     provider: &dyn crate::llm::LlmProvider,
+    telemetry: &mut LoopTelemetry,
 ) -> Result<crate::llm::Prepared, String> {
     // Pairing is a precondition for every provider request, not just for
     // compaction: an invalid history must never leave the process.
@@ -1678,6 +1997,7 @@ fn prepare_for_send(
         prefix_end,
         tail_start,
     } = compact_history(messages)?;
+    telemetry.tier1_compactions = telemetry.tier1_compactions.saturating_add(1);
     *messages = compacted;
 
     let mut prepared = provider.prepare(messages, phase);
@@ -1688,7 +2008,7 @@ fn prepare_for_send(
     }
 
     if prepared.context_bytes > TIER_TWO_CONTEXT_BYTES {
-        let summary = request_handover_summary(messages, config, phase, provider)?;
+        let summary = request_handover_summary(messages, config, phase, provider, telemetry)?;
         *messages = replacement_history(messages, prefix_end, tail_start, summary)?;
 
         prepared = provider.prepare(messages, phase);
@@ -1940,6 +2260,30 @@ fn request_handover_summary(
     config: &Config,
     phase: Phase,
     provider: &dyn crate::llm::LlmProvider,
+    telemetry: &mut LoopTelemetry,
+) -> Result<Message, String> {
+    let result = request_handover_summary_checked(compacted, config, phase, provider, telemetry);
+    match &result {
+        Ok(_) => {
+            telemetry.tier2_summaries_accepted =
+                telemetry.tier2_summaries_accepted.saturating_add(1);
+        }
+        Err(_) => {
+            telemetry.tier2_summary_failures = telemetry.tier2_summary_failures.saturating_add(1);
+        }
+    }
+    result
+}
+
+/// Send and validate one required handover summary, leaving the accounting to
+/// its caller so an accepted summary is counted exactly once before any later
+/// replacement or size guard runs.
+fn request_handover_summary_checked(
+    compacted: &[Message],
+    config: &Config,
+    phase: Phase,
+    provider: &dyn crate::llm::LlmProvider,
+    telemetry: &mut LoopTelemetry,
 ) -> Result<Message, String> {
     let mut summary_messages = compacted.to_vec();
     summary_messages.push(Message::user(HANDOVER_SUMMARY_INSTRUCTION));
@@ -1953,7 +2297,7 @@ fn request_handover_summary(
         ));
     }
 
-    let message = send_summary_with_retry(config, provider, &prepared.outgoing)?;
+    let message = send_summary_with_retry(config, provider, &prepared, telemetry)?;
 
     if message
         .tool_calls
@@ -2026,11 +2370,14 @@ fn is_context_overflow_error(error: &CallError) -> bool {
 fn send_summary_with_retry(
     config: &Config,
     provider: &dyn crate::llm::LlmProvider,
-    outgoing: &crate::api::Outgoing,
+    prepared: &crate::llm::Prepared,
+    telemetry: &mut LoopTelemetry,
 ) -> Result<Message, String> {
     let mut attempt = 1;
     loop {
-        let result = match config.send(outgoing) {
+        telemetry.provider_send_attempts = telemetry.provider_send_attempts.saturating_add(1);
+        telemetry.peak_context_bytes = telemetry.peak_context_bytes.max(prepared.context_bytes);
+        let result = match config.send(&prepared.outgoing) {
             Ok(raw) => {
                 let status = raw.status;
                 match provider.decode(raw) {
@@ -2046,9 +2393,18 @@ fn send_summary_with_retry(
             Err(error) => Err((false, error)),
         };
         match result {
-            Ok(message) => return Ok(message),
+            Ok(message) => {
+                if let Some(usage) = message.usage {
+                    telemetry.token_usage = telemetry.token_usage.saturating_add(usage);
+                }
+                return Ok(message);
+            }
             Err((from_decode, error)) => match retry::should_retry(&error, attempt) {
                 Some(delay) => {
+                    telemetry.transient_retries = telemetry.transient_retries.saturating_add(1);
+                    telemetry.retry_backoff_ms = telemetry
+                        .retry_backoff_ms
+                        .saturating_add(floor_duration_millis(delay));
                     let _ = status::shared().stderr_log(&format!(
                         "[WARN] handover summary attempt {attempt}/{} failed: {error}; retrying.",
                         retry::MAX_ATTEMPTS
@@ -2080,6 +2436,7 @@ fn force_compact_on_overflow(
     phase: Phase,
     provider: &dyn crate::llm::LlmProvider,
     error: &CallError,
+    telemetry: &mut LoopTelemetry,
 ) -> Result<Option<crate::llm::Prepared>, String> {
     let before_bytes = provider.prepare(messages, phase).context_bytes;
     let CompactedHistory {
@@ -2112,7 +2469,7 @@ fn force_compact_on_overflow(
         if tail_start <= prefix_end {
             return Ok(None);
         }
-        let summary = request_handover_summary(&compacted, config, phase, provider)?;
+        let summary = request_handover_summary(&compacted, config, phase, provider, telemetry)?;
         let replaced = replacement_history(&compacted, prefix_end, tail_start, summary)?;
         let prepared = provider.prepare(&replaced, phase);
         if prepared.context_bytes > TIER_TWO_CONTEXT_BYTES {
@@ -2673,6 +3030,24 @@ mod tests {
             target,
             "the fixture must land exactly on the requested post-Tier-1 context"
         );
+        messages
+    }
+
+    /// A history that needs Tier 1 and then a handover summary, but whose six
+    /// retained tool steps are each too large for the post-summary replacement
+    /// to fall back under Tier 2. The accepted summary therefore cannot save
+    /// the request, which exercises a failure after acceptance.
+    fn history_with_oversized_retained_tail() -> Vec<Message> {
+        let mut messages = vec![
+            Message::system("SYSTEM PROMPT: keep this byte-for-byte."),
+            Message::user("KICKOFF: start the work."),
+        ];
+        for index in 1..=2 {
+            messages.extend(compaction_step(index, "o".repeat(150 * 1024)));
+        }
+        for index in 3..=8 {
+            messages.extend(compaction_step(index, "t".repeat(50 * 1024)));
+        }
         messages
     }
 
@@ -3846,7 +4221,7 @@ mod tests {
     /// and is recognised by its prefix so a later compaction never replaces it
     /// again and loses the original count.
     #[test]
-    fn when_older_tool_results_are_compacted_then_stub_names_function_target_and_omitted_bytes() {
+    fn when_preserving_compacted_history_given_older_tool_results_then_retains_bounded_context() {
         use crate::api::FunctionCall;
 
         let call = ToolCall {
@@ -7484,8 +7859,13 @@ mod tests {
 
         let provider = config.provider(Phase::Code);
         let mut probed = messages.clone();
-        let Err(detail) = prepare_for_send(&mut probed, &config, Phase::Code, provider.as_ref())
-        else {
+        let Err(detail) = prepare_for_send(
+            &mut probed,
+            &config,
+            Phase::Code,
+            provider.as_ref(),
+            &mut LoopTelemetry::default(),
+        ) else {
             panic!("a duplicate call id must be refused before preparation");
         };
         assert!(
@@ -7819,6 +8199,7 @@ mod tests {
             &config,
             Phase::Code,
             provider.as_ref(),
+            &mut LoopTelemetry::default(),
         )
         .expect("exactly four MiB is permitted");
         assert_eq!(
@@ -8029,6 +8410,137 @@ mod tests {
     /// Core entry-point behavior and the minimum valid boundary: one truncated
     /// tool-free reply earns exactly one recovery prompt, appended after the
     /// partial assistant turn, with the earlier transcript preserved.
+    /// Edge-case table and maximum boundary: zero, one and two consecutive
+    /// truncated tool-free replies earn exactly that many recovery prompts, and
+    /// a third is accepted as the turn's end. At the final available step the
+    /// policy still stops at the step limit after appending only one prompt.
+    #[test]
+    fn when_recovering_truncated_replies_given_consecutive_tool_free_truncations_then_counts_at_most_two_prompts()
+     {
+        let script = Script::new(vec![reply(Some("done"), &[])]);
+        let complete_config = config(script.clone());
+        let mut messages = plan_transcript();
+        let complete = run_agent_loop_attempt_in(
+            &mut messages,
+            &complete_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+        assert!(matches!(complete.stop, Stop::TurnEnd));
+        assert_eq!(script.requests(), 1);
+        assert_eq!(
+            complete.telemetry.truncation_recoveries, 0,
+            "a complete reply appends no recovery prompt"
+        );
+
+        let script = Script::new(vec![
+            truncated_reply(Some("partial one"), &[]),
+            reply(Some("done"), &[]),
+        ]);
+        let one_config = config(script.clone());
+        let mut messages = plan_transcript();
+        let one = run_agent_loop_attempt_in(
+            &mut messages,
+            &one_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+        assert!(matches!(one.stop, Stop::TurnEnd));
+        assert_eq!(
+            script.requests(),
+            2,
+            "one prompt earns one recovery request"
+        );
+        assert_eq!(one.telemetry.truncation_recoveries, 1);
+
+        let script = Script::new(vec![
+            truncated_reply(Some("partial one"), &[]),
+            truncated_reply(Some("partial two"), &[]),
+            reply(Some("done"), &[]),
+        ]);
+        let two_config = config(script.clone());
+        let mut messages = plan_transcript();
+        let two = run_agent_loop_attempt_in(
+            &mut messages,
+            &two_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+        assert!(matches!(two.stop, Stop::TurnEnd));
+        assert_eq!(
+            script.requests(),
+            3,
+            "two prompts earn two recovery requests before the complete reply"
+        );
+        assert_eq!(two.telemetry.truncation_recoveries, 2);
+
+        let script = Script::new(vec![
+            truncated_reply(Some("partial one"), &[]),
+            truncated_reply(Some("partial two"), &[]),
+            truncated_reply(Some("partial three"), &[]),
+        ]);
+        let exhausted_config = config(script.clone());
+        let mut messages = plan_transcript();
+        let exhausted = run_agent_loop_attempt_in(
+            &mut messages,
+            &exhausted_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+        assert!(matches!(exhausted.stop, Stop::TurnEnd));
+        assert_eq!(
+            script.requests(),
+            3,
+            "the third truncated reply is accepted without a fourth request"
+        );
+        assert_eq!(
+            exhausted.telemetry.truncation_recoveries, 2,
+            "no more than two prompts are appended"
+        );
+
+        let mut bodies = Vec::new();
+        for index in 0..MAX_STEPS - 1 {
+            let mut body: serde_json::Value = serde_json::from_str(&reply(
+                Some("working"),
+                &[("no_such_tool", format!(r#"{{"step":{index}}}"#))],
+            ))
+            .expect("the scripted reply is JSON");
+            body["choices"][0]["message"]["tool_calls"][0]["id"] =
+                serde_json::json!(format!("call-{index}"));
+            bodies.push(body.to_string());
+        }
+        bodies.push(truncated_reply(Some("partial at the limit"), &[]));
+        let script = Script::new(bodies);
+        let limited_config = config(script.clone());
+        let mut messages = plan_transcript();
+        let limited = run_agent_loop_attempt_in(
+            &mut messages,
+            &limited_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+        assert!(matches!(limited.stop, Stop::Failed(FailureKind::StepLimit)));
+        assert_eq!(
+            script.requests(),
+            MAX_STEPS,
+            "no request is sent beyond the step budget"
+        );
+        assert_eq!(
+            limited.telemetry.truncation_recoveries, 1,
+            "the prompt appended at the final step is still one recovery"
+        );
+    }
+
     #[test]
     fn when_reply_is_truncated_given_no_tool_calls_then_requests_recovery_in_same_conversation() {
         const PARTIAL: &str = "I will inspect the build and";
@@ -8380,6 +8892,57 @@ mod tests {
         assert!(
             !content.contains(REPEATED_CALL_REDIRECT_HEADER),
             "this tool result must not carry a redirect: {content:?}"
+        );
+    }
+
+    /// Edge-case table and upper boundary: the third identical turn counts one
+    /// warning, the fifth-or-later turn counts one abort and sets the sticky
+    /// flag, and the aborted turn dispatches none of its calls.
+    #[test]
+    fn when_repeating_tool_turns_given_third_and_fifth_identical_calls_then_counts_warning_and_aborts_without_dispatch()
+     {
+        let arguments = r#"{"code":"return 'same';"}"#.to_string();
+        let mut bodies = Vec::new();
+        for turn in 0..5 {
+            bodies.push(reply_numbered(
+                turn * 10,
+                Some("working"),
+                &[("execute_script", arguments.clone())],
+            ));
+        }
+        let script = Script::new(bodies);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        let attempt = run_agent_loop_attempt_in(
+            &mut messages,
+            &settings,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+
+        assert!(matches!(attempt.stop, Stop::Failed(FailureKind::StepLimit)));
+        assert_eq!(
+            attempt.telemetry.repeated_tool_warnings, 1,
+            "only the third identical turn is a warning"
+        );
+        assert_eq!(
+            attempt.telemetry.repeated_tool_aborts, 1,
+            "the fifth turn is the one aborting turn"
+        );
+        assert!(
+            attempt.telemetry.repeated_turn_aborted,
+            "the abort flag records the repeated-turn stop"
+        );
+        assert_eq!(
+            attempt.telemetry.execute_script_calls, 4,
+            "the aborted fifth turn dispatches none of its calls"
+        );
+        assert!(
+            tool_result_for(&messages, "call-40").is_none(),
+            "the aborted turn appends no result"
         );
     }
 
@@ -8961,6 +9524,63 @@ mod tests {
         }
     }
 
+    /// Minimum valid boundary: a provider overflow below the ordinary Tier 1
+    /// watermark is recovered by forced compaction, and the resent request is
+    /// counted as one overflow recovery rather than an ordinary Tier 1 pass.
+    #[test]
+    fn when_recovering_overflow_given_compaction_that_proceeds_to_resend_then_counts_one_recovery()
+    {
+        let script = Script::with_replies(vec![
+            Reply::Error(CallError::Api {
+                status: 400,
+                message: "context_length_exceeded: maximum context length is 32768 tokens"
+                    .to_string(),
+            }),
+            Reply::Body(reply(Some("done"), &[])),
+        ]);
+        let config = config(script.clone());
+        let mut messages = tier_one_history(8, 16 * 1024);
+        assert!(
+            context_bytes(&config, &messages, Phase::Code) <= TIER_ONE_CONTEXT_BYTES,
+            "ordinary preparation does not compact this history"
+        );
+
+        let attempt = run_agent_loop_attempt_in(
+            &mut messages,
+            &config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+
+        assert!(matches!(attempt.stop, Stop::TurnEnd));
+        assert_eq!(
+            script.requests(),
+            2,
+            "the overflowed turn is compacted and resent once"
+        );
+        assert_eq!(
+            attempt.telemetry.overflow_compaction_recoveries, 1,
+            "the prepared recovery request proceeded to resend"
+        );
+        assert_eq!(
+            attempt.telemetry.tier1_compactions, 0,
+            "overflow recovery is distinct from ordinary Tier 1 compaction"
+        );
+        assert_eq!(attempt.telemetry.tier2_summaries_accepted, 0);
+        assert_eq!(attempt.telemetry.tier2_summary_failures, 0);
+
+        let retried = recorded_messages(&script.sent()[1], "messages");
+        assert!(
+            retried.iter().any(|message| {
+                message.role == Role::Tool
+                    && message.content.as_deref().is_some_and(is_tool_result_stub)
+            }),
+            "the resent request carries the forced compaction: {retried:?}"
+        );
+    }
+
     #[test]
     fn when_sending_turn_given_http_400_context_length_exceeded_below_watermark_then_compacts_and_retries()
      {
@@ -9112,8 +9732,135 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Edge-case table at the empty boundary: the default context and the
+    /// root/session constructor both carry no ticket identity, so their saved
+    /// trajectory has neither identity key -- not even as a null value.
     #[test]
-    fn when_loop_finishes_given_no_session_dir_or_plan_turn_end_then_writes_no_trajectory_file() {
+    fn when_saving_ticket_attempts_given_context_without_identity_then_omits_both_identity_keys() {
+        let default_context = InvocationContext::default();
+        assert_eq!(default_context.ticket_id, None);
+        assert_eq!(default_context.attempt, None);
+
+        let root = std::env::temp_dir().join(format!(
+            "ejaj-traj-no-identity-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session_dir = root.join(".ejaj").join("no-identity");
+        let script = Script::new(vec![reply(Some("done"), &[])]);
+        let settings = config(script);
+        let mut messages = vec![Message::system("system prompt"), Message::user("ticket")];
+
+        let stop = run_agent_loop_with_context(
+            &mut messages,
+            &settings,
+            Phase::Code,
+            Source::None,
+            InvocationContext::new(&root, &session_dir),
+        );
+        assert!(matches!(stop, Stop::TurnEnd));
+
+        let path = session_dir.join("trajectories").join("code.traj.json");
+        let trajectory: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            trajectory.get("ticket_id").is_none(),
+            "an identity-less context must omit ticket_id entirely: {trajectory}"
+        );
+        assert!(
+            trajectory.get("attempt").is_none(),
+            "an identity-less context must omit attempt entirely: {trajectory}"
+        );
+        assert_ne!(trajectory.get("ticket_id"), Some(&serde_json::Value::Null));
+        assert_ne!(trajectory.get("attempt"), Some(&serde_json::Value::Null));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Minimum valid boundary: a context carrying ticket identity saves both
+    /// fields, a JSON string and a JSON number, alongside the existing fields.
+    #[test]
+    fn when_saving_ticket_attempts_given_trimmed_identity_then_serializes_both_identity_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "ejaj-traj-identity-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session_dir = root.join(".ejaj").join("with-identity");
+        let script = Script::new(vec![reply(Some("done"), &[])]);
+        let settings = config(script);
+        let mut messages = vec![Message::system("system prompt"), Message::user("ticket")];
+
+        let stop = run_agent_loop_with_context(
+            &mut messages,
+            &settings,
+            Phase::Code,
+            Source::None,
+            InvocationContext::new(&root, &session_dir).with_ticket_identity("1-trimmed-ticket", 2),
+        );
+        assert!(matches!(stop, Stop::TurnEnd));
+
+        let path = session_dir.join("trajectories").join("code.traj.json");
+        let trajectory: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            trajectory["ticket_id"],
+            serde_json::json!("1-trimmed-ticket")
+        );
+        assert!(trajectory["ticket_id"].is_string());
+        assert_eq!(trajectory["attempt"], serde_json::json!(2));
+        assert!(trajectory["attempt"].is_u64());
+        assert_eq!(trajectory["phase"], "code");
+        assert_eq!(trajectory["exit_status"], "turn_end");
+        assert!(trajectory["messages"].is_array());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Contract: the ticket identity builder sets both identity fields and
+    /// leaves the root and session values of whatever context it was given
+    /// intact -- including the empty context that has neither.
+    #[test]
+    fn when_setting_ticket_identity_given_root_and_session_context_then_preserves_context_values() {
+        let root = Path::new("/ejaj-identity-root");
+        let session_dir = Path::new("/ejaj-identity-root/.ejaj/20261108-190000");
+
+        let retry_attempt =
+            InvocationContext::new(root, session_dir).with_ticket_identity("7-honor-defaults", 2);
+
+        assert_eq!(retry_attempt.root, Some(root));
+        assert_eq!(retry_attempt.session_dir, Some(session_dir));
+        assert_eq!(retry_attempt.ticket_id, Some("7-honor-defaults"));
+        assert_eq!(retry_attempt.attempt, Some(2));
+
+        let first_attempt =
+            InvocationContext::new(root, session_dir).with_ticket_identity("7-honor-defaults", 1);
+
+        assert_eq!(first_attempt.root, Some(root));
+        assert_eq!(first_attempt.session_dir, Some(session_dir));
+        assert_eq!(first_attempt.ticket_id, Some("7-honor-defaults"));
+        assert_eq!(first_attempt.attempt, Some(1));
+
+        let context_free = InvocationContext::default().with_ticket_identity("9-sessionless", 3);
+
+        assert_eq!(context_free.root, None);
+        assert_eq!(context_free.session_dir, None);
+        assert_eq!(context_free.ticket_id, Some("9-sessionless"));
+        assert_eq!(context_free.attempt, Some(3));
+    }
+
+    /// Regression table over the existing skip conditions and the collision
+    /// naming: a plan stop that is not a handoff, an invocation with no session
+    /// directory, and a session path with no .ejaj/ ancestor each create no
+    /// trajectory file, while two saves into one real session stay numbered.
+    #[test]
+    fn when_saving_trajectories_given_existing_skip_conditions_then_creates_no_file() {
         let root = std::env::temp_dir().join(format!(
             "ejaj-traj-skip-test-{}-{}",
             std::process::id(),
@@ -9122,10 +9869,14 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        std::fs::create_dir_all(&root).unwrap();
         let ejaj_session = root.join(".ejaj").join("plan-turn-end");
         let non_ejaj_session = root.join("artifacts");
         let script = Script::new(vec![
             reply(Some("What scope should we use?"), &[]),
+            reply(Some("done"), &[]),
+            reply(Some("done"), &[]),
+            reply(Some("done"), &[]),
             reply(Some("done"), &[]),
         ]);
         let settings = config(script);
@@ -9156,6 +9907,41 @@ mod tests {
         assert!(
             !non_ejaj_session.join("trajectories").exists(),
             "a session directory outside .ejaj/ must not get trajectories/"
+        );
+
+        let mut sessionless_messages = vec![Message::system("code"), Message::user("work")];
+        let sessionless_stop = run_agent_loop_with_context(
+            &mut sessionless_messages,
+            &settings,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+        );
+        assert!(matches!(sessionless_stop, Stop::TurnEnd));
+        assert!(
+            !root.join("trajectories").exists() && !root.join(".ejaj").exists(),
+            "an invocation with no session directory must not create any trajectory path"
+        );
+
+        for _ in 0..2 {
+            let mut collision_messages = vec![Message::system("code"), Message::user("work")];
+            let collision_stop = run_agent_loop_with_context(
+                &mut collision_messages,
+                &settings,
+                Phase::Code,
+                Source::None,
+                InvocationContext::new(&root, &ejaj_session),
+            );
+            assert!(matches!(collision_stop, Stop::TurnEnd));
+        }
+        let trajectories = ejaj_session.join("trajectories");
+        assert!(
+            trajectories.join("code.traj.json").is_file(),
+            "the first trajectory keeps the unnumbered name"
+        );
+        assert!(
+            trajectories.join("code-1.traj.json").is_file(),
+            "a colliding trajectory keeps the numbered name"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -9612,6 +10398,1153 @@ mod tests {
             trail.len() <= 1_500,
             "the complete trail is {} bytes",
             trail.len()
+        );
+    }
+
+    /// Edge-case table: the Tier 1 watermark is exclusive, the Tier 2 summary
+    /// watermark is exclusive, and each counter follows only the work actually
+    /// required at that size.
+    #[test]
+    fn when_preparing_history_given_sizes_at_and_around_compaction_watermarks_then_counts_only_required_work()
+     {
+        enum Fixture {
+            AtOrAroundTierOne(usize),
+            AfterTierOne(usize),
+        }
+
+        let cases = [
+            (
+                Fixture::AtOrAroundTierOne(TIER_ONE_CONTEXT_BYTES),
+                0_u64,
+                0_u64,
+                1_usize,
+            ),
+            (
+                Fixture::AtOrAroundTierOne(TIER_ONE_CONTEXT_BYTES + 1),
+                1,
+                0,
+                1,
+            ),
+            (Fixture::AfterTierOne(TIER_TWO_CONTEXT_BYTES), 1, 0, 1),
+            (Fixture::AfterTierOne(TIER_TWO_CONTEXT_BYTES + 1), 1, 1, 2),
+        ];
+
+        for (fixture, expected_tier1, expected_accepted, expected_requests) in cases {
+            let script = if expected_requests == 2 {
+                Script::new(vec![
+                    reply(Some(HANDOVER_REPLY), &[]),
+                    reply(Some("done"), &[]),
+                ])
+            } else {
+                Script::new(vec![reply(Some("done"), &[])])
+            };
+            let config = config(script.clone());
+            let mut messages = match fixture {
+                Fixture::AtOrAroundTierOne(target) => pad_to_context(
+                    &config,
+                    tier_one_history(8, 150 * 1024),
+                    target,
+                    Phase::Code,
+                ),
+                Fixture::AfterTierOne(target) => {
+                    summary_history_compacted_to_context(&config, target, Phase::Code)
+                }
+            };
+
+            let attempt = run_agent_loop_attempt_in(
+                &mut messages,
+                &config,
+                Phase::Code,
+                Source::None,
+                InvocationContext::default(),
+                None,
+            );
+
+            assert!(
+                matches!(attempt.stop, Stop::TurnEnd),
+                "the scripted ordinary reply must end the pass"
+            );
+            assert_eq!(
+                script.requests(),
+                expected_requests,
+                "only the required requests are sent at tier1={expected_tier1}"
+            );
+            assert_eq!(
+                attempt.telemetry.tier1_compactions, expected_tier1,
+                "Tier 1 counts only work above 409,600 bytes"
+            );
+            assert_eq!(
+                attempt.telemetry.tier2_summaries_accepted, expected_accepted,
+                "Tier 2 acceptance follows the 204,800-byte watermark"
+            );
+            assert_eq!(
+                attempt.telemetry.tier2_summary_failures, 0,
+                "no summary request failed in this table"
+            );
+        }
+    }
+
+    /// Core entry-point behavior: an accepted summary is counted only after its
+    /// contract validates, a required-summary failure counts once, and a later
+    /// post-summary size guard does not undo the acceptance already earned.
+    #[test]
+    fn when_validating_summary_given_accepted_or_rejected_replies_then_counts_the_final_validation_result()
+     {
+        let script = Script::new(vec![
+            reply(Some(HANDOVER_REPLY), &[]),
+            reply(Some("done"), &[]),
+        ]);
+        let accepted_config = config(script.clone());
+        let mut messages = summary_history();
+        let accepted = run_agent_loop_attempt_in(
+            &mut messages,
+            &accepted_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+
+        assert!(matches!(accepted.stop, Stop::TurnEnd));
+        assert_eq!(
+            script.requests(),
+            2,
+            "one summary then one ordinary request"
+        );
+        assert_eq!(accepted.telemetry.tier1_compactions, 1);
+        assert_eq!(accepted.telemetry.tier2_summaries_accepted, 1);
+        assert_eq!(accepted.telemetry.tier2_summary_failures, 0);
+
+        for invalid in [reply(None, &[]), reply(Some("not a handover summary"), &[])] {
+            let script = Script::new(vec![invalid]);
+            let rejected_config = config(script.clone());
+            let mut messages = summary_history();
+            let rejected = run_agent_loop_attempt_in(
+                &mut messages,
+                &rejected_config,
+                Phase::Code,
+                Source::None,
+                InvocationContext::default(),
+                None,
+            );
+
+            assert!(matches!(
+                rejected.stop,
+                Stop::Failed(FailureKind::ContextGuard)
+            ));
+            assert_eq!(
+                script.requests(),
+                1,
+                "the rejected summary never reaches the ordinary request"
+            );
+            assert_eq!(rejected.telemetry.tier2_summaries_accepted, 0);
+            assert_eq!(
+                rejected.telemetry.tier2_summary_failures, 1,
+                "a required summary failure is counted once"
+            );
+        }
+
+        let script = Script::new(vec![reply(Some(HANDOVER_REPLY), &[])]);
+        let guarded_config = config(script.clone());
+        let mut messages = history_with_oversized_retained_tail();
+        let guarded = run_agent_loop_attempt_in(
+            &mut messages,
+            &guarded_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+
+        assert!(matches!(
+            guarded.stop,
+            Stop::Failed(FailureKind::ContextGuard)
+        ));
+        assert_eq!(
+            script.requests(),
+            1,
+            "the post-summary guard stops before another provider send"
+        );
+        assert_eq!(
+            guarded.telemetry.tier2_summaries_accepted, 1,
+            "acceptance survives a later replacement-size guard failure"
+        );
+        assert_eq!(
+            guarded.telemetry.tier2_summary_failures, 0,
+            "the summary itself validated, so it is not a failure"
+        );
+    }
+
+    /// Contract: merging is saturating and total. Every counter and every
+    /// token-usage field adds independently at its own ceiling, the peak keeps
+    /// the larger value, and the abort flag is the OR of both sides. A default
+    /// value is all zeroes and not aborted.
+    #[test]
+    fn when_merging_telemetry_given_saturated_values_then_preserves_counter_token_peak_and_abort_invariants()
+     {
+        let default = LoopTelemetry::default();
+        assert_eq!(default.elapsed_ms, 0);
+        assert_eq!(default.provider_send_attempts, 0);
+        assert_eq!(default.transient_retries, 0);
+        assert_eq!(default.retry_backoff_ms, 0);
+        assert_eq!(default.peak_context_bytes, 0);
+        assert_eq!(default.token_usage, TokenUsage::default());
+        assert_eq!(default.tier1_compactions, 0);
+        assert_eq!(default.tier2_summaries_accepted, 0);
+        assert_eq!(default.tier2_summary_failures, 0);
+        assert_eq!(default.overflow_compaction_recoveries, 0);
+        assert_eq!(default.truncation_recoveries, 0);
+        assert_eq!(default.repeated_tool_warnings, 0);
+        assert_eq!(default.repeated_tool_aborts, 0);
+        assert!(!default.repeated_turn_aborted);
+        assert_eq!(default.step_budget_warnings, 0);
+        assert_eq!(default.plan_turns_suspended_for_user_answers, 0);
+        assert_eq!(default.bash_calls, 0);
+        assert_eq!(default.bash_failures, 0);
+        assert_eq!(default.bash_timeouts, 0);
+        assert_eq!(default.bash_output_spills, 0);
+        assert_eq!(default.execute_script_calls, 0);
+        assert_eq!(default.execute_script_failures, 0);
+        assert_eq!(default.execute_script_timeouts, 0);
+        assert_eq!(default.rejected_control_tool_calls, 0);
+        assert_eq!(default.rejected_other_tool_calls, 0);
+
+        let near = LoopTelemetry {
+            elapsed_ms: u64::MAX - 1,
+            provider_send_attempts: u64::MAX - 1,
+            transient_retries: u64::MAX - 1,
+            retry_backoff_ms: u64::MAX - 1,
+            peak_context_bytes: usize::MAX - 1,
+            token_usage: TokenUsage {
+                input_tokens: u64::MAX - 1,
+                cached_input_tokens: u64::MAX - 1,
+                output_tokens: u64::MAX - 1,
+                reasoning_tokens: u64::MAX - 1,
+            },
+            tier1_compactions: u64::MAX - 1,
+            tier2_summaries_accepted: u64::MAX - 1,
+            tier2_summary_failures: u64::MAX - 1,
+            overflow_compaction_recoveries: u64::MAX - 1,
+            truncation_recoveries: u64::MAX - 1,
+            repeated_tool_warnings: u64::MAX - 1,
+            repeated_tool_aborts: u64::MAX - 1,
+            repeated_turn_aborted: false,
+            step_budget_warnings: u64::MAX - 1,
+            plan_turns_suspended_for_user_answers: u64::MAX - 1,
+            bash_calls: u64::MAX - 1,
+            bash_failures: u64::MAX - 1,
+            bash_timeouts: u64::MAX - 1,
+            bash_output_spills: u64::MAX - 1,
+            execute_script_calls: u64::MAX - 1,
+            execute_script_failures: u64::MAX - 1,
+            execute_script_timeouts: u64::MAX - 1,
+            rejected_control_tool_calls: u64::MAX - 1,
+            rejected_other_tool_calls: u64::MAX - 1,
+        };
+        let added = LoopTelemetry {
+            elapsed_ms: 2,
+            provider_send_attempts: 2,
+            transient_retries: 2,
+            retry_backoff_ms: 2,
+            peak_context_bytes: usize::MAX,
+            token_usage: TokenUsage {
+                input_tokens: 2,
+                cached_input_tokens: 2,
+                output_tokens: 2,
+                reasoning_tokens: 2,
+            },
+            tier1_compactions: 2,
+            tier2_summaries_accepted: 2,
+            tier2_summary_failures: 2,
+            overflow_compaction_recoveries: 2,
+            truncation_recoveries: 2,
+            repeated_tool_warnings: 2,
+            repeated_tool_aborts: 2,
+            repeated_turn_aborted: true,
+            step_budget_warnings: 2,
+            plan_turns_suspended_for_user_answers: 2,
+            bash_calls: 2,
+            bash_failures: 2,
+            bash_timeouts: 2,
+            bash_output_spills: 2,
+            execute_script_calls: 2,
+            execute_script_failures: 2,
+            execute_script_timeouts: 2,
+            rejected_control_tool_calls: 2,
+            rejected_other_tool_calls: 2,
+        };
+
+        let mut merged = near;
+        merged.merge(added);
+
+        assert_eq!(merged.elapsed_ms, u64::MAX);
+        assert_eq!(merged.provider_send_attempts, u64::MAX);
+        assert_eq!(merged.transient_retries, u64::MAX);
+        assert_eq!(merged.retry_backoff_ms, u64::MAX);
+        assert_eq!(merged.peak_context_bytes, usize::MAX);
+        assert_eq!(
+            merged.token_usage,
+            TokenUsage {
+                input_tokens: u64::MAX,
+                cached_input_tokens: u64::MAX,
+                output_tokens: u64::MAX,
+                reasoning_tokens: u64::MAX,
+            }
+        );
+        assert_eq!(merged.tier1_compactions, u64::MAX);
+        assert_eq!(merged.tier2_summaries_accepted, u64::MAX);
+        assert_eq!(merged.tier2_summary_failures, u64::MAX);
+        assert_eq!(merged.overflow_compaction_recoveries, u64::MAX);
+        assert_eq!(merged.truncation_recoveries, u64::MAX);
+        assert_eq!(merged.repeated_tool_warnings, u64::MAX);
+        assert_eq!(merged.repeated_tool_aborts, u64::MAX);
+        assert!(merged.repeated_turn_aborted);
+        assert_eq!(merged.step_budget_warnings, u64::MAX);
+        assert_eq!(merged.plan_turns_suspended_for_user_answers, u64::MAX);
+        assert_eq!(merged.bash_calls, u64::MAX);
+        assert_eq!(merged.bash_failures, u64::MAX);
+        assert_eq!(merged.bash_timeouts, u64::MAX);
+        assert_eq!(merged.bash_output_spills, u64::MAX);
+        assert_eq!(merged.execute_script_calls, u64::MAX);
+        assert_eq!(merged.execute_script_failures, u64::MAX);
+        assert_eq!(merged.execute_script_timeouts, u64::MAX);
+        assert_eq!(merged.rejected_control_tool_calls, u64::MAX);
+        assert_eq!(merged.rejected_other_tool_calls, u64::MAX);
+
+        let mut peak = LoopTelemetry {
+            peak_context_bytes: 11,
+            ..LoopTelemetry::default()
+        };
+        peak.merge(LoopTelemetry {
+            peak_context_bytes: 10,
+            ..LoopTelemetry::default()
+        });
+        assert_eq!(peak.peak_context_bytes, 11, "the larger peak is kept");
+        let mut abort = LoopTelemetry {
+            repeated_turn_aborted: true,
+            ..LoopTelemetry::default()
+        };
+        abort.merge(LoopTelemetry::default());
+        assert!(abort.repeated_turn_aborted, "the abort flag is sticky");
+    }
+
+    /// Edge-case table across the empty and partial boundaries: a trajectory
+    /// written before a telemetry field existed omits it, so deserializing must
+    /// supply every absent field from its default while keeping the fields the
+    /// payload does carry.
+    #[test]
+    fn when_deserializing_partial_telemetry_given_missing_fields_then_defaults_values() {
+        let empty: LoopTelemetry =
+            serde_json::from_str("{}").expect("an empty telemetry object must deserialize");
+        assert_eq!(
+            empty,
+            LoopTelemetry {
+                elapsed_ms: 0,
+                provider_send_attempts: 0,
+                transient_retries: 0,
+                retry_backoff_ms: 0,
+                peak_context_bytes: 0,
+                token_usage: TokenUsage {
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                },
+                tier1_compactions: 0,
+                tier2_summaries_accepted: 0,
+                tier2_summary_failures: 0,
+                overflow_compaction_recoveries: 0,
+                truncation_recoveries: 0,
+                repeated_tool_warnings: 0,
+                repeated_tool_aborts: 0,
+                repeated_turn_aborted: false,
+                step_budget_warnings: 0,
+                plan_turns_suspended_for_user_answers: 0,
+                bash_calls: 0,
+                bash_failures: 0,
+                bash_timeouts: 0,
+                bash_output_spills: 0,
+                execute_script_calls: 0,
+                execute_script_failures: 0,
+                execute_script_timeouts: 0,
+                rejected_control_tool_calls: 0,
+                rejected_other_tool_calls: 0,
+            }
+        );
+
+        let partial: LoopTelemetry = serde_json::from_str(
+            r#"{"provider_send_attempts": 3, "peak_context_bytes": 4096, "repeated_turn_aborted": true}"#,
+        )
+        .expect("a telemetry object missing most fields must deserialize");
+
+        assert_eq!(partial.provider_send_attempts, 3);
+        assert_eq!(partial.peak_context_bytes, 4096);
+        assert!(partial.repeated_turn_aborted);
+        assert_eq!(partial.elapsed_ms, 0);
+        assert_eq!(partial.transient_retries, 0);
+        assert_eq!(partial.retry_backoff_ms, 0);
+        assert_eq!(
+            partial.token_usage,
+            TokenUsage {
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+            }
+        );
+        assert_eq!(partial.tier1_compactions, 0);
+        assert_eq!(partial.tier2_summaries_accepted, 0);
+        assert_eq!(partial.tier2_summary_failures, 0);
+        assert_eq!(partial.overflow_compaction_recoveries, 0);
+        assert_eq!(partial.truncation_recoveries, 0);
+        assert_eq!(partial.repeated_tool_warnings, 0);
+        assert_eq!(partial.repeated_tool_aborts, 0);
+        assert_eq!(partial.step_budget_warnings, 0);
+        assert_eq!(partial.plan_turns_suspended_for_user_answers, 0);
+        assert_eq!(partial.bash_calls, 0);
+        assert_eq!(partial.bash_failures, 0);
+        assert_eq!(partial.bash_timeouts, 0);
+        assert_eq!(partial.bash_output_spills, 0);
+        assert_eq!(partial.execute_script_calls, 0);
+        assert_eq!(partial.execute_script_failures, 0);
+        assert_eq!(partial.execute_script_timeouts, 0);
+        assert_eq!(partial.rejected_control_tool_calls, 0);
+        assert_eq!(partial.rejected_other_tool_calls, 0);
+    }
+
+    /// Regression: the existing outcome-only constructor and the Stop-returning
+    /// entry points keep their behavior while the new telemetry starts at its
+    /// default.
+    #[test]
+    fn when_adding_attempt_given_only_an_outcome_then_defaults_telemetry_without_changing_stop() {
+        use crate::loops::code::{Attempt, Outcome, Session};
+
+        for outcome in [
+            Outcome::Complete,
+            Outcome::TurnEnd,
+            Outcome::Failed(FailureKind::StepLimit),
+        ] {
+            let attempt = Attempt::new(outcome);
+            assert_eq!(attempt.outcome, outcome);
+            assert_eq!(attempt.narration, None);
+            assert_eq!(attempt.tool_activity, None);
+            assert_eq!(attempt.telemetry, LoopTelemetry::default());
+        }
+
+        let completion_script =
+            Script::new(vec![reply(None, &[("task_complete", "{}".to_string())])]);
+        let completion_config = config(completion_script.clone());
+        let mut completion_messages = vec![Message::system("sys"), Message::user("finish")];
+        assert!(
+            matches!(
+                run_agent_loop(
+                    &mut completion_messages,
+                    &completion_config,
+                    Phase::Code,
+                    Source::None
+                ),
+                Stop::Complete
+            ),
+            "task_complete still ends the code loop with Complete"
+        );
+        assert_eq!(completion_script.requests(), 1);
+
+        let turn_end_script = Script::new(vec![reply(Some("nothing to do"), &[])]);
+        let turn_end_config = config(turn_end_script.clone());
+        let mut turn_end_messages = vec![Message::system("sys"), Message::user("finish")];
+        assert!(
+            matches!(
+                run_agent_loop(
+                    &mut turn_end_messages,
+                    &turn_end_config,
+                    Phase::Code,
+                    Source::None
+                ),
+                Stop::TurnEnd
+            ),
+            "a tool-free turn still ends the code loop with TurnEnd"
+        );
+        assert_eq!(turn_end_script.requests(), 1);
+
+        let session_script = Script::new(vec![reply(Some("finished"), &[])]);
+        let session_config = config(session_script.clone());
+        let session = Session::new(&session_config, "scope");
+        assert_eq!(session.run_ticket("do the work"), Outcome::TurnEnd);
+        assert_eq!(session_script.requests(), 1);
+    }
+
+    /// The provider-prepared context size of one recorded request: the encoded
+    /// messages member alone, which is exactly what the transcript occupies on
+    /// the chat-completions wire.
+    fn recorded_context_bytes(sent: &serde_json::Value) -> usize {
+        serde_json::to_string(&sent["messages"])
+            .expect("the recorded messages encode")
+            .len()
+    }
+
+    /// The largest provider-prepared context among the requests the script
+    /// actually saw, measured from the recorded wire bodies.
+    fn recorded_peak_context_bytes(script: &Script) -> usize {
+        script
+            .sent()
+            .iter()
+            .map(recorded_context_bytes)
+            .max()
+            .expect("at least one request was sent")
+    }
+
+    /// A monotonic clock stand-in: each read hands back the next scripted
+    /// instant. The loop reads it once before and once after the body, so a
+    /// test can control the measured interval exactly without sleeping.
+    struct FixedClock {
+        times: Mutex<std::collections::VecDeque<Duration>>,
+    }
+
+    impl FixedClock {
+        fn new(times: Vec<Duration>) -> FixedClock {
+            FixedClock {
+                times: Mutex::new(times.into()),
+            }
+        }
+    }
+
+    impl crate::timing::Clock for FixedClock {
+        fn now(&self) -> Duration {
+            self.times
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("the loop must read the clock exactly as many times as scripted")
+        }
+    }
+
+    /// Core entry point: a finished invocation returns its telemetry and writes
+    /// the same object into the trajectory, while the existing trajectory
+    /// fields keep their names and wire types.
+    #[test]
+    fn when_invocation_finishes_given_scripted_provider_replies_then_returns_and_persists_telemetry()
+     {
+        const EXPECTED_USAGE: TokenUsage = TokenUsage {
+            input_tokens: 120,
+            cached_input_tokens: 20,
+            output_tokens: 30,
+            reasoning_tokens: 5,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "ejaj-telemetry-traj-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session_dir = root.join(".ejaj").join("20261108-190000");
+        let script = Script::new(vec![reply_with_usage(Some("done"), &[], 120, 20, 30, 5)]);
+        let config = config(script.clone());
+        let mut messages = vec![Message::system("sys"), Message::user("work the ticket")];
+
+        let attempt = run_agent_loop_attempt_in(
+            &mut messages,
+            &config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::new(&root, &session_dir),
+            None,
+        );
+
+        assert!(matches!(attempt.stop, Stop::TurnEnd));
+        assert_eq!(attempt.telemetry.provider_send_attempts, 1);
+        assert_eq!(attempt.telemetry.transient_retries, 0);
+        assert_eq!(attempt.telemetry.retry_backoff_ms, 0);
+        assert_eq!(attempt.telemetry.token_usage, EXPECTED_USAGE);
+        assert_eq!(
+            attempt.telemetry.peak_context_bytes,
+            recorded_peak_context_bytes(&script)
+        );
+
+        let trajectory_path = session_dir.join("trajectories").join("code.traj.json");
+        let trajectory: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&trajectory_path).unwrap()).unwrap();
+        assert_eq!(
+            trajectory["telemetry"],
+            serde_json::to_value(attempt.telemetry).unwrap(),
+            "the saved trajectory carries the returned invocation telemetry"
+        );
+
+        let telemetry = &trajectory["telemetry"];
+        assert_eq!(telemetry["elapsed_ms"].as_u64().is_some(), true);
+        assert_eq!(telemetry["provider_send_attempts"], 1);
+        assert_eq!(telemetry["transient_retries"], 0);
+        assert_eq!(telemetry["retry_backoff_ms"], 0);
+        assert!(telemetry["peak_context_bytes"].as_u64().is_some());
+        assert_eq!(telemetry["token_usage"]["input_tokens"], 120);
+        assert_eq!(telemetry["token_usage"]["cached_input_tokens"], 20);
+        assert_eq!(telemetry["token_usage"]["output_tokens"], 30);
+        assert_eq!(telemetry["token_usage"]["reasoning_tokens"], 5);
+        for field in [
+            "tier1_compactions",
+            "tier2_summaries_accepted",
+            "tier2_summary_failures",
+            "overflow_compaction_recoveries",
+            "truncation_recoveries",
+            "repeated_tool_warnings",
+            "repeated_tool_aborts",
+            "step_budget_warnings",
+            "plan_turns_suspended_for_user_answers",
+            "bash_calls",
+            "bash_failures",
+            "bash_timeouts",
+            "bash_output_spills",
+            "execute_script_calls",
+            "execute_script_failures",
+            "execute_script_timeouts",
+            "rejected_control_tool_calls",
+            "rejected_other_tool_calls",
+        ] {
+            assert_eq!(
+                telemetry[field], 0,
+                "the default-zero field {field} must still be serialized"
+            );
+        }
+        assert_eq!(telemetry["repeated_turn_aborted"], false);
+
+        assert!(trajectory["phase"].is_string());
+        assert!(trajectory["role"].is_string());
+        assert!(trajectory["model"].is_string());
+        assert!(trajectory["steps_taken"].is_u64());
+        assert!(trajectory["exit_status"].is_string());
+        assert!(trajectory["messages"].is_array());
+        assert_eq!(trajectory["phase"], "code");
+        assert_eq!(trajectory["role"], "mid");
+        assert_eq!(trajectory["model"], "test-model");
+        assert_eq!(trajectory["steps_taken"], 1);
+        assert_eq!(trajectory["exit_status"], "turn_end");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Core entry point and malformed-payload boundary: actual Bash and
+    /// execute-script dispatches count once, returned errors count failures, the
+    /// specified timeout text adds a timeout on top of the failure, and a Bash
+    /// spill-prefix result adds a spill.
+    #[test]
+    fn when_dispatching_commands_given_errors_timeouts_and_spills_then_counts_each_tool_outcome() {
+        let root = std::env::temp_dir().join(format!(
+            "ejaj-tool-outcome-telemetry-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session_dir = root.join(".ejaj").join("20261108-190001");
+        std::fs::create_dir_all(&session_dir).expect("the invocation root exists for commands");
+        let script = Script::new(vec![
+            reply(
+                Some("running commands"),
+                &[
+                    (
+                        "bash",
+                        serde_json::json!({ "command": "printf ok" }).to_string(),
+                    ),
+                    (
+                        "bash",
+                        serde_json::json!({ "command": "exit 7" }).to_string(),
+                    ),
+                    (
+                        "bash",
+                        serde_json::json!({
+                            "command": "echo 'command timed out after 3s' >&2; exit 1"
+                        })
+                        .to_string(),
+                    ),
+                    (
+                        "bash",
+                        serde_json::json!({ "command": "printf 'x%.0s' {1..20000}" })
+                            .to_string(),
+                    ),
+                    (
+                        "execute_script",
+                        serde_json::json!({ "code": "return 1 + 1;" }).to_string(),
+                    ),
+                    (
+                        "execute_script",
+                        serde_json::json!({ "code": "throw new Error('boom');" }).to_string(),
+                    ),
+                    (
+                        "execute_script",
+                        serde_json::json!({
+                            "code": "throw new Error('script exceeded the 10s wall-clock deadline');"
+                        })
+                        .to_string(),
+                    ),
+                ],
+            ),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = vec![Message::system("sys"), Message::user("work the ticket")];
+
+        let attempt = run_agent_loop_attempt_in(
+            &mut messages,
+            &settings,
+            Phase::Code,
+            Source::None,
+            InvocationContext::new(&root, &session_dir),
+            None,
+        );
+
+        assert!(matches!(attempt.stop, Stop::TurnEnd));
+        assert_eq!(attempt.telemetry.bash_calls, 4);
+        assert_eq!(
+            attempt.telemetry.bash_failures, 2,
+            "the ordinary error and the timeout-text error are both failures"
+        );
+        assert_eq!(
+            attempt.telemetry.bash_timeouts, 1,
+            "only the returned text naming a command timeout is a timeout"
+        );
+        assert_eq!(
+            attempt.telemetry.bash_output_spills, 1,
+            "the oversized Bash result is a spill"
+        );
+        assert_eq!(attempt.telemetry.execute_script_calls, 3);
+        assert_eq!(
+            attempt.telemetry.execute_script_failures, 2,
+            "the ordinary script error and the deadline-text error are both failures"
+        );
+        assert_eq!(
+            attempt.telemetry.execute_script_timeouts, 1,
+            "only the returned text naming the wall-clock deadline is a timeout"
+        );
+
+        let spilled = tool_result_for(&messages, "call-3").expect("the spill result exists");
+        assert!(
+            spilled.contains("[full output saved to"),
+            "the dispatched Bash result really carries the spill footer: {spilled:?}"
+        );
+        let timed_out = tool_result_for(&messages, "call-2").expect("the timeout result exists");
+        assert!(
+            timed_out.contains("command timed out after"),
+            "the dispatched Bash result carries the timeout text: {timed_out:?}"
+        );
+        let script_timed_out =
+            tool_result_for(&messages, "call-6").expect("the script timeout result exists");
+        assert!(
+            script_timed_out.contains("wall-clock deadline"),
+            "the dispatched script result carries the deadline text: {script_timed_out:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Contract and malformed-payload boundary: every rejected call increments
+    /// exactly one rejection kind. The six control names go to the control
+    /// counter, any other parse error goes to the other counter, and no rejected
+    /// call is counted as a dispatched command.
+    #[test]
+    fn when_rejecting_tool_calls_given_control_and_other_invalid_payloads_then_counts_exactly_one_rejection_kind()
+     {
+        let script = Script::new(vec![
+            reply(
+                Some("retrying"),
+                &[
+                    ("finish_plan", "{}".to_string()),
+                    ("finish_spec", "{}".to_string()),
+                    ("finish_tickets", "{}".to_string()),
+                    ("finish_triage", "{}".to_string()),
+                    ("finish_review", "{}".to_string()),
+                    ("task_complete", "{ not json".to_string()),
+                    ("no_such_tool", "{}".to_string()),
+                ],
+            ),
+            reply(Some("done"), &[]),
+        ]);
+        let settings = config(script.clone());
+        let mut messages = vec![Message::system("sys"), Message::user("work the ticket")];
+
+        let attempt = run_agent_loop_attempt_in(
+            &mut messages,
+            &settings,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+
+        assert!(matches!(attempt.stop, Stop::TurnEnd));
+        assert_eq!(
+            attempt.telemetry.rejected_control_tool_calls, 6,
+            "each of the six control names is one control rejection"
+        );
+        assert_eq!(
+            attempt.telemetry.rejected_other_tool_calls, 1,
+            "an unknown tool is exactly one other rejection"
+        );
+        assert_eq!(
+            attempt.telemetry.bash_calls, 0,
+            "a rejected call is never a dispatched Bash call"
+        );
+        assert_eq!(
+            attempt.telemetry.execute_script_calls, 0,
+            "a rejected call is never a dispatched execute-script call"
+        );
+        assert!(
+            tool_result_for(&messages, "call-6")
+                .is_some_and(|result| result.contains("unknown tool")),
+            "the other rejection really reached the model as its tool result"
+        );
+    }
+
+    /// Edge-case table at the empty and upper boundaries: step 89's result
+    /// receives no warning, every result at step 90 does, and the counter counts
+    /// each appended warning rather than each turn.
+    #[test]
+    fn when_delivering_tool_results_given_step_warning_threshold_boundaries_then_counts_only_appended_warnings()
+     {
+        let mut bodies = Vec::new();
+        for step in 1..=89 {
+            bodies.push(reply_numbered(
+                step * 10,
+                Some("working"),
+                &[(
+                    "execute_script",
+                    serde_json::json!({ "code": format!("return {step};") }).to_string(),
+                )],
+            ));
+        }
+        bodies.push(reply_numbered(
+            900,
+            Some("working"),
+            &[
+                (
+                    "execute_script",
+                    serde_json::json!({ "code": "return 901;" }).to_string(),
+                ),
+                (
+                    "execute_script",
+                    serde_json::json!({ "code": "return 902;" }).to_string(),
+                ),
+                (
+                    "execute_script",
+                    serde_json::json!({ "code": "return 903;" }).to_string(),
+                ),
+            ],
+        ));
+        bodies.push(reply(Some("done"), &[]));
+        let script = Script::new(bodies);
+        let settings = config(script.clone());
+        let mut messages = plan_transcript();
+
+        let attempt = run_agent_loop_attempt_in(
+            &mut messages,
+            &settings,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+
+        assert!(matches!(attempt.stop, Stop::TurnEnd));
+        assert_eq!(
+            attempt.telemetry.step_budget_warnings, 3,
+            "the three results delivered at step 90 each receive one warning"
+        );
+        let before_boundary =
+            tool_result_for(&messages, "call-890").expect("step 89 delivered its result");
+        assert!(
+            !before_boundary.contains("[WARN: step "),
+            "step 89 still has eleven steps remaining, so its result carries no warning"
+        );
+        for id in ["call-900", "call-901", "call-902"] {
+            let result = tool_result_for(&messages, id).expect("step 90 delivered every result");
+            assert!(
+                result.contains("[WARN: step "),
+                "step 90's result {id} carries the existing warning: {result:?}"
+            );
+        }
+    }
+
+    /// Core entry point at the minimum valid boundary: a plan reply that asks
+    /// the user returns control and counts one suspension, both when the turn
+    /// had no tool calls and when a control handoff in that turn was suspended.
+    #[test]
+    fn when_plan_turn_returns_given_user_question_with_or_without_control_handoff_then_counts_one_suspension()
+     {
+        let question_script = Script::new(vec![reply(Some("Which provider should we use?"), &[])]);
+        let question_config = config(question_script.clone());
+        let mut question_messages = plan_transcript();
+        let question_attempt = run_agent_loop_attempt_in(
+            &mut question_messages,
+            &question_config,
+            Phase::Plan,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+
+        assert!(matches!(question_attempt.stop, Stop::TurnEnd));
+        assert_eq!(
+            question_attempt
+                .telemetry
+                .plan_turns_suspended_for_user_answers,
+            1,
+            "a tool-free question returns control exactly once"
+        );
+
+        let handoff_script = Script::new(vec![reply(
+            Some("Please confirm the caching choice?"),
+            &[("finish_plan", finish_plan_arguments())],
+        )]);
+        let handoff_config = config(handoff_script.clone());
+        let mut handoff_messages = plan_transcript();
+        let handoff_attempt = run_agent_loop_attempt_in(
+            &mut handoff_messages,
+            &handoff_config,
+            Phase::Plan,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+
+        assert!(matches!(handoff_attempt.stop, Stop::TurnEnd));
+        assert_eq!(
+            handoff_attempt
+                .telemetry
+                .plan_turns_suspended_for_user_answers,
+            1,
+            "a suspended control handoff returns control exactly once"
+        );
+        assert!(
+            assistant_tool_steps(&handoff_messages).is_empty(),
+            "the suspended control call is dropped rather than handed off"
+        );
+    }
+
+    /// Edge-case table: every actual send counts, a scheduled retry adds one
+    /// retry and its floored delay, and an authorization failure ends the turn
+    /// without a decoded response, so no usage is added.
+    #[test]
+    fn when_provider_retries_given_transient_or_forbidden_failures_then_counts_actual_sends() {
+        let script = Script::with_replies(vec![
+            Reply::Error(CallError::Transport("connection reset".to_string())),
+            Reply::Error(CallError::Api {
+                status: 403,
+                message: "forbidden".to_string(),
+            }),
+        ]);
+        let retry_config = config(script.clone());
+        let mut messages = vec![Message::system("sys"), Message::user("work the ticket")];
+        let attempt = run_agent_loop_attempt_in(
+            &mut messages,
+            &retry_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+
+        assert!(matches!(attempt.stop, Stop::Failed(FailureKind::Api)));
+        assert_eq!(
+            script.requests(),
+            2,
+            "the scheduled retry was actually sent"
+        );
+        assert_eq!(attempt.telemetry.provider_send_attempts, 2);
+        assert_eq!(attempt.telemetry.transient_retries, 1);
+        assert_eq!(attempt.telemetry.retry_backoff_ms, 1_000);
+        assert_eq!(attempt.telemetry.token_usage, TokenUsage::default());
+        assert_eq!(
+            attempt.telemetry.peak_context_bytes,
+            recorded_peak_context_bytes(&script)
+        );
+
+        let exhausted = Script::with_errors(vec![
+            CallError::Transport("connection reset".to_string()),
+            CallError::Transport("connection reset".to_string()),
+            CallError::Transport("connection reset".to_string()),
+        ]);
+        let exhausted_config = config(exhausted.clone());
+        let mut exhausted_messages = vec![Message::system("sys"), Message::user("work the ticket")];
+        let exhausted_attempt = run_agent_loop_attempt_in(
+            &mut exhausted_messages,
+            &exhausted_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+
+        assert!(matches!(
+            exhausted_attempt.stop,
+            Stop::Failed(FailureKind::Transport)
+        ));
+        assert_eq!(exhausted.requests(), 3, "all three error sends happened");
+        assert_eq!(exhausted_attempt.telemetry.provider_send_attempts, 3);
+        assert_eq!(exhausted_attempt.telemetry.transient_retries, 2);
+        assert_eq!(exhausted_attempt.telemetry.retry_backoff_ms, 3_000);
+        assert_eq!(
+            exhausted_attempt.telemetry.token_usage,
+            TokenUsage::default()
+        );
+    }
+
+    /// Contract: usage is added only after a successful decode. A normal reply
+    /// and a decoded but summary-invalid reply both contribute; a decode
+    /// failure contributes nothing. The peak follows the requests actually
+    /// sent, including the tool-free summary request.
+    #[test]
+    fn when_decoding_responses_given_normal_and_invalid_summary_replies_then_accumulates_only_decoded_usage()
+     {
+        const NORMAL_USAGE: TokenUsage = TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 10,
+            output_tokens: 20,
+            reasoning_tokens: 7,
+        };
+        const SUMMARY_USAGE: TokenUsage = TokenUsage {
+            input_tokens: 11,
+            cached_input_tokens: 3,
+            output_tokens: 5,
+            reasoning_tokens: 2,
+        };
+
+        let normal_script = Script::new(vec![reply_with_usage(Some("done"), &[], 100, 10, 20, 7)]);
+        let normal_config = config(normal_script.clone());
+        let mut normal_messages = vec![Message::system("sys"), Message::user("work the ticket")];
+        let normal_attempt = run_agent_loop_attempt_in(
+            &mut normal_messages,
+            &normal_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+        assert!(matches!(normal_attempt.stop, Stop::TurnEnd));
+        assert_eq!(normal_attempt.telemetry.provider_send_attempts, 1);
+        assert_eq!(normal_attempt.telemetry.token_usage, NORMAL_USAGE);
+        assert_eq!(
+            normal_attempt.telemetry.peak_context_bytes,
+            recorded_peak_context_bytes(&normal_script)
+        );
+
+        let summary_script = Script::new(vec![reply_with_usage(
+            Some("not a handover"),
+            &[],
+            11,
+            3,
+            5,
+            2,
+        )]);
+        let summary_config = config(summary_script.clone());
+        let mut summary_messages = summary_history();
+        let summary_attempt = run_agent_loop_attempt_in(
+            &mut summary_messages,
+            &summary_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+        assert!(matches!(
+            summary_attempt.stop,
+            Stop::Failed(FailureKind::ContextGuard)
+        ));
+        assert_eq!(
+            summary_script.requests(),
+            1,
+            "the decoded summary reply is sent before validation"
+        );
+        assert_eq!(summary_attempt.telemetry.provider_send_attempts, 1);
+        assert_eq!(
+            summary_attempt.telemetry.token_usage, SUMMARY_USAGE,
+            "a decoded summary reply contributes usage even when validation rejects it"
+        );
+        assert_eq!(
+            summary_attempt.telemetry.peak_context_bytes,
+            recorded_peak_context_bytes(&summary_script)
+        );
+        assert!(
+            summary_script.sent()[0]["tools"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "the summary request is the tool-free prepared request"
+        );
+
+        let decode_script = Script::new(vec![serde_json::json!({ "choices": [] }).to_string()]);
+        let decode_config = config(decode_script.clone());
+        let mut decode_messages = vec![Message::system("sys"), Message::user("work the ticket")];
+        let decode_attempt = run_agent_loop_attempt_in(
+            &mut decode_messages,
+            &decode_config,
+            Phase::Code,
+            Source::None,
+            InvocationContext::default(),
+            None,
+        );
+        assert!(matches!(
+            decode_attempt.stop,
+            Stop::Failed(FailureKind::Malformed)
+        ));
+        assert_eq!(decode_attempt.telemetry.provider_send_attempts, 1);
+        assert_eq!(
+            decode_attempt.telemetry.token_usage,
+            TokenUsage::default(),
+            "a response that never decoded contributes no usage"
+        );
+        assert_eq!(
+            decode_attempt.telemetry.peak_context_bytes,
+            recorded_peak_context_bytes(&decode_script),
+            "the sent request still counts toward the peak"
+        );
+    }
+
+    /// Boundary and upper-limit behavior: elapsed time is bounded by the two
+    /// controlled clock reads, floored to whole milliseconds, and converted
+    /// without wrapping.
+    #[test]
+    fn when_measuring_invocation_given_controlled_monotonic_time_then_floors_elapsed_milliseconds()
+    {
+        fn elapsed_for(times: Vec<Duration>) -> u64 {
+            let script = Script::new(vec![reply(Some("done"), &[])]);
+            let config = config(script);
+            let mut messages = vec![Message::system("sys"), Message::user("work the ticket")];
+            let mut narration = None;
+            let mut telemetry = LoopTelemetry::default();
+            let clock = FixedClock::new(times);
+            let stop = run_agent_loop_capturing(
+                &mut messages,
+                &config,
+                Phase::Code,
+                Source::None,
+                InvocationContext::default(),
+                None,
+                &mut narration,
+                &mut telemetry,
+                &clock,
+            );
+            assert!(matches!(stop, Stop::TurnEnd));
+            telemetry.elapsed_ms
+        }
+
+        assert_eq!(
+            elapsed_for(vec![Duration::from_millis(42), Duration::from_millis(42)]),
+            0,
+            "a zero-length interval floors to zero"
+        );
+        assert_eq!(
+            elapsed_for(vec![
+                Duration::from_millis(10),
+                Duration::from_millis(12_355) + Duration::from_nanos(999_999),
+            ]),
+            12_345,
+            "a fractional millisecond is floored, not rounded"
+        );
+        assert_eq!(
+            elapsed_for(vec![Duration::ZERO, Duration::new(u64::MAX, 0)]),
+            u64::MAX,
+            "a duration beyond the u64 millisecond range saturates instead of wrapping"
         );
     }
 }

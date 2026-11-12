@@ -21,3 +21,4 @@ pub mod triage;
 
 pub use agent::FailureKind;
 pub(crate) use agent::InvocationContext;
+pub use agent::LoopTelemetry;

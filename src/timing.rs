@@ -11,6 +11,39 @@
 
 use std::time::{Duration, Instant};
 
+/// A monotonic source of elapsed durations.
+///
+/// The loop needs two readings of one monotonic timeline to measure its own
+/// body. Production supplies MonotonicClock; a unit test supplies a local
+/// stand-in so the measured interval is controlled without sleeping. The trait
+/// stays private to the crate: only the loop's own timing seam reads it.
+pub(crate) trait Clock {
+    /// The current point on the monotonic timeline.
+    fn now(&self) -> Duration;
+}
+
+/// The production clock: an instant captured when the run starts, with every
+/// reading measured from it. Instant is monotonic, so wall-clock changes
+/// cannot move the measured interval backwards.
+pub(crate) struct MonotonicClock {
+    origin: Instant,
+}
+
+impl MonotonicClock {
+    /// Start a new monotonic timeline at the current instant.
+    pub(crate) fn new() -> MonotonicClock {
+        MonotonicClock {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Clock for MonotonicClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+}
+
 /// Where the elapsed duration of one finished operation is reported.
 ///
 /// The seam between measuring an operation and showing its duration: the

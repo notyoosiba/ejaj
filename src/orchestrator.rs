@@ -289,11 +289,15 @@ impl Production<'_> {
     ///
     /// The root is always explicit, independently of the optional session
     /// directory: a caller that supplied no session still keeps the root it
-    /// selected, and a supplied session passes through unchanged.
+    /// selected, and a supplied session passes through unchanged. Ticket work
+    /// adds its trimmed identity on top of this base with the
+    /// InvocationContext ticket-attempt builder.
     fn invocation(&self) -> InvocationContext<'_> {
         InvocationContext {
             root: Some(self.root),
             session_dir: self.session_dir,
+            ticket_id: None,
+            attempt: None,
         }
     }
 }
@@ -311,6 +315,7 @@ impl Lifecycle for Production<'_> {
         let retry_config = handover.map(|_| self.config.code_retry_config());
         let config = retry_config.as_ref().unwrap_or(self.config);
         let session = code::Session::new(config, self.scope);
+        let attempt = if handover.is_some() { 2 } else { 1 };
         let mut kickoff = ticket.to_markdown();
         if let Some(context) = self
             .triage
@@ -319,7 +324,13 @@ impl Lifecycle for Production<'_> {
             kickoff.push('\n');
             kickoff.push_str(&context);
         }
-        session.run_ticket_attempt_in(&kickoff, handover, contributions, self.invocation())
+        session.run_ticket_attempt_in(
+            &kickoff,
+            handover,
+            contributions,
+            self.invocation()
+                .with_ticket_identity(ticket.id.trim(), attempt),
+        )
     }
 
     fn verify(&mut self, ticket: &Ticket) -> Result<(), String> {
