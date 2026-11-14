@@ -76,6 +76,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Upper bound on review-generated fix queue rounds in one [`Pipeline::ask`]:
 /// each of these rounds runs a review pass, queues the fix set that review
@@ -151,6 +152,38 @@ pub struct Pipeline {
     /// queue and returned `Step::Retry` without committing its working-tree
     /// changes.
     dirty_from_retry: bool,
+}
+
+/// Finish one measured queue round: report the existing total and residual
+/// elapsed lines, then attach the same attribution to the returned result's
+/// metrics.
+///
+/// The lines are exactly the two the queue has always emitted -- the round's
+/// total first and its residual overhead second, once each, under the existing
+/// labels -- and nothing else is timed: no line is added for a model attempt, an
+/// executed tool, a verification gate or a transition gate. The residual is the
+/// part of the same measured interval not attributed to a contributor, with a
+/// saturating subtraction, so an interval shorter than its parts reports zero
+/// rather than wrapping.
+///
+/// The attached values come from the same accumulator and the same measured
+/// interval as the lines, floored to whole milliseconds by the breakdown, so the
+/// structured metrics can never disagree with the reported overhead by more than
+/// the floored fraction. A failed informational write changes neither the result
+/// nor the control flow.
+fn finish_timed_queue_round<R: crate::timing::Reporter + ?Sized>(
+    reporter: &mut R,
+    queue_round: usize,
+    contributions: &crate::timing::QueueContributions,
+    elapsed: Duration,
+    mut result: orchestrator::QueueResult,
+) -> orchestrator::QueueResult {
+    let total_label = format!("ticket-queue round {queue_round}");
+    reporter.report(&total_label, elapsed);
+    let overhead_label = format!("ticket-queue round {queue_round} overhead");
+    reporter.report(&overhead_label, contributions.residual(elapsed));
+    result.metrics.timing = contributions.breakdown(elapsed);
+    result
 }
 
 impl Pipeline {
@@ -655,15 +688,16 @@ impl Pipeline {
         });
         // Report the existing total first, then the residual: the part of that
         // same measured interval not already attributed to a model attempt, an
-        // executed command or a verification gate. The subtraction saturates,
-        // so an interval shorter than its measured parts reports zero rather
-        // than wrapping. A failed informational write changes neither the result
-        // nor the control flow.
-        let total_label = format!("ticket-queue round {}", progress.queue_round);
-        let _ = status::shared().elapsed_log(&total_label, elapsed);
-        let overhead_label = format!("ticket-queue round {} overhead", progress.queue_round);
-        let _ = status::shared().elapsed_log(&overhead_label, contributions.residual(elapsed));
-        result
+        // executed command or a verification gate. The attribution travels back
+        // with the result so the round's metrics carry exactly the numbers the
+        // lines report.
+        finish_timed_queue_round(
+            &mut *status::shared(),
+            progress.queue_round,
+            &contributions,
+            elapsed,
+            result,
+        )
     }
 
     /// Run the repository-wide full test suite gate after a resolved queue
@@ -680,7 +714,20 @@ impl Pipeline {
         };
 
         let _ = status::shared().stdout_log(&format!("\n=== Transition gate ({command}) ===\n"));
-        match crate::tools::run_command_in(&self.root, command) {
+        // The measured interval encloses the command invocation alone: the
+        // header above and every result line below stay outside it, and nothing
+        // is reported -- the gate adds accounting, never output. A missing
+        // manifest returned above, so only an actual invocation is counted.
+        let (result, elapsed) =
+            crate::timing::measured(|| crate::tools::run_command_in(&self.root, command));
+        progress.transition_gate_runs = progress.transition_gate_runs.saturating_add(1);
+        progress.transition_gate_elapsed_ms = progress
+            .transition_gate_elapsed_ms
+            .saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+        // Both totals are recorded before the result is handled, so a passing
+        // attempt, a queued repair attempt and a terminating attempt all retain
+        // the invocation that produced them.
+        match result {
             Ok(_) => {
                 progress.transition_failures = 0;
                 let _ = status::shared()
@@ -1224,6 +1271,16 @@ struct ReviewProgress {
     review_round: usize,
     queue_round: usize,
     transition_failures: usize,
+    /// How many actual repository-wide transition-gate commands this loop has
+    /// invoked. The later run-metrics work reads this total; it is retained
+    /// across consecutive-failure resets so repair attempts stay accounted for.
+    #[allow(dead_code)]
+    transition_gate_runs: u64,
+    /// The measured whole-millisecond duration of every transition-gate command
+    /// this loop has invoked, accumulated saturatingly. Like the run count, it
+    /// survives the reset a passing gate applies to consecutive failures.
+    #[allow(dead_code)]
+    transition_gate_elapsed_ms: u64,
 }
 
 impl ReviewProgress {
@@ -1270,6 +1327,8 @@ impl ReviewProgress {
             review_round: 0,
             queue_round: 0,
             transition_failures: 0,
+            transition_gate_runs: 0,
+            transition_gate_elapsed_ms: 0,
         }
     }
 }
@@ -1671,6 +1730,7 @@ fn ejaj_ancestor(dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// A sink that records the bytes written to stdout, so the exact payload the
     /// coordinator is handed can be asserted without touching the real streams.
@@ -2176,6 +2236,261 @@ mod tests {
 
         fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
         assert_eq!(transition_gate_command(&root), Some("cargo test"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The environment marker a parent test sets on the child copy that performs
+    /// one real transition-gate attempt, so the parent can read the production
+    /// transcript at the process boundary without mocking a stream.
+    const TRANSITION_GATE_CHILD: &str = "EJAJ_TRANSITION_GATE_CHILD";
+
+    /// A progress state with no prior queue or review history, carrying fresh
+    /// transition-gate accounting.
+    fn transition_progress() -> ReviewProgress {
+        ReviewProgress {
+            prior_completed: Vec::new(),
+            all_tickets: Vec::new(),
+            current_set: TicketSet {
+                tickets: Vec::new(),
+            },
+            triage: None,
+            reviews: Vec::new(),
+            review_markdown: String::new(),
+            review_round: 1,
+            queue_round: 1,
+            transition_failures: 0,
+            transition_gate_runs: 0,
+            transition_gate_elapsed_ms: 0,
+        }
+    }
+
+    /// A pipeline anchored to one disposable project root. No agent runs in the
+    /// transition-gate tests, so the provider transport is never consulted.
+    fn transition_pipeline(root: &Path) -> Pipeline {
+        let config = Config::new(
+            "https://provider.test/v1/chat/completions",
+            "scripted-model",
+            None,
+        );
+        Pipeline::new(&config, "transition-gate scope", root)
+    }
+
+    /// Declare the standard manifest the transition gate selects, with the test
+    /// script the caller controls.
+    fn write_test_manifest(root: &Path, script: &str) {
+        fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{"name":"transition-gate-check","version":"0.1.0","scripts":{{"test":"{script}"}}}}"#
+            ),
+        )
+        .expect("the disposable test manifest is writable");
+    }
+
+    /// Run the named test once in a child copy of this test binary and return
+    /// everything that copy wrote to stdout and stderr.
+    fn transition_gate_transcript(test: &str) -> String {
+        let dir = scratch_dir("transition-gate-transcript");
+        let path = dir.join("transcript.txt");
+        let sink = fs::File::create(&path).expect("the transcript file is creatable");
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the test binary path is known"),
+        )
+        .args([
+            "--exact",
+            &format!("pipeline::tests::{test}"),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(TRANSITION_GATE_CHILD, "1")
+        .stdout(std::process::Stdio::from(
+            sink.try_clone().expect("the transcript file is clonable"),
+        ))
+        .stderr(std::process::Stdio::from(sink))
+        .output()
+        .expect("the child test process starts and is waited for");
+        let transcript = fs::read_to_string(&path).unwrap_or_default();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            output.status.success(),
+            "the child transition-gate attempt failed ({}):\n{transcript}",
+            output.status
+        );
+        transcript
+    }
+
+    /// Core entry-point behavior: a passing transition gate counts exactly one
+    /// measured command, retains its whole-millisecond duration, and leaves the
+    /// existing stdout unchanged -- no timing line is added.
+    #[test]
+    fn when_a_transition_gate_passes_given_a_test_manifest_then_counts_one_command_without_timing_output()
+     {
+        const TEST: &str = "when_a_transition_gate_passes_given_a_test_manifest_then_counts_one_command_without_timing_output";
+
+        if std::env::var_os(TRANSITION_GATE_CHILD).is_some() {
+            // The child performs the real attempt; the harness progress line
+            // needs its own newline before the production transcript starts.
+            println!();
+            let root = scratch_dir("transition-gate-pass");
+            write_test_manifest(&root, "exit 0");
+            let pipeline = transition_pipeline(&root);
+            let mut progress = transition_progress();
+
+            let outcome = pipeline
+                .transition_gate(&mut progress, &root.join("tickets"))
+                .expect("a repository with a passing suite never fails the gate call");
+
+            assert!(
+                matches!(outcome, TransitionGate::Passed),
+                "a zero exit is a passing gate"
+            );
+            assert_eq!(
+                progress.transition_gate_runs, 1,
+                "the passing command is counted exactly once"
+            );
+            assert!(
+                progress.transition_gate_elapsed_ms > 0,
+                "the measured command contributes its whole milliseconds"
+            );
+            assert_eq!(
+                progress.transition_failures, 0,
+                "a pass keeps the consecutive-failure counter at zero"
+            );
+
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let transcript = transition_gate_transcript(TEST);
+        assert!(
+            transcript.contains("=== Transition gate (npm test) ==="),
+            "the existing gate header must survive: {transcript}"
+        );
+        assert!(
+            transcript.contains("[INFO] transition gate `npm test` passed"),
+            "the existing pass message must survive: {transcript}"
+        );
+        assert!(
+            !transcript.contains("elapsed:"),
+            "the gate must emit no timing line: {transcript}"
+        );
+    }
+
+    /// Empty/zero boundary: with no standard test manifest there is no command
+    /// to invoke, so neither the run count nor the elapsed total moves.
+    #[test]
+    fn when_a_transition_gate_is_checked_given_no_test_manifest_then_records_no_command() {
+        let root = scratch_dir("transition-gate-no-manifest");
+        let pipeline = transition_pipeline(&root);
+        let mut progress = transition_progress();
+        progress.transition_failures = 2;
+
+        let outcome = pipeline
+            .transition_gate(&mut progress, &root.join("tickets"))
+            .expect("a missing manifest is not a failure");
+
+        assert!(
+            matches!(outcome, TransitionGate::Passed),
+            "no manifest still passes without running a command"
+        );
+        assert_eq!(
+            progress.transition_gate_runs, 0,
+            "a missing manifest records no command"
+        );
+        assert_eq!(
+            progress.transition_gate_elapsed_ms, 0,
+            "a missing manifest contributes no elapsed time"
+        );
+        assert_eq!(
+            progress.transition_failures, 0,
+            "the existing missing-manifest reset is preserved"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Upper boundary and contract: repeated failures keep accumulating across
+    /// the reset path, and both totals saturate rather than wrapping.
+    #[test]
+    fn when_transition_gate_attempts_accumulate_given_repeated_failures_then_saturates_without_resetting_totals()
+     {
+        let root = scratch_dir("transition-gate-accumulate");
+        let tickets = root.join("tickets");
+        fs::create_dir_all(&tickets).expect("the ticket directory is creatable");
+        write_test_manifest(&root, "printf 'gate-failure\\n'; exit 7");
+        let pipeline = transition_pipeline(&root);
+        let mut progress = transition_progress();
+        let mut previous_elapsed = 0;
+
+        for expected_failures in 1..=2 {
+            let outcome = pipeline
+                .transition_gate(&mut progress, &tickets)
+                .expect("a failed command is reported as a gate outcome");
+            assert!(
+                matches!(outcome, TransitionGate::Queued),
+                "failure {expected_failures} queues a repair ticket"
+            );
+            assert_eq!(progress.transition_failures, expected_failures);
+            assert_eq!(
+                progress.transition_gate_runs, expected_failures as u64,
+                "every failed attempt is one command"
+            );
+            assert!(
+                progress.transition_gate_elapsed_ms >= previous_elapsed,
+                "elapsed time only accumulates"
+            );
+            previous_elapsed = progress.transition_gate_elapsed_ms;
+        }
+
+        let outcome = pipeline
+            .transition_gate(&mut progress, &tickets)
+            .expect("the third failure terminates the gate path");
+        assert!(
+            matches!(outcome, TransitionGate::Terminated(_)),
+            "the consecutive-failure bound still terminates the run"
+        );
+        assert_eq!(progress.transition_failures, 3);
+        assert_eq!(
+            progress.transition_gate_runs, 3,
+            "the termination path retains every attempt"
+        );
+        previous_elapsed = progress.transition_gate_elapsed_ms;
+
+        write_test_manifest(&root, "exit 0");
+        let outcome = pipeline
+            .transition_gate(&mut progress, &tickets)
+            .expect("a repaired suite passes the gate");
+        assert!(matches!(outcome, TransitionGate::Passed));
+        assert_eq!(
+            progress.transition_failures, 0,
+            "a pass resets consecutive failures"
+        );
+        assert_eq!(
+            progress.transition_gate_runs, 4,
+            "the run total survives the failure reset"
+        );
+        assert!(
+            progress.transition_gate_elapsed_ms >= previous_elapsed,
+            "the elapsed total survives the failure reset"
+        );
+
+        progress.transition_gate_runs = u64::MAX - 1;
+        progress.transition_gate_elapsed_ms = u64::MAX - 1;
+        let outcome = pipeline
+            .transition_gate(&mut progress, &tickets)
+            .expect("the saturating attempt still returns its outcome");
+        assert!(matches!(outcome, TransitionGate::Passed));
+        assert_eq!(
+            progress.transition_gate_runs,
+            u64::MAX,
+            "the run count saturates"
+        );
+        assert_eq!(
+            progress.transition_gate_elapsed_ms,
+            u64::MAX,
+            "the elapsed total saturates"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2764,6 +3079,59 @@ mod tests {
         assert_eq!(
             detail,
             "drained without completing every ticket (1-first: gate failed; 2-second: retry exhausted; gate output: ## 3-trap\n\n- Title: Trap\n- Status: failed\nsecond diagnostic)"
+        );
+    }
+
+    /// Core entry-point behavior: one measured queue round over a single ready
+    /// ticket attaches its whole-millisecond attribution to the result while
+    /// reporting exactly the two existing elapsed lines -- the round total
+    /// followed by its residual overhead, once each -- and leaving the result's
+    /// outcome and report untouched.
+    #[test]
+    fn when_a_timed_queue_round_finishes_given_one_ready_ticket_then_returns_attributed_timing_and_preserves_elapsed_output()
+     {
+        let mut contributions = crate::timing::QueueContributions::new();
+        contributions.record_model_attempt(Duration::from_millis(1_500));
+        contributions.record_executed_tool(Duration::from_millis(250));
+        contributions.record_verification_gate(Duration::from_millis(750));
+        let elapsed = Duration::from_millis(3_000);
+        // The result the round produced for its one ready ticket, with the
+        // metrics still at their defaults because no attribution happened yet.
+        let report = "# Ticket queue report\n\n1 ticket: 1 completed, 0 failed, 0 blocked.\n\n## 1-ready\n\n- Title: Ready ticket\n- Status: completed\n- Ended: gate accepted\n- Gate: `true`\n";
+        let round = orchestrator::QueueResult {
+            outcome: orchestrator::Outcome::Resolved,
+            report: report.to_string(),
+            metrics: orchestrator::QueueRoundMetrics::default(),
+        };
+        let mut out = OutputCoordinator::new(RecordingSink::default());
+
+        let result = finish_timed_queue_round(&mut out, 1, &contributions, elapsed, round);
+
+        assert_eq!(
+            result.metrics.timing,
+            crate::timing::QueueTimingBreakdown {
+                total_elapsed_ms: 3_000,
+                model_attempt_ms: 1_500,
+                executed_tool_ms: 250,
+                verification_gate_ms: 750,
+                residual_overhead_ms: 500,
+            },
+            "the round's measured interval and contributors are attributed in whole milliseconds"
+        );
+        assert_eq!(
+            out.sink().stdout,
+            "[INFO] ticket-queue round 1 elapsed: 3.000 seconds\n[INFO] ticket-queue round 1 overhead elapsed: 0.500 seconds\n",
+            "the existing total then overhead lines keep their labels, order and count"
+        );
+        assert!(
+            matches!(result.outcome, orchestrator::Outcome::Resolved),
+            "the round outcome is unchanged: {:?}",
+            result.outcome
+        );
+        assert_eq!(result.report, report, "the round report is unchanged");
+        assert!(
+            result.metrics.tickets.is_empty(),
+            "no ticket execution records are populated by this slice"
         );
     }
 }

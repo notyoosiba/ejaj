@@ -1288,3 +1288,62 @@ fn when_hybrid_first_code_attempt_fails_given_fatal_api_transport_or_malformed_r
         let _ = fs::remove_dir_all(&state);
     }
 }
+
+/// Production routing regression: the ticket lifecycle's initial code attempt
+/// records the configured code-phase role and the one handover retry records
+/// the configured retry code-phase role, observed through the persisted attempt
+/// trajectories and the live provider exchanges.
+#[test]
+fn when_hybrid_code_work_retries_given_configured_code_phase_then_records_initial_and_retry_roles()
+{
+    let state = scratch_dir();
+    fs::create_dir_all(&state).expect("the role state directory is creatable");
+    let failed_once = state.join("first-gate-failed");
+    let gate = format!(
+        "if [ ! -e {state} ]; then : > {state}; printf 'first gate change\n' > first-gate-change.txt; exit 1; else exit 0; fi",
+        state = failed_once.display(),
+    );
+    let tickets = tickets_with_gate(&gate);
+    let replies = vec![
+        common::CodeReply::Complete(None),
+        common::CodeReply::TurnEnd(None),
+    ];
+
+    let configured = priced_config(Mode::Hybrid, Arc::new(common::ScriptedTransport::new()));
+    assert_eq!(
+        configured.provider(Phase::Code).name(),
+        "chat-completions",
+        "the configured code phase is the mid provider"
+    );
+
+    let (step, dir, transport, _repository) = run_hybrid(Mode::Hybrid, replies, tickets);
+    assert!(matches!(&step, Step::Complete), "{step:?}");
+
+    let exchanges = code_exchanges(&transport);
+    assert_eq!(
+        exchanges.len(),
+        2,
+        "exactly the initial attempt and its one handover retry"
+    );
+    assert_eq!(
+        exchanges[0].0,
+        common::test_url(),
+        "the initial attempt keeps the configured code-phase route"
+    );
+    assert_eq!(
+        exchanges[1].0,
+        common::test_giga_url(),
+        "the retry uses the configured retry code-phase route"
+    );
+
+    let first = trajectory(&dir, "code.traj.json");
+    assert_eq!(first["attempt"], serde_json::json!(1));
+    assert_eq!(first["role"], serde_json::json!("mid"));
+    assert_eq!(first["model"], serde_json::json!(common::TEST_MODEL));
+    let retry = trajectory(&dir, "code-1.traj.json");
+    assert_eq!(retry["attempt"], serde_json::json!(2));
+    assert_eq!(retry["role"], serde_json::json!("giga"));
+    assert_eq!(retry["model"], serde_json::json!(common::TEST_GIGA_MODEL));
+
+    let _ = fs::remove_dir_all(&state);
+}

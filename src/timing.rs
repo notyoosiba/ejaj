@@ -101,6 +101,35 @@ where
     value
 }
 
+/// One measured queue round's whole-millisecond timing attribution, in the
+/// shape a metrics artifact serializes.
+///
+/// Every field is a non-negative whole millisecond count: a duration's
+/// fractional millisecond is floored away and a duration whose millisecond
+/// count cannot fit in a `u64` saturates at `u64::MAX` rather than wrapping.
+/// The four category fields are the accumulator's own sums and the residual is
+/// computed from the unrounded contributions, so flooring one category can
+/// never move the unaccounted time into another.
+///
+/// The type is crate-internal and serializable, with every field defaulting to
+/// zero when a payload omits it, so a round that reported no timing still
+/// decodes and a report written before a category existed stays readable. It
+/// reports nothing by itself: the measured queue round owns where the values go.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct QueueTimingBreakdown {
+    /// The measured whole-round interval.
+    pub(crate) total_elapsed_ms: u64,
+    /// The part attributed to completed provider attempts.
+    pub(crate) model_attempt_ms: u64,
+    /// The part attributed to executed command tools.
+    pub(crate) executed_tool_ms: u64,
+    /// The part attributed to verification gates.
+    pub(crate) verification_gate_ms: u64,
+    /// The part of the round attributed to no measured contributor.
+    pub(crate) residual_overhead_ms: u64,
+}
+
 /// Ephemeral accounting of the time one queue round already spent inside a
 /// ticket, split into the categories the queue will report separately.
 ///
@@ -172,6 +201,31 @@ impl QueueContributions {
     pub(crate) fn residual(&self, elapsed: Duration) -> Duration {
         elapsed.saturating_sub(self.total())
     }
+
+    /// Attribute one measured round to its contributors and its residual as
+    /// whole milliseconds.
+    ///
+    /// `total_elapsed` is the interval the queue round actually measured, and
+    /// every category is this accumulator's own sum. The residual is
+    /// `total_elapsed` minus the unrounded contributions, computed before any
+    /// value is floored, so the parts and the residual can never disagree by a
+    /// carried millisecond. A round shorter than its attributed parts reports a
+    /// zero residual, and a count too large for a `u64` saturates.
+    pub(crate) fn breakdown(&self, total_elapsed: Duration) -> QueueTimingBreakdown {
+        QueueTimingBreakdown {
+            total_elapsed_ms: whole_milliseconds(total_elapsed),
+            model_attempt_ms: whole_milliseconds(self.model_attempts),
+            executed_tool_ms: whole_milliseconds(self.executed_tools),
+            verification_gate_ms: whole_milliseconds(self.verification_gates),
+            residual_overhead_ms: whole_milliseconds(self.residual(total_elapsed)),
+        }
+    }
+}
+
+/// One duration as a non-negative whole millisecond count: the fractional
+/// millisecond is floored away and a value beyond `u64::MAX` saturates.
+fn whole_milliseconds(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -443,5 +497,149 @@ mod tests {
         saturated.record_model_attempt(Duration::from_secs(1));
         assert_eq!(saturated.model_attempts(), Duration::MAX);
         assert_eq!(saturated.residual(Duration::MAX), Duration::ZERO);
+    }
+
+    /// Edge-case table for one round's whole-millisecond conversion: no
+    /// contributors and no elapsed time, a round shorter than its attributed
+    /// parts, fractional milliseconds, and durations at and past the `u64`
+    /// millisecond ceiling. Every case floors its fractional part and saturates
+    /// at the ceiling rather than wrapping.
+    #[test]
+    fn when_round_durations_are_converted_given_zero_fractional_and_oversized_values_then_floors_and_saturates()
+     {
+        fn contributions(model: Duration, tool: Duration, gate: Duration) -> QueueContributions {
+            let mut contributions = QueueContributions::new();
+            contributions.record_model_attempt(model);
+            contributions.record_executed_tool(tool);
+            contributions.record_verification_gate(gate);
+            contributions
+        }
+
+        let cases: Vec<(&str, QueueContributions, Duration, QueueTimingBreakdown)> = vec![
+            (
+                "empty contributors and zero elapsed time",
+                QueueContributions::new(),
+                Duration::ZERO,
+                QueueTimingBreakdown {
+                    total_elapsed_ms: 0,
+                    model_attempt_ms: 0,
+                    executed_tool_ms: 0,
+                    verification_gate_ms: 0,
+                    residual_overhead_ms: 0,
+                },
+            ),
+            (
+                "a round shorter than its attributed parts",
+                contributions(
+                    Duration::from_millis(1_500),
+                    Duration::from_millis(250),
+                    Duration::from_millis(750),
+                ),
+                Duration::ZERO,
+                QueueTimingBreakdown {
+                    total_elapsed_ms: 0,
+                    model_attempt_ms: 1_500,
+                    executed_tool_ms: 250,
+                    verification_gate_ms: 750,
+                    residual_overhead_ms: 0,
+                },
+            ),
+            (
+                "fractional milliseconds floor their parts and the residual",
+                contributions(
+                    Duration::from_millis(1_500) + Duration::from_micros(999),
+                    Duration::from_micros(250_500),
+                    Duration::from_millis(750),
+                ),
+                Duration::from_micros(3_500_600),
+                QueueTimingBreakdown {
+                    total_elapsed_ms: 3_500,
+                    model_attempt_ms: 1_500,
+                    executed_tool_ms: 250,
+                    verification_gate_ms: 750,
+                    residual_overhead_ms: 999,
+                },
+            ),
+            (
+                "durations past the millisecond ceiling saturate",
+                contributions(Duration::MAX, Duration::ZERO, Duration::ZERO),
+                Duration::MAX,
+                QueueTimingBreakdown {
+                    total_elapsed_ms: u64::MAX,
+                    model_attempt_ms: u64::MAX,
+                    executed_tool_ms: 0,
+                    verification_gate_ms: 0,
+                    residual_overhead_ms: 0,
+                },
+            ),
+        ];
+
+        for (case, queue, elapsed, expected) in cases {
+            assert_eq!(queue.breakdown(elapsed), expected, "case: {case}");
+        }
+    }
+
+    /// Contract: the wire form of the round breakdown tolerates a payload that
+    /// names only some fields -- or none at all -- because every field defaults
+    /// to zero, and rejects a payload that is not the specified shape.
+    #[test]
+    fn when_timing_breakdown_is_decoded_given_omitted_fields_or_invalid_payload_then_defaults_or_rejects()
+     {
+        let empty: QueueTimingBreakdown =
+            serde_json::from_str("{}").expect("an empty payload decodes to the defaults");
+        assert_eq!(
+            empty.total_elapsed_ms, 0,
+            "an omitted total defaults to zero"
+        );
+        assert_eq!(empty.model_attempt_ms, 0);
+        assert_eq!(empty.executed_tool_ms, 0);
+        assert_eq!(empty.verification_gate_ms, 0);
+        assert_eq!(empty.residual_overhead_ms, 0);
+
+        let partial: QueueTimingBreakdown =
+            serde_json::from_str(r#"{"model_attempt_ms": 1500, "verification_gate_ms": 750}"#)
+                .expect("a payload with omitted fields decodes");
+        assert_eq!(partial.total_elapsed_ms, 0);
+        assert_eq!(partial.model_attempt_ms, 1_500);
+        assert_eq!(partial.executed_tool_ms, 0);
+        assert_eq!(partial.verification_gate_ms, 750);
+        assert_eq!(partial.residual_overhead_ms, 0);
+
+        let complete: QueueTimingBreakdown = serde_json::from_str(
+            r#"{"total_elapsed_ms": 3000, "model_attempt_ms": 1500, "executed_tool_ms": 250, "verification_gate_ms": 750, "residual_overhead_ms": 500}"#,
+        )
+        .expect("a complete payload decodes");
+        assert_eq!(
+            complete,
+            QueueTimingBreakdown {
+                total_elapsed_ms: 3_000,
+                model_attempt_ms: 1_500,
+                executed_tool_ms: 250,
+                verification_gate_ms: 750,
+                residual_overhead_ms: 500,
+            }
+        );
+
+        for (case, payload) in [
+            (
+                "a negative millisecond value",
+                r#"{"total_elapsed_ms": -1}"#,
+            ),
+            (
+                "a stringly typed millisecond value",
+                r#"{"total_elapsed_ms": "3000"}"#,
+            ),
+            (
+                "a fractional millisecond value",
+                r#"{"residual_overhead_ms": 1.5}"#,
+            ),
+            ("a null millisecond value", r#"{"total_elapsed_ms": null}"#),
+            ("a scalar instead of an object", "3000"),
+        ] {
+            assert!(
+                serde_json::from_str::<QueueTimingBreakdown>(payload).is_err(),
+                "the invalid payload must be rejected ({case}): {payload}"
+            );
+        }
     }
 }

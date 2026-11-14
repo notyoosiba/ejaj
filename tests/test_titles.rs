@@ -333,3 +333,73 @@ fn when_renaming_given_summary_body_line_boundary_tests_then_uses_domain_level_t
         assert_no_internal_identifier(title);
     }
 }
+
+/// Regression for the ticket-execution-record coverage: every new metric test
+/// names the caller-visible queue or pipeline behaviour in domain language, so
+/// no lifecycle, recorder, or trait method name leaks into a title.
+#[test]
+fn when_recording_ticket_execution_metrics_given_queue_and_hybrid_tests_then_uses_domain_level_titles()
+ {
+    let queue_titles = test_titles(&source("src/orchestrator.rs"));
+    for expected in [
+        "when_a_queue_round_finishes_given_tickets_in_emitted_order_then_returns_one_record_per_ticket",
+        "when_queue_tickets_are_not_reached_given_status_stop_or_dependency_failure_then_records_pending_or_nearest_blocker",
+        "when_ticket_work_retries_given_first_gate_failure_then_records_roles_and_both_attempts",
+        "when_ticket_metrics_are_serialized_given_each_outcome_and_defaulted_fields_then_uses_stable_tags",
+        "when_ticket_work_stops_given_fatal_or_retryable_agent_outcomes_then_preserves_existing_retry_and_report_behavior",
+    ] {
+        let title = queue_titles
+            .iter()
+            .find(|title| title.as_str() == expected)
+            .unwrap_or_else(|| {
+                panic!("missing caller-intent queue metrics test `{expected}`: {queue_titles:?}")
+            });
+        assert_domain_level_bdd(title);
+        assert_no_internal_identifier(title);
+    }
+
+    let hybrid_titles = test_titles(&source("tests/hybrid_pipeline.rs"));
+    let expected = "when_hybrid_code_work_retries_given_configured_code_phase_then_records_initial_and_retry_roles";
+    let title = hybrid_titles
+        .iter()
+        .find(|title| title.as_str() == expected)
+        .unwrap_or_else(|| {
+            panic!("missing caller-intent hybrid routing test `{expected}`: {hybrid_titles:?}")
+        });
+    assert_domain_level_bdd(title);
+    assert_no_internal_identifier(title);
+}
+
+/// Regression for transition-gate accounting: every new pipeline title names
+/// the caller-visible gate behaviour in domain language, and the pass, missing
+/// manifest, saturation and repair/termination expectations all remain present.
+#[test]
+fn when_accounting_for_transition_gates_given_pipeline_tests_then_uses_domain_level_titles() {
+    let unit_titles = test_titles(&source("src/pipeline.rs"));
+    let integration_titles = test_titles(&source("tests/pipeline.rs"));
+    let mut accounting: Vec<&str> = unit_titles
+        .iter()
+        .chain(integration_titles.iter())
+        .map(String::as_str)
+        .filter(|title| {
+            title.starts_with("when_a_transition_gate_")
+                || title.starts_with("when_transition_gate_attempts_")
+        })
+        .collect();
+    accounting.sort_unstable();
+    let mut expected = vec![
+        "when_a_transition_gate_fails_given_repair_and_termination_paths_then_preserves_existing_control_flow",
+        "when_a_transition_gate_is_checked_given_no_test_manifest_then_records_no_command",
+        "when_a_transition_gate_passes_given_a_test_manifest_then_counts_one_command_without_timing_output",
+        "when_transition_gate_attempts_accumulate_given_repeated_failures_then_saturates_without_resetting_totals",
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        accounting, expected,
+        "the transition-gate accounting titles changed"
+    );
+    for title in accounting {
+        assert_domain_level_bdd(title);
+        assert_no_internal_identifier(title);
+    }
+}

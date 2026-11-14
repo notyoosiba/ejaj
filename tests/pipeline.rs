@@ -14381,6 +14381,160 @@ fn when_transition_gate_fails_once_given_project_test_suite_then_queues_repair_t
     let _ = fs::remove_dir_all(repository.path());
 }
 
+/// Install a counted project test suite whose real command runs an external
+/// shell stand-in. The counter lives in the repository, so the same actual
+/// `npm test` invocation is deterministic for the repair ticket's own
+/// verification gate and for the repository-wide transition gate.
+fn install_counted_suite(repository: &common::TempRepo, fail_odd_invocations: bool) {
+    repository.write(
+        "package.json",
+        r#"{"name":"suite-gate-check","version":"0.1.0","scripts":{"test":"sh suite-gate.sh"}}"#,
+    );
+    let failing_condition = if fail_odd_invocations {
+        "[ $((count % 2)) -eq 1 ]"
+    } else {
+        "[ \"$count\" -eq 1 ]"
+    };
+    let script = format!(
+        r#"count=0
+if [ -f suite-count.txt ]; then count=$(cat suite-count.txt); fi
+count=$((count + 1))
+echo "$count" > suite-count.txt
+if {failing_condition}; then
+  echo "suite gate failed on invocation $count"
+  exit 1
+fi
+echo "suite gate passed on invocation $count"
+"#
+    );
+    repository.write("suite-gate.sh", &script);
+    repository.commit_all("add counted project test suite");
+}
+
+/// One full pipeline run over a disposable repository whose transition gate is
+/// backed by the counted external command. The scripted provider only stands in
+/// for the agent boundary; the suite command and every Git operation are real.
+fn transition_regression_run(
+    fail_odd_invocations: bool,
+    code_replies: usize,
+) -> (
+    Step,
+    common::TempRepo,
+    PathBuf,
+    Arc<common::ScriptedTransport>,
+) {
+    let repository = committed_repository();
+    install_counted_suite(&repository, fail_odd_invocations);
+    let session = repository.path().join(".ejaj/transition-gate-regression");
+    let transport = Arc::new(
+        common::ScriptedTransport::new()
+            .with_review(common::ReviewScript::Pass)
+            .with_code_replies(vec![common::CodeReply::Complete(None); code_replies]),
+    );
+    let config = common::scripted_pipeline_with_transport(transport.clone());
+    let mut pipeline = Pipeline::new(&config, common::scope(), repository.path());
+    let step = pipeline.ask(&common::harmless_plan_request(), &session);
+    (step, repository, session, transport)
+}
+
+/// Regression: a transition-gate failure still queues the repair ticket and
+/// returns to review once the real command passes, and the third consecutive
+/// failure still terminates before review. Neither path gains a timing line.
+#[test]
+fn when_a_transition_gate_fails_given_repair_and_termination_paths_then_preserves_existing_control_flow()
+ {
+    const CHILD: &str = "EJAJ_TRANSITION_GATE_PATHS_CHILD";
+
+    if std::env::var_os(CHILD).is_some() {
+        // The parent asserts this child's production transcript; the child must
+        // still prove both control-flow outcomes and their artifacts.
+        println!();
+
+        let (repair_step, repair_repository, repair_session, repair_transport) =
+            transition_regression_run(false, 2);
+        assert!(
+            matches!(repair_step, Step::Complete),
+            "the repaired suite lets the run complete: {repair_step:?}"
+        );
+        assert!(
+            repair_session
+                .join("tickets/g1-1-fix-full-test-suite.md")
+                .is_file(),
+            "the repair ticket is written before review"
+        );
+        assert_eq!(
+            review_contexts(&repair_transport).len(),
+            1,
+            "the repaired suite reaches review exactly once"
+        );
+        let _ = fs::remove_dir_all(repair_repository.path());
+
+        let (termination_step, termination_repository, termination_session, termination_transport) =
+            transition_regression_run(true, 3);
+        assert!(
+            matches!(termination_step, Step::Retry),
+            "three consecutive transition failures terminate the run: {termination_step:?}"
+        );
+        assert!(
+            termination_session
+                .join("tickets/g1-1-fix-full-test-suite.md")
+                .is_file(),
+            "the first consecutive failure queues a repair ticket"
+        );
+        assert!(
+            termination_session
+                .join("tickets/g2-1-fix-full-test-suite.md")
+                .is_file(),
+            "the second consecutive failure queues a repair ticket"
+        );
+        assert!(
+            !termination_session
+                .join("tickets/g3-1-fix-full-test-suite.md")
+                .exists(),
+            "the terminating failure queues no third repair ticket"
+        );
+        assert_eq!(
+            review_contexts(&termination_transport).len(),
+            0,
+            "the terminating failure stops before review"
+        );
+        let _ = fs::remove_dir_all(termination_repository.path());
+
+        return;
+    }
+
+    let transcript = common::captured_transcript(
+        "when_a_transition_gate_fails_given_repair_and_termination_paths_then_preserves_existing_control_flow",
+        &[(CHILD, "1")],
+    );
+    assert!(
+        transcript.contains(
+            "[WARN] transition gate `npm test` failed after queue round 1; queueing a repair \
+             ticket before review."
+        ),
+        "the first repair warning must survive unchanged: {transcript}"
+    );
+    assert!(
+        transcript.contains("transition gate `npm test` failed after queue round 2; queueing"),
+        "a second consecutive failure still queues its repair: {transcript}"
+    );
+    assert!(
+        transcript.contains("[INFO] transition gate `npm test` passed"),
+        "the repaired run still reports its existing pass line: {transcript}"
+    );
+    assert!(
+        transcript.contains("failed after queue round 3 (")
+            && transcript.contains("); the plan tool must be called again to start a new run."),
+        "the terminating failure keeps its existing warning: {transcript}"
+    );
+    assert!(
+        !transcript
+            .lines()
+            .any(|line| line.contains("transition gate") && line.contains("elapsed")),
+        "the transition gate must emit no timing line: {transcript}"
+    );
+}
+
 // -- Unattended handoff retry ----------------------------------------------
 
 /// Every request one run sent for the pass identified by `marker`.

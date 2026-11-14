@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The model-free scheduler over one ticket set.
 ///
@@ -194,6 +195,23 @@ impl Scheduler {
     }
 }
 
+/// The ticket's recorded downstream chain over the round's opening graph:
+/// one plus the longest still-present transitive dependent path. The path set
+/// keeps a malformed dependency cycle finite instead of recursing forever; a
+/// well-formed graph never repeats a node on one path.
+fn recorded_chain_length(dependents: &[Vec<usize>], index: usize, on_path: &mut [bool]) -> usize {
+    if on_path[index] {
+        return 0;
+    }
+    on_path[index] = true;
+    let mut best = 1;
+    for &dependent in &dependents[index] {
+        best = best.max(1 + recorded_chain_length(dependents, dependent, on_path));
+    }
+    on_path[index] = false;
+    best
+}
+
 /// Why [`run`] returned.
 #[derive(Debug)]
 pub enum Outcome {
@@ -207,6 +225,149 @@ pub enum Outcome {
     /// in flight -- empty when none had started -- and `reason` is the one-line
     /// explanation. Only a failed status write stops the queue this way.
     Stopped { ticket: String, reason: String },
+}
+
+/// How one code-agent attempt ended, in the stable wire vocabulary the metrics
+/// artifact carries.
+///
+/// The variant names are crate-internal; the serialized names are the contract:
+/// exactly `complete`, `turn_end`, `failed_api`, `failed_transport`,
+/// `failed_malformed`, `failed_step_limit` and `failed_context_guard`, so a
+/// reader can key on them without knowing the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AttemptOutcomeTag {
+    /// The attempt declared the ticket complete.
+    Complete,
+    /// The attempt ended its turn without declaring completion.
+    TurnEnd,
+    /// The provider rejected the request with an API failure.
+    FailedApi,
+    /// The provider transport failed before a response arrived.
+    FailedTransport,
+    /// The provider response could not be decoded.
+    FailedMalformed,
+    /// The agent loop stopped at its step limit.
+    FailedStepLimit,
+    /// The agent loop stopped at its context guard.
+    FailedContextGuard,
+}
+
+/// The final status a ticket reached in one queue round, in the stable wire
+/// vocabulary the metrics artifact carries.
+///
+/// The serialized names are exactly `completed`, `failed`, `blocked` and
+/// `pending`. A record that names no status is `pending`: the ticket was
+/// never decided.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TicketStatusTag {
+    /// The ticket completed and its verification gate passed.
+    Completed,
+    /// The ticket failed and is not retried again by this round.
+    Failed,
+    /// The ticket never ran because a blocker failed.
+    Blocked,
+    /// The ticket was still undecided when the queue stopped.
+    #[default]
+    Pending,
+}
+
+/// How a ticket's participation in one queue round ended, in the stable wire
+/// vocabulary the metrics artifact carries.
+///
+/// The serialized names are exactly `declared`, `gate_accepted`,
+/// `retry_exhausted`, `gate_failed`, `agent_failure_api`,
+/// `agent_failure_transport`, `agent_failure_malformed`,
+/// `agent_failure_step_limit`, `agent_failure_context_guard`, `blocked` and
+/// `never_started`. A record that names no ending is `never_started`: no
+/// attempt was made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TicketEndingTag {
+    /// The ticket declared completion.
+    Declared,
+    /// The verification gate accepted the ticket.
+    GateAccepted,
+    /// The ticket's one retry was exhausted.
+    RetryExhausted,
+    /// The verification gate rejected the ticket.
+    GateFailed,
+    /// The agent failed with an API error.
+    AgentFailureApi,
+    /// The agent failed at the transport boundary.
+    AgentFailureTransport,
+    /// The agent failed on a malformed provider response.
+    AgentFailureMalformed,
+    /// The agent stopped at its step limit.
+    AgentFailureStepLimit,
+    /// The agent stopped at its context guard.
+    AgentFailureContextGuard,
+    /// The ticket never ran because a blocker failed.
+    Blocked,
+    /// The queue stopped before the ticket started.
+    #[default]
+    NeverStarted,
+}
+
+/// One ticket's execution record for a queue round, in the stable metric shape
+/// the later ticket-execution-record population fills in.
+///
+/// Every field defaults, so a payload that omits a field still decodes: lists
+/// start empty, counters and durations start at zero, optional fields start
+/// absent, and a record with no status or ending is `pending` and
+/// `never_started`. The duration is a whole millisecond count, floored exactly
+/// like the round-level breakdown.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct TicketExecutionMetrics {
+    /// The ticket's id, as the ticket set emits it.
+    pub(crate) ticket_id: String,
+    /// How many blockers the ticket had when the round began.
+    pub(crate) initial_blocker_count: usize,
+    /// The scheduler's remaining downstream chain length for the ticket.
+    pub(crate) downstream_chain_length: usize,
+    /// How many code-agent attempts the round made for the ticket.
+    pub(crate) attempt_count: u64,
+    /// The provider model that served the first attempt, if one ran.
+    pub(crate) first_attempt_role: Option<String>,
+    /// How the first attempt ended, if one ran.
+    pub(crate) first_attempt_outcome: Option<AttemptOutcomeTag>,
+    /// The provider model that served the retry, if one ran.
+    pub(crate) retry_role: Option<String>,
+    /// Whether the retry moved to a stronger model.
+    pub(crate) retry_escalated: bool,
+    /// How many verification gates the round invoked for the ticket.
+    pub(crate) verification_gate_count: u64,
+    /// The ticket's verification gates in whole milliseconds, floored.
+    pub(crate) verification_gate_elapsed_ms: u64,
+    /// The status the ticket ended the round in.
+    pub(crate) final_status: TicketStatusTag,
+    /// How the ticket's participation in the round ended.
+    pub(crate) ending: TicketEndingTag,
+    /// The blocker whose failure prevented the ticket from running, if any.
+    pub(crate) failed_blocker: Option<String>,
+    /// The code-agent loop telemetry accumulated for the ticket.
+    pub(crate) telemetry: crate::loops::LoopTelemetry,
+}
+
+/// One queue round's metrics payload: the round's whole-millisecond timing and
+/// one execution record per ticket the round scheduled.
+///
+/// A measured queue round attaches its timing attribution here; every path that
+/// runs no timed round -- such as recording an already completed set -- keeps
+/// the default, so a metrics reader never mistakes "not measured" for "measured
+/// as zero". The ticket list is populated by the ticket-execution-record
+/// population and stays empty until then. The payload is crate-internal and
+/// serializable with every field defaulted, so a payload written before a field
+/// existed still decodes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct QueueRoundMetrics {
+    /// The round's whole-millisecond timing attribution.
+    pub(crate) timing: crate::timing::QueueTimingBreakdown,
+    /// One record per ticket the round scheduled, in emitted order.
+    pub(crate) tickets: Vec<TicketExecutionMetrics>,
 }
 
 /// What one queue invocation produced: how it ended, and the end-of-run report
@@ -224,6 +385,9 @@ pub struct QueueResult {
     /// The report markdown handed to [`Lifecycle::report`]: the same bytes the
     /// report file would hold, whether or not that write succeeded.
     pub report: String,
+    /// The round's metrics payload. A measured queue round fills the timing
+    /// attribution; a path that measured no round keeps the default.
+    pub(crate) metrics: QueueRoundMetrics,
 }
 
 /// The narrow seam the queue drives: one code-agent attempt per ticket, its
@@ -234,6 +398,15 @@ pub struct QueueResult {
 /// queue's lifecycle is deterministic without a model, a shell or a live
 /// filesystem.
 trait Lifecycle {
+    /// The provider role serving one code-agent attempt for the ticket.
+    ///
+    /// Attempt 1 is the configured code-phase route and attempt 2 is the
+    /// configured retry route; a lifecycle without configured routing -- such as
+    /// a scripted test double -- keeps the mid role for either attempt.
+    fn attempt_role(&self, _attempt: usize) -> &'static str {
+        "mid"
+    }
+
     /// Hand one ticket to the code agent and report how the turn ended.
     ///
     /// The optional accumulator is forwarded into the production code-agent
@@ -303,6 +476,17 @@ impl Production<'_> {
 }
 
 impl Lifecycle for Production<'_> {
+    fn attempt_role(&self, attempt: usize) -> &'static str {
+        match attempt {
+            1 => self.config.provider_role(crate::tools::Phase::Code),
+            2 => self
+                .config
+                .code_retry_config()
+                .provider_role(crate::tools::Phase::Code),
+            _ => "mid",
+        }
+    }
+
     fn work(
         &mut self,
         ticket: &Ticket,
@@ -466,6 +650,7 @@ pub(crate) fn record_precompleted(
         },
         &[],
         outcome,
+        Vec::new(),
     )
 }
 
@@ -629,6 +814,31 @@ impl Ending {
         matches!(self, Ending::Declared | Ending::GateAccepted)
     }
 
+    /// The stable status tag the execution record carries for this ending.
+    fn status_tag(&self) -> TicketStatusTag {
+        match self {
+            Ending::Declared | Ending::GateAccepted => TicketStatusTag::Completed,
+            Ending::GateFailed(_) | Ending::RetryExhausted(_) | Ending::AgentFailure(_) => {
+                TicketStatusTag::Failed
+            }
+            Ending::Blocked(_) => TicketStatusTag::Blocked,
+            Ending::NeverStarted => TicketStatusTag::Pending,
+        }
+    }
+
+    /// The stable ending tag the execution record carries for this ending.
+    fn ending_tag(&self) -> TicketEndingTag {
+        match self {
+            Ending::Declared => TicketEndingTag::Declared,
+            Ending::GateAccepted => TicketEndingTag::GateAccepted,
+            Ending::RetryExhausted(_) => TicketEndingTag::RetryExhausted,
+            Ending::GateFailed(_) => TicketEndingTag::GateFailed,
+            Ending::AgentFailure(kind) => agent_failure_tag(*kind),
+            Ending::Blocked(_) => TicketEndingTag::Blocked,
+            Ending::NeverStarted => TicketEndingTag::NeverStarted,
+        }
+    }
+
     /// The ticket's status in the report. The snapshot keeps its own four
     /// values; only the report names a blocked ticket as such.
     fn status(&self) -> &'static str {
@@ -739,6 +949,36 @@ fn retries_after_first_stop(kind: FailureKind) -> bool {
     matches!(kind, FailureKind::StepLimit | FailureKind::ContextGuard)
 }
 
+/// The stable ending tag for one fatal or bounded agent-loop failure.
+fn agent_failure_tag(kind: FailureKind) -> TicketEndingTag {
+    match kind {
+        FailureKind::Api => TicketEndingTag::AgentFailureApi,
+        FailureKind::Transport => TicketEndingTag::AgentFailureTransport,
+        FailureKind::Malformed => TicketEndingTag::AgentFailureMalformed,
+        FailureKind::StepLimit => TicketEndingTag::AgentFailureStepLimit,
+        FailureKind::ContextGuard => TicketEndingTag::AgentFailureContextGuard,
+    }
+}
+
+/// The stable outcome tag for one completed code-agent attempt.
+fn attempt_outcome_tag(outcome: code::Outcome) -> AttemptOutcomeTag {
+    match outcome {
+        code::Outcome::Complete => AttemptOutcomeTag::Complete,
+        code::Outcome::TurnEnd => AttemptOutcomeTag::TurnEnd,
+        code::Outcome::Failed(FailureKind::Api) => AttemptOutcomeTag::FailedApi,
+        code::Outcome::Failed(FailureKind::Transport) => AttemptOutcomeTag::FailedTransport,
+        code::Outcome::Failed(FailureKind::Malformed) => AttemptOutcomeTag::FailedMalformed,
+        code::Outcome::Failed(FailureKind::StepLimit) => AttemptOutcomeTag::FailedStepLimit,
+        code::Outcome::Failed(FailureKind::ContextGuard) => AttemptOutcomeTag::FailedContextGuard,
+    }
+}
+
+/// One measured duration as a whole millisecond count, saturating instead of
+/// wrapping when the count cannot fit in a `u64`.
+fn whole_milliseconds(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// One ticket's code-agent attempts: the first call and at most one fresh retry.
 ///
 /// The first verification gate runs only after the first attempt declares
@@ -752,11 +992,16 @@ fn work_with_retry(
     ticket: &Ticket,
     id: &str,
     mut contributions: Option<&mut QueueContributions>,
+    record: &mut TicketExecutionMetrics,
 ) -> Ending {
     let first = lifecycle.work(ticket, None, contributions.as_deref_mut());
+    record.attempt_count = 1;
+    record.first_attempt_role = Some(lifecycle.attempt_role(1).to_string());
+    record.first_attempt_outcome = Some(attempt_outcome_tag(first.outcome));
+    record.telemetry.merge(first.telemetry);
     match first.outcome {
         code::Outcome::Complete => {
-            match invoke_gate(id, contributions.as_deref_mut(), || {
+            match invoke_gate(id, contributions.as_deref_mut(), record, || {
                 lifecycle.verify(ticket)
             }) {
                 Ok(()) => Ending::Declared,
@@ -774,6 +1019,7 @@ fn work_with_retry(
                         "task_complete, but the first verification gate failed",
                         Some(&output),
                         contributions,
+                        record,
                     )
                 }
             }
@@ -791,6 +1037,7 @@ fn work_with_retry(
                 "turn end without task_complete",
                 None,
                 contributions,
+                record,
             )
         }
         code::Outcome::Failed(kind) if retries_after_first_stop(kind) => {
@@ -807,6 +1054,7 @@ fn work_with_retry(
                 &format!("agent loop stopped: {}", kind.label()),
                 None,
                 contributions,
+                record,
             )
         }
         code::Outcome::Failed(kind) => Ending::AgentFailure(kind),
@@ -828,6 +1076,7 @@ fn retry_once(
     stop_reason: &str,
     first_gate_output: Option<&str>,
     mut contributions: Option<&mut QueueContributions>,
+    record: &mut TicketExecutionMetrics,
 ) -> Ending {
     let diff = lifecycle.work_tree_diff();
     let handover = render_retry_handover(
@@ -838,7 +1087,13 @@ fn retry_once(
         diff.as_deref().map_err(String::as_str),
     );
     let second = lifecycle.work(ticket, Some(&handover), contributions.as_deref_mut());
-    match invoke_gate(id, contributions, || lifecycle.verify(ticket)) {
+    record.attempt_count = 2;
+    let retry_role = lifecycle.attempt_role(2);
+    record.retry_escalated =
+        record.first_attempt_role.as_deref() == Some("mid") && retry_role == "giga";
+    record.retry_role = Some(retry_role.to_string());
+    record.telemetry.merge(second.telemetry);
+    match invoke_gate(id, contributions, record, || lifecycle.verify(ticket)) {
         Ok(()) => match second.outcome {
             code::Outcome::Complete => Ending::Declared,
             _ => Ending::GateAccepted,
@@ -962,7 +1217,12 @@ fn finish(
     set: &TicketSet,
     endings: &[Ending],
     outcome: Outcome,
+    mut tickets: Vec<TicketExecutionMetrics>,
 ) -> QueueResult {
+    for (record, ending) in tickets.iter_mut().zip(endings) {
+        record.final_status = ending.status_tag();
+        record.ending = ending.ending_tag();
+    }
     let mut combined_tickets = Vec::with_capacity(prior_completed.len() + set.tickets.len());
     combined_tickets.extend_from_slice(prior_completed);
     combined_tickets.extend_from_slice(&set.tickets);
@@ -1014,6 +1274,10 @@ fn finish(
     QueueResult {
         outcome,
         report: markdown,
+        metrics: QueueRoundMetrics {
+            timing: Default::default(),
+            tickets,
+        },
     }
 }
 
@@ -1029,11 +1293,16 @@ fn finish(
 fn invoke_gate(
     ticket_id: &str,
     contributions: Option<&mut QueueContributions>,
+    record: &mut TicketExecutionMetrics,
     verify: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     let (result, elapsed) = crate::timing::measured(verify);
     let label = format!("ticket {ticket_id} verification gate");
     let _ = crate::status::shared().elapsed_log(&label, elapsed);
+    record.verification_gate_count = record.verification_gate_count.saturating_add(1);
+    record.verification_gate_elapsed_ms = record
+        .verification_gate_elapsed_ms
+        .saturating_add(whole_milliseconds(elapsed));
     if let Some(contributions) = contributions {
         contributions.record_verification_gate(elapsed);
     }
@@ -1071,6 +1340,23 @@ fn run_queue_with_prior_contributions(
     mut contributions: Option<&mut QueueContributions>,
 ) -> QueueResult {
     let mut scheduler = Scheduler::new(set);
+    // The round's opening graph, captured before any ticket settles, so every
+    // record describes the dependencies the round began with. Records stay in
+    // emitted order; the scheduler's execution order is independent of it.
+    let mut records: Vec<TicketExecutionMetrics> = set
+        .tickets
+        .iter()
+        .enumerate()
+        .map(|(index, ticket)| TicketExecutionMetrics {
+            ticket_id: ticket.id.trim().to_string(),
+            initial_blocker_count: ticket.blocked_by.len(),
+            downstream_chain_length: {
+                let mut on_path = vec![false; set.tickets.len()];
+                recorded_chain_length(&scheduler.dependents, index, &mut on_path)
+            },
+            ..TicketExecutionMetrics::default()
+        })
+        .collect();
     let mut snapshot = QueueSnapshot::new(
         prior_completed
             .iter()
@@ -1090,6 +1376,7 @@ fn run_queue_with_prior_contributions(
             set,
             &endings,
             stopped_on_persistence(String::new(), &error),
+            records,
         );
     }
 
@@ -1116,7 +1403,8 @@ fn run_queue_with_prior_contributions(
                 prior_completed,
                 set,
                 &endings,
-                stopped_on_persistence(id, &error),
+                stopped_on_persistence(id.clone(), &error),
+                records,
             );
         }
 
@@ -1124,7 +1412,13 @@ fn run_queue_with_prior_contributions(
         // earns one fresh retry; the final gate is authoritative after the
         // second attempt. The ticket's work and every gate invocation are
         // measured into the caller's accumulator exactly once each.
-        let ending = work_with_retry(lifecycle, ticket, &id, contributions.as_deref_mut());
+        let ending = work_with_retry(
+            lifecycle,
+            ticket,
+            &id,
+            contributions.as_deref_mut(),
+            &mut records[index],
+        );
 
         // The ending is recorded before the status write, so the report stays
         // truthful even when that write is what fails.
@@ -1144,7 +1438,8 @@ fn run_queue_with_prior_contributions(
                 prior_completed,
                 set,
                 &endings,
-                stopped_on_persistence(id, &error),
+                stopped_on_persistence(id.clone(), &error),
+                records,
             );
         }
         if completed {
@@ -1160,7 +1455,9 @@ fn run_queue_with_prior_contributions(
     // failure that stopped it.
     for (index, ending) in endings.iter_mut().enumerate() {
         if matches!(ending, Ending::NeverStarted) {
-            *ending = Ending::Blocked(match scheduler.failed_ancestor(index) {
+            let blocker = scheduler.failed_ancestor(index).map(str::to_string);
+            records[index].failed_blocker = blocker.clone();
+            *ending = Ending::Blocked(match blocker {
                 Some(blocker) => format!("{blocker} (failed)"),
                 None => "an unresolved dependency".to_string(),
             });
@@ -1174,7 +1471,7 @@ fn run_queue_with_prior_contributions(
     } else {
         Outcome::Incomplete
     };
-    finish(lifecycle, prior_completed, set, &endings, outcome)
+    finish(lifecycle, prior_completed, set, &endings, outcome, records)
 }
 
 /// Every status-write stop reason starts with this phrase, so the queue-stop
@@ -1286,6 +1583,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::process::{Command, Stdio};
+    use std::time::Duration;
 
     /// A ticket set built from `(id, blocked_by)` pairs; every other field is
     /// irrelevant to the scheduler.
@@ -1708,6 +2006,299 @@ mod tests {
              Repository working-tree diff (staged, unstaged, and non-ignored untracked changes; .ejaj/ excluded):\nscripted diff body\n"
         );
     }
+
+    /// Regression: a round whose measured contributors already exceed its total
+    /// reports zero residual overhead rather than a negative one, and the path
+    /// that runs no timed round at all -- recording an already completed set --
+    /// keeps the default metrics while its outcome and report stay unchanged.
+    #[test]
+    fn when_queue_time_is_attributed_given_contributors_exceed_total_then_reports_zero_overhead() {
+        let mut contributions = QueueContributions::new();
+        contributions.record_model_attempt(Duration::from_millis(1_500));
+        contributions.record_executed_tool(Duration::from_millis(750));
+        contributions.record_verification_gate(Duration::from_millis(250));
+
+        let timing = contributions.breakdown(Duration::from_millis(500));
+        assert_eq!(timing.total_elapsed_ms, 500);
+        assert_eq!(timing.model_attempt_ms, 1_500);
+        assert_eq!(timing.executed_tool_ms, 750);
+        assert_eq!(timing.verification_gate_ms, 250);
+        assert_eq!(
+            timing.residual_overhead_ms, 0,
+            "attributed time beyond the measured round reports no negative overhead"
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("ejaj-precompleted-metrics-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("the precompleted test directory is creatable");
+        let result = record_precompleted(
+            &set(&[("1-done", &[])]).tickets,
+            &dir.join("queue.json"),
+            &dir.join("queue-report.md"),
+        );
+
+        assert!(
+            matches!(result.outcome, Outcome::Resolved),
+            "recording prior completions still resolves the queue: {:?}",
+            result.outcome
+        );
+        assert_eq!(
+            result.report,
+            "# Ticket queue report\n\n1 ticket: 1 completed, 0 failed, 0 blocked.\n\n## 1-done\n\n- Title: 1-done\n- Status: completed\n- Ended: declared\n- Gate: `cargo check`\n"
+        );
+        assert_eq!(result.metrics.timing.total_elapsed_ms, 0);
+        assert_eq!(result.metrics.timing.model_attempt_ms, 0);
+        assert_eq!(result.metrics.timing.executed_tool_ms, 0);
+        assert_eq!(result.metrics.timing.verification_gate_ms, 0);
+        assert_eq!(result.metrics.timing.residual_overhead_ms, 0);
+        assert!(
+            result.metrics.tickets.is_empty(),
+            "an untimed path records no ticket execution metrics"
+        );
+
+        fs::remove_dir_all(&dir).expect("the temp directory is removable");
+    }
+
+    /// Contract: the foundational metric tags serialize to the stable
+    /// snake-case strings a metrics artifact carries, decode back to exactly the
+    /// same tag, and reject any value outside the declared vocabulary.
+    #[test]
+    fn when_metric_tags_are_serialized_given_each_queue_status_and_ending_then_uses_stable_snake_case_values()
+     {
+        let attempt_outcomes = [
+            (AttemptOutcomeTag::Complete, "complete"),
+            (AttemptOutcomeTag::TurnEnd, "turn_end"),
+            (AttemptOutcomeTag::FailedApi, "failed_api"),
+            (AttemptOutcomeTag::FailedTransport, "failed_transport"),
+            (AttemptOutcomeTag::FailedMalformed, "failed_malformed"),
+            (AttemptOutcomeTag::FailedStepLimit, "failed_step_limit"),
+            (
+                AttemptOutcomeTag::FailedContextGuard,
+                "failed_context_guard",
+            ),
+        ];
+        for (tag, expected) in attempt_outcomes {
+            let encoded = serde_json::to_string(&tag).expect("an attempt outcome tag serializes");
+            assert_eq!(
+                encoded,
+                format!("\"{expected}\""),
+                "attempt outcome tag {tag:?}"
+            );
+            assert_eq!(
+                serde_json::from_str::<AttemptOutcomeTag>(&encoded)
+                    .expect("the serialized attempt outcome tag decodes"),
+                tag
+            );
+        }
+
+        let statuses = [
+            (TicketStatusTag::Completed, "completed"),
+            (TicketStatusTag::Failed, "failed"),
+            (TicketStatusTag::Blocked, "blocked"),
+            (TicketStatusTag::Pending, "pending"),
+        ];
+        for (tag, expected) in statuses {
+            let encoded = serde_json::to_string(&tag).expect("a status tag serializes");
+            assert_eq!(encoded, format!("\"{expected}\""), "status tag {tag:?}");
+            assert_eq!(
+                serde_json::from_str::<TicketStatusTag>(&encoded)
+                    .expect("the serialized status tag decodes"),
+                tag
+            );
+        }
+
+        let endings = [
+            (TicketEndingTag::Declared, "declared"),
+            (TicketEndingTag::GateAccepted, "gate_accepted"),
+            (TicketEndingTag::RetryExhausted, "retry_exhausted"),
+            (TicketEndingTag::GateFailed, "gate_failed"),
+            (TicketEndingTag::AgentFailureApi, "agent_failure_api"),
+            (
+                TicketEndingTag::AgentFailureTransport,
+                "agent_failure_transport",
+            ),
+            (
+                TicketEndingTag::AgentFailureMalformed,
+                "agent_failure_malformed",
+            ),
+            (
+                TicketEndingTag::AgentFailureStepLimit,
+                "agent_failure_step_limit",
+            ),
+            (
+                TicketEndingTag::AgentFailureContextGuard,
+                "agent_failure_context_guard",
+            ),
+            (TicketEndingTag::Blocked, "blocked"),
+            (TicketEndingTag::NeverStarted, "never_started"),
+        ];
+        for (tag, expected) in endings {
+            let encoded = serde_json::to_string(&tag).expect("an ending tag serializes");
+            assert_eq!(encoded, format!("\"{expected}\""), "ending tag {tag:?}");
+            assert_eq!(
+                serde_json::from_str::<TicketEndingTag>(&encoded)
+                    .expect("the serialized ending tag decodes"),
+                tag
+            );
+        }
+
+        for (case, payload) in [
+            ("an attempt outcome outside the vocabulary", "\"failed\""),
+            ("a capitalised attempt outcome", "\"Complete\""),
+            ("an attempt outcome that is not a string", "1"),
+        ] {
+            assert!(
+                serde_json::from_str::<AttemptOutcomeTag>(payload).is_err(),
+                "an invalid attempt outcome must be rejected ({case}): {payload}"
+            );
+        }
+        for (case, payload) in [
+            ("a status outside the vocabulary", "\"in_progress\""),
+            ("a capitalised status", "\"Completed\""),
+            ("a status that is not a string", "1"),
+        ] {
+            assert!(
+                serde_json::from_str::<TicketStatusTag>(payload).is_err(),
+                "an invalid status must be rejected ({case}): {payload}"
+            );
+        }
+        for (case, payload) in [
+            ("an ending outside the vocabulary", "\"retrying\""),
+            ("a capitalised ending", "\"GateFailed\""),
+            ("an ending that is not a string", "1"),
+        ] {
+            assert!(
+                serde_json::from_str::<TicketEndingTag>(payload).is_err(),
+                "an invalid ending must be rejected ({case}): {payload}"
+            );
+        }
+    }
+
+    /// Contract: a ticket execution record whose payload omits every field
+    /// decodes to the documented defaults -- pending and never started -- and a
+    /// payload that names some fields keeps the omitted ones defaulted.
+    #[test]
+    fn when_ticket_metrics_are_decoded_given_omitted_fields_then_uses_pending_status_and_never_started_ending()
+     {
+        let decoded: TicketExecutionMetrics =
+            serde_json::from_str("{}").expect("an empty ticket record decodes to the defaults");
+        assert_eq!(decoded.ticket_id, "");
+        assert_eq!(decoded.initial_blocker_count, 0);
+        assert_eq!(decoded.downstream_chain_length, 0);
+        assert_eq!(decoded.attempt_count, 0);
+        assert_eq!(decoded.first_attempt_role, None);
+        assert_eq!(decoded.first_attempt_outcome, None);
+        assert_eq!(decoded.retry_role, None);
+        assert!(!decoded.retry_escalated);
+        assert_eq!(decoded.verification_gate_count, 0);
+        assert_eq!(decoded.verification_gate_elapsed_ms, 0);
+        assert_eq!(decoded.final_status, TicketStatusTag::Pending);
+        assert_eq!(decoded.ending, TicketEndingTag::NeverStarted);
+        assert_eq!(decoded.failed_blocker, None);
+        assert_eq!(decoded.telemetry.elapsed_ms, 0);
+
+        let decoded: TicketExecutionMetrics = serde_json::from_str(
+            r#"{"ticket_id": "1-ready", "initial_blocker_count": 2, "attempt_count": 2, "first_attempt_outcome": "turn_end", "final_status": "blocked", "ending": "blocked"}"#,
+        )
+        .expect("a partially populated ticket record decodes");
+        assert_eq!(decoded.ticket_id, "1-ready");
+        assert_eq!(decoded.initial_blocker_count, 2);
+        assert_eq!(decoded.attempt_count, 2);
+        assert_eq!(
+            decoded.first_attempt_outcome,
+            Some(AttemptOutcomeTag::TurnEnd)
+        );
+        assert_eq!(decoded.final_status, TicketStatusTag::Blocked);
+        assert_eq!(decoded.ending, TicketEndingTag::Blocked);
+        assert_eq!(
+            decoded.first_attempt_role, None,
+            "the omitted role keeps its default"
+        );
+    }
+
+    /// Contract and boundary: the complete ticket record serializes every
+    /// outcome with its stable tag, rejects a malformed tag, defaults every
+    /// omitted field, and preserves saturated telemetry and gate accounting.
+    #[test]
+    fn when_ticket_metrics_are_serialized_given_each_outcome_and_defaulted_fields_then_uses_stable_tags()
+     {
+        for (tag, expected) in [
+            (AttemptOutcomeTag::Complete, "complete"),
+            (AttemptOutcomeTag::TurnEnd, "turn_end"),
+            (AttemptOutcomeTag::FailedApi, "failed_api"),
+            (AttemptOutcomeTag::FailedTransport, "failed_transport"),
+            (AttemptOutcomeTag::FailedMalformed, "failed_malformed"),
+            (AttemptOutcomeTag::FailedStepLimit, "failed_step_limit"),
+            (
+                AttemptOutcomeTag::FailedContextGuard,
+                "failed_context_guard",
+            ),
+        ] {
+            let encoded = serde_json::to_value(tag).expect("an attempt outcome serializes");
+            assert_eq!(encoded, serde_json::json!(expected), "outcome {tag:?}");
+        }
+        for malformed in [serde_json::json!("failed"), serde_json::json!(7)] {
+            assert!(
+                serde_json::from_value::<AttemptOutcomeTag>(malformed.clone()).is_err(),
+                "a malformed attempt outcome is rejected: {malformed}"
+            );
+        }
+
+        let saturated = TicketExecutionMetrics {
+            ticket_id: "1-saturated".to_string(),
+            initial_blocker_count: 2,
+            downstream_chain_length: 3,
+            attempt_count: 2,
+            first_attempt_role: Some("mid".to_string()),
+            first_attempt_outcome: Some(AttemptOutcomeTag::TurnEnd),
+            retry_role: Some("giga".to_string()),
+            retry_escalated: true,
+            verification_gate_count: 2,
+            verification_gate_elapsed_ms: u64::MAX,
+            final_status: TicketStatusTag::Completed,
+            ending: TicketEndingTag::GateAccepted,
+            failed_blocker: None,
+            telemetry: crate::loops::LoopTelemetry {
+                elapsed_ms: u64::MAX,
+                ..Default::default()
+            },
+        };
+        let encoded = serde_json::to_value(&saturated).expect("the record serializes");
+        assert_eq!(
+            encoded["first_attempt_outcome"],
+            serde_json::json!("turn_end")
+        );
+        assert_eq!(encoded["final_status"], serde_json::json!("completed"));
+        assert_eq!(encoded["ending"], serde_json::json!("gate_accepted"));
+        assert_eq!(encoded["retry_escalated"], serde_json::json!(true));
+        assert_eq!(
+            encoded["verification_gate_elapsed_ms"],
+            serde_json::json!(u64::MAX)
+        );
+        assert_eq!(
+            encoded["telemetry"]["elapsed_ms"],
+            serde_json::json!(u64::MAX)
+        );
+        let decoded: TicketExecutionMetrics =
+            serde_json::from_value(encoded).expect("the saturated record decodes");
+        assert_eq!(decoded, saturated);
+
+        let defaults: TicketExecutionMetrics =
+            serde_json::from_str("{}").expect("an empty record decodes");
+        assert_eq!(defaults.final_status, TicketStatusTag::Pending);
+        assert_eq!(defaults.ending, TicketEndingTag::NeverStarted);
+        assert_eq!(defaults.first_attempt_role, None);
+        assert_eq!(defaults.retry_role, None);
+        assert!(!defaults.retry_escalated);
+        assert_eq!(defaults.verification_gate_elapsed_ms, 0);
+        assert_eq!(defaults.telemetry.elapsed_ms, 0);
+        let encoded = serde_json::to_value(TicketExecutionMetrics::default())
+            .expect("the default record serializes");
+        assert_eq!(encoded["final_status"], serde_json::json!("pending"));
+        assert_eq!(encoded["ending"], serde_json::json!("never_started"));
+        assert_eq!(encoded["first_attempt_outcome"], serde_json::Value::Null);
+        assert_eq!(encoded["failed_blocker"], serde_json::Value::Null);
+    }
 }
 
 #[cfg(test)]
@@ -1860,6 +2451,7 @@ mod snapshot_tests {
 mod lifecycle_tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::time::Duration;
 
     /// A scripted [`Lifecycle`]: the code-agent and gate outcomes are queued in
     /// advance, and one chosen persistence attempt fails. The snapshots it
@@ -1883,6 +2475,10 @@ mod lifecycle_tests {
         /// The repository diff handed to the retry handover.
         diff: Result<String, String>,
         diff_calls: usize,
+        /// The role each attempt reports: first attempt then retry.
+        roles: (&'static str, &'static str),
+        /// How long each scripted gate spends before it returns.
+        gate_pause: Duration,
     }
 
     impl Script {
@@ -1904,12 +2500,26 @@ mod lifecycle_tests {
                 handovers: Vec::new(),
                 diff: Ok(String::new()),
                 diff_calls: 0,
+                roles: ("mid", "mid"),
+                gate_pause: Duration::ZERO,
             }
         }
 
         /// Serve the given working-tree diff to the retry handover.
         fn with_diff(mut self, diff: Result<String, String>) -> Script {
             self.diff = diff;
+            self
+        }
+
+        /// Report the given first-attempt and retry roles.
+        fn with_roles(mut self, first: &'static str, retry: &'static str) -> Script {
+            self.roles = (first, retry);
+            self
+        }
+
+        /// Make every scripted gate spend the given pause before returning.
+        fn with_gate_pause(mut self, pause: Duration) -> Script {
+            self.gate_pause = pause;
             self
         }
 
@@ -1944,6 +2554,14 @@ mod lifecycle_tests {
     }
 
     impl Lifecycle for Script {
+        fn attempt_role(&self, attempt: usize) -> &'static str {
+            if attempt == 1 {
+                self.roles.0
+            } else {
+                self.roles.1
+            }
+        }
+
         fn work(
             &mut self,
             ticket: &Ticket,
@@ -1959,6 +2577,9 @@ mod lifecycle_tests {
 
         fn verify(&mut self, ticket: &Ticket) -> Result<(), String> {
             self.verified.push(ticket.id.clone());
+            if !self.gate_pause.is_zero() {
+                std::thread::sleep(self.gate_pause);
+            }
             self.verify
                 .pop_front()
                 .expect("the script has a verification-gate result")
@@ -3089,6 +3710,378 @@ mod lifecycle_tests {
             !result.report.contains("FIRST-GATE-OUTPUT"),
             "{}",
             result.report
+        );
+    }
+
+    /// Core entry-point behavior: one round emits exactly one execution record
+    /// per current ticket, in the emitted set order rather than the scheduling
+    /// order, and preserves the legacy outcome and report byte for byte.
+    #[test]
+    fn when_a_queue_round_finishes_given_tickets_in_emitted_order_then_returns_one_record_per_ticket()
+     {
+        // 1-short is emitted first but scheduled third: after 2-root completes,
+        // 3-mid still has the longer chain and runs before the tie.
+        let set = super::tests::set(&[
+            ("1-short", &[]),
+            ("2-root", &[]),
+            ("3-mid", &["2-root"]),
+            ("4-end", &["3-mid"]),
+        ]);
+        let mut lifecycle = Script::new(
+            vec![
+                code::Outcome::Complete,
+                code::Outcome::Complete,
+                code::Outcome::Complete,
+                code::Outcome::Complete,
+            ],
+            vec![Ok(()), Ok(()), Ok(()), Ok(())],
+        );
+
+        let result = run_queue(&mut lifecycle, &set);
+
+        resolved(&result);
+        assert_eq!(
+            lifecycle.worked,
+            ["2-root", "3-mid", "1-short", "4-end"],
+            "the scheduler keeps its existing execution order"
+        );
+        let records: Vec<(&str, usize, usize)> = result
+            .metrics
+            .tickets
+            .iter()
+            .map(|record| {
+                (
+                    record.ticket_id.as_str(),
+                    record.initial_blocker_count,
+                    record.downstream_chain_length,
+                )
+            })
+            .collect();
+        assert_eq!(
+            records,
+            [
+                ("1-short", 0, 1),
+                ("2-root", 0, 3),
+                ("3-mid", 1, 2),
+                ("4-end", 1, 1),
+            ],
+            "one record per ticket, in emitted order, with the round's opening graph"
+        );
+        for record in &result.metrics.tickets {
+            assert_eq!(record.final_status, TicketStatusTag::Completed);
+            assert_eq!(record.ending, TicketEndingTag::Declared);
+        }
+        assert_eq!(
+            result.report,
+            "# Ticket queue report\n\n4 tickets: 4 completed, 0 failed, 0 blocked.\n\n## 1-short\n\n- Title: 1-short\n- Status: completed\n- Ended: declared\n- Gate: `cargo check`\n\n## 2-root\n\n- Title: 2-root\n- Status: completed\n- Ended: declared\n- Gate: `cargo check`\n\n## 3-mid\n\n- Title: 3-mid\n- Status: completed\n- Ended: declared\n- Gate: `cargo check`\n\n## 4-end\n\n- Title: 4-end\n- Status: completed\n- Ended: declared\n- Gate: `cargo check`\n"
+        );
+    }
+
+    /// Edge-case table: every ticket the queue never starts carries the full
+    /// no-attempt defaults; a status stop keeps them pending/never started,
+    /// while a drained dependency failure marks them blocked with the trimmed
+    /// nearest failed ancestor.
+    #[test]
+    fn when_queue_tickets_are_not_reached_given_status_stop_or_dependency_failure_then_records_pending_or_nearest_blocker()
+     {
+        // A status-write stop before scheduling leaves every ticket unreached.
+        let stopped_set = super::tests::set(&[("1-first", &[]), ("2-second", &["1-first"])]);
+        let mut stopping = Script::new(Vec::new(), Vec::new()).failing_at(0);
+        let result = run_queue(&mut stopping, &stopped_set);
+        let (ticket, _) = stopped(&result);
+        assert_eq!(ticket, "", "the status stop names no ticket in flight");
+        assert_eq!(result.metrics.tickets.len(), 2);
+        for record in &result.metrics.tickets {
+            assert_eq!(record.attempt_count, 0);
+            assert_eq!(record.first_attempt_role, None);
+            assert_eq!(record.first_attempt_outcome, None);
+            assert_eq!(record.retry_role, None);
+            assert!(!record.retry_escalated);
+            assert_eq!(record.verification_gate_count, 0);
+            assert_eq!(record.verification_gate_elapsed_ms, 0);
+            assert_eq!(record.telemetry, crate::loops::LoopTelemetry::default());
+            assert_eq!(record.final_status, TicketStatusTag::Pending);
+            assert_eq!(record.ending, TicketEndingTag::NeverStarted);
+            assert_eq!(record.failed_blocker, None);
+        }
+
+        // The drained dependency failure: the root fails, the independent
+        // branch still runs, and both dependents are blocked by the trimmed id.
+        let set = super::tests::set(&[
+            (" 1-root ", &[]),
+            ("2-mid", &["1-root"]),
+            ("3-end", &["2-mid"]),
+            ("4-independent", &[]),
+        ]);
+        let mut lifecycle = Script::new(
+            vec![
+                code::Outcome::Failed(FailureKind::Api),
+                code::Outcome::Complete,
+            ],
+            vec![Ok(())],
+        );
+        let result = run_queue(&mut lifecycle, &set);
+        incomplete(&result);
+        assert_eq!(lifecycle.worked, [" 1-root ", "4-independent"]);
+
+        let blocked: Vec<(&str, usize, u64, Option<&str>)> = result
+            .metrics
+            .tickets
+            .iter()
+            .skip(1)
+            .take(2)
+            .map(|record| {
+                (
+                    record.ticket_id.as_str(),
+                    record.initial_blocker_count,
+                    record.attempt_count,
+                    record.failed_blocker.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            blocked,
+            [
+                ("2-mid", 1, 0, Some("1-root")),
+                ("3-end", 1, 0, Some("1-root")),
+            ],
+            "both unresolved tickets name the nearest failed ancestor once"
+        );
+        for record in &result.metrics.tickets[1..=2] {
+            assert_eq!(record.final_status, TicketStatusTag::Blocked);
+            assert_eq!(record.ending, TicketEndingTag::Blocked);
+            assert_eq!(record.first_attempt_role, None);
+            assert_eq!(record.first_attempt_outcome, None);
+            assert_eq!(record.retry_role, None);
+            assert!(!record.retry_escalated);
+            assert_eq!(record.verification_gate_count, 0);
+            assert_eq!(record.verification_gate_elapsed_ms, 0);
+            assert_eq!(record.telemetry, crate::loops::LoopTelemetry::default());
+        }
+        assert_eq!(
+            result.metrics.tickets[0].final_status,
+            TicketStatusTag::Failed
+        );
+        assert_eq!(
+            result.metrics.tickets[0].ending,
+            TicketEndingTag::AgentFailureApi
+        );
+        assert_eq!(result.metrics.tickets[0].failed_blocker, None);
+        assert_eq!(
+            result.metrics.tickets[3].final_status,
+            TicketStatusTag::Completed
+        );
+        assert_eq!(result.metrics.tickets[3].ending, TicketEndingTag::Declared);
+    }
+
+    /// Edge-case table: a first-attempt gate failure buys the one retry, so the
+    /// record carries both attempts, both gate invocations -- the failed one
+    /// included -- and the saturating merge of both attempts' telemetry. The
+    /// default role resolution keeps the retry on mid; an overriding lifecycle
+    /// can escalate it to giga.
+    #[test]
+    fn when_ticket_work_retries_given_first_gate_failure_then_records_roles_and_both_attempts() {
+        const GATE_PAUSE: Duration = Duration::from_millis(10);
+        let first = crate::loops::LoopTelemetry {
+            elapsed_ms: u64::MAX - 5,
+            provider_send_attempts: 2,
+            peak_context_bytes: 100,
+            ..Default::default()
+        };
+        let retry = crate::loops::LoopTelemetry {
+            elapsed_ms: 10,
+            provider_send_attempts: 1,
+            peak_context_bytes: 300,
+            ..Default::default()
+        };
+
+        let mut lifecycle = Script::with_attempts(
+            vec![
+                code::Attempt {
+                    outcome: code::Outcome::Complete,
+                    narration: None,
+                    tool_activity: None,
+                    telemetry: first,
+                },
+                code::Attempt {
+                    outcome: code::Outcome::TurnEnd,
+                    narration: None,
+                    tool_activity: None,
+                    telemetry: retry,
+                },
+            ],
+            vec![Err("FIRST-GATE-FAILED".to_string()), Ok(())],
+        )
+        .with_gate_pause(GATE_PAUSE);
+        let result = run_queue(&mut lifecycle, &one());
+        resolved(&result);
+        let record = &result.metrics.tickets[0];
+        assert_eq!(record.attempt_count, 2);
+        assert_eq!(record.first_attempt_role.as_deref(), Some("mid"));
+        assert_eq!(
+            record.first_attempt_outcome,
+            Some(AttemptOutcomeTag::Complete)
+        );
+        assert_eq!(record.retry_role.as_deref(), Some("mid"));
+        assert!(!record.retry_escalated);
+        assert_eq!(record.verification_gate_count, 2);
+        assert!(
+            record.verification_gate_elapsed_ms >= 20,
+            "both gates, including the failed first one, contribute their elapsed milliseconds: {}",
+            record.verification_gate_elapsed_ms
+        );
+        assert_eq!(
+            record.telemetry.elapsed_ms,
+            u64::MAX,
+            "the two attempts' elapsed milliseconds merge saturatingly"
+        );
+        assert_eq!(record.telemetry.provider_send_attempts, 3);
+        assert_eq!(record.telemetry.peak_context_bytes, 300);
+        assert_eq!(record.final_status, TicketStatusTag::Completed);
+        assert_eq!(record.ending, TicketEndingTag::GateAccepted);
+
+        let mut escalating = Script::new(
+            vec![code::Outcome::Complete, code::Outcome::Complete],
+            vec![Err("FIRST-GATE-FAILED".to_string()), Ok(())],
+        )
+        .with_roles("mid", "giga");
+        let result = run_queue(&mut escalating, &one());
+        resolved(&result);
+        let record = &result.metrics.tickets[0];
+        assert_eq!(record.attempt_count, 2);
+        assert_eq!(record.first_attempt_role.as_deref(), Some("mid"));
+        assert_eq!(
+            record.first_attempt_outcome,
+            Some(AttemptOutcomeTag::Complete)
+        );
+        assert_eq!(record.retry_role.as_deref(), Some("giga"));
+        assert!(record.retry_escalated);
+        assert_eq!(record.verification_gate_count, 2);
+        assert_eq!(
+            record.telemetry,
+            crate::loops::LoopTelemetry::default(),
+            "both scripted attempts contributed no telemetry"
+        );
+    }
+
+    /// Regression: recording metrics changes neither the retry policy nor the
+    /// legacy report. A fatal stop never retries, a bounded stop retries once,
+    /// the final gate is authoritative after a retry, and a failed branch never
+    /// disturbs an independent one.
+    #[test]
+    fn when_ticket_work_stops_given_fatal_or_retryable_agent_outcomes_then_preserves_existing_retry_and_report_behavior()
+     {
+        // A fatal API failure is final: no retry, no gate, no metrics surprise.
+        let mut fatal = Script::new(vec![code::Outcome::Failed(FailureKind::Api)], Vec::new());
+        let result = run_queue(&mut fatal, &one());
+        incomplete(&result);
+        assert_eq!(fatal.worked, ["1-first"]);
+        assert!(fatal.verified.is_empty());
+        let record = &result.metrics.tickets[0];
+        assert_eq!(record.attempt_count, 1);
+        assert_eq!(
+            record.first_attempt_outcome,
+            Some(AttemptOutcomeTag::FailedApi)
+        );
+        assert_eq!(record.retry_role, None);
+        assert!(!record.retry_escalated);
+        assert_eq!(record.verification_gate_count, 0);
+        assert_eq!(record.final_status, TicketStatusTag::Failed);
+        assert_eq!(record.ending, TicketEndingTag::AgentFailureApi);
+        assert_eq!(
+            result.report,
+            "# Ticket queue report\n\n1 ticket: 0 completed, 1 failed, 0 blocked.\n\n## 1-first\n\n- Title: 1-first\n- Status: failed\n- Ended: agent failure: API error\n- Gate: `cargo check`\n"
+        );
+
+        // A bounded step-limit stop earns the one retry, and its final gate is
+        // the authority even when the retry did not declare completion.
+        let mut retryable = Script::new(
+            vec![
+                code::Outcome::Failed(FailureKind::StepLimit),
+                code::Outcome::TurnEnd,
+            ],
+            vec![Ok(())],
+        );
+        let result = run_queue(&mut retryable, &one());
+        resolved(&result);
+        assert_eq!(retryable.worked, ["1-first", "1-first"]);
+        assert_eq!(retryable.verified, ["1-first"]);
+        let record = &result.metrics.tickets[0];
+        assert_eq!(record.attempt_count, 2);
+        assert_eq!(
+            record.first_attempt_outcome,
+            Some(AttemptOutcomeTag::FailedStepLimit)
+        );
+        assert_eq!(record.retry_role.as_deref(), Some("mid"));
+        assert!(!record.retry_escalated);
+        assert_eq!(record.verification_gate_count, 1);
+        assert_eq!(record.final_status, TicketStatusTag::Completed);
+        assert_eq!(record.ending, TicketEndingTag::GateAccepted);
+        assert_eq!(
+            result.report,
+            "# Ticket queue report\n\n1 ticket: 1 completed, 0 failed, 0 blocked.\n\n## 1-first\n\n- Title: 1-first\n- Status: completed\n- Ended: gate accepted without declaration\n- Gate: `cargo check`\n"
+        );
+
+        // After a retry the final gate is authoritative: a second failure ends
+        // the ticket even though the retried attempt ended its turn.
+        let mut authoritative = Script::new(
+            vec![code::Outcome::Complete, code::Outcome::TurnEnd],
+            vec![
+                Err("FINAL-GATE-FAILED".to_string()),
+                Err("FINAL-GATE-FAILED".to_string()),
+            ],
+        );
+        let result = run_queue(&mut authoritative, &one());
+        incomplete(&result);
+        assert_eq!(authoritative.worked, ["1-first", "1-first"]);
+        assert_eq!(authoritative.verified, ["1-first", "1-first"]);
+        let record = &result.metrics.tickets[0];
+        assert_eq!(record.attempt_count, 2);
+        assert_eq!(
+            record.first_attempt_outcome,
+            Some(AttemptOutcomeTag::Complete)
+        );
+        assert_eq!(record.verification_gate_count, 2);
+        assert_eq!(record.final_status, TicketStatusTag::Failed);
+        assert_eq!(record.ending, TicketEndingTag::RetryExhausted);
+        assert_eq!(
+            result.report,
+            "# Ticket queue report\n\n1 ticket: 0 completed, 1 failed, 0 blocked.\n\n## 1-first\n\n- Title: 1-first\n- Status: failed\n- Ended: retry exhausted without task_complete\n- Gate: `cargo check`\n- Gate output:\n```\nFINAL-GATE-FAILED\n```\n"
+        );
+
+        // A failed branch blocks its dependents but never the independent one.
+        let set = super::tests::set(&[("1-root", &[]), ("2-dep", &["1-root"]), ("3-ind", &[])]);
+        let mut branching = Script::new(
+            vec![
+                code::Outcome::Failed(FailureKind::Api),
+                code::Outcome::Complete,
+            ],
+            vec![Ok(())],
+        );
+        let result = run_queue(&mut branching, &set);
+        incomplete(&result);
+        assert_eq!(branching.worked, ["1-root", "3-ind"]);
+        assert_eq!(branching.verified, ["3-ind"]);
+        assert_eq!(
+            result
+                .metrics
+                .tickets
+                .iter()
+                .map(|record| (record.ticket_id.as_str(), record.final_status))
+                .collect::<Vec<_>>(),
+            [
+                ("1-root", TicketStatusTag::Failed),
+                ("2-dep", TicketStatusTag::Blocked),
+                ("3-ind", TicketStatusTag::Completed),
+            ]
+        );
+        assert_eq!(
+            result.metrics.tickets[1].failed_blocker.as_deref(),
+            Some("1-root")
+        );
+        assert_eq!(
+            result.report,
+            "# Ticket queue report\n\n3 tickets: 1 completed, 1 failed, 1 blocked.\n\n## 1-root\n\n- Title: 1-root\n- Status: failed\n- Ended: agent failure: API error\n- Gate: `cargo check`\n\n## 2-dep\n\n- Title: 2-dep\n- Status: blocked\n- Ended: blocked by 1-root (failed)\n- Gate: `cargo check`\n\n## 3-ind\n\n- Title: 3-ind\n- Status: completed\n- Ended: declared\n- Gate: `cargo check`\n"
         );
     }
 }
