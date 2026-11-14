@@ -230,13 +230,13 @@ pub enum Outcome {
 /// How one code-agent attempt ended, in the stable wire vocabulary the metrics
 /// artifact carries.
 ///
-/// The variant names are crate-internal; the serialized names are the contract:
+/// The variant names are Rust-internal; the serialized names are the contract:
 /// exactly `complete`, `turn_end`, `failed_api`, `failed_transport`,
 /// `failed_malformed`, `failed_step_limit` and `failed_context_guard`, so a
 /// reader can key on them without knowing the enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AttemptOutcomeTag {
+pub enum AttemptOutcomeTag {
     /// The attempt declared the ticket complete.
     Complete,
     /// The attempt ended its turn without declaring completion.
@@ -261,7 +261,7 @@ pub(crate) enum AttemptOutcomeTag {
 /// never decided.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum TicketStatusTag {
+pub enum TicketStatusTag {
     /// The ticket completed and its verification gate passed.
     Completed,
     /// The ticket failed and is not retried again by this round.
@@ -284,7 +284,7 @@ pub(crate) enum TicketStatusTag {
 /// attempt was made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum TicketEndingTag {
+pub enum TicketEndingTag {
     /// The ticket declared completion.
     Declared,
     /// The verification gate accepted the ticket.
@@ -320,35 +320,35 @@ pub(crate) enum TicketEndingTag {
 /// like the round-level breakdown.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-pub(crate) struct TicketExecutionMetrics {
+pub struct TicketExecutionMetrics {
     /// The ticket's id, as the ticket set emits it.
-    pub(crate) ticket_id: String,
+    pub ticket_id: String,
     /// How many blockers the ticket had when the round began.
-    pub(crate) initial_blocker_count: usize,
+    pub initial_blocker_count: usize,
     /// The scheduler's remaining downstream chain length for the ticket.
-    pub(crate) downstream_chain_length: usize,
+    pub downstream_chain_length: usize,
     /// How many code-agent attempts the round made for the ticket.
-    pub(crate) attempt_count: u64,
+    pub attempt_count: u64,
     /// The provider model that served the first attempt, if one ran.
-    pub(crate) first_attempt_role: Option<String>,
+    pub first_attempt_role: Option<String>,
     /// How the first attempt ended, if one ran.
-    pub(crate) first_attempt_outcome: Option<AttemptOutcomeTag>,
+    pub first_attempt_outcome: Option<AttemptOutcomeTag>,
     /// The provider model that served the retry, if one ran.
-    pub(crate) retry_role: Option<String>,
+    pub retry_role: Option<String>,
     /// Whether the retry moved to a stronger model.
-    pub(crate) retry_escalated: bool,
+    pub retry_escalated: bool,
     /// How many verification gates the round invoked for the ticket.
-    pub(crate) verification_gate_count: u64,
+    pub verification_gate_count: u64,
     /// The ticket's verification gates in whole milliseconds, floored.
-    pub(crate) verification_gate_elapsed_ms: u64,
+    pub verification_gate_elapsed_ms: u64,
     /// The status the ticket ended the round in.
-    pub(crate) final_status: TicketStatusTag,
+    pub final_status: TicketStatusTag,
     /// How the ticket's participation in the round ended.
-    pub(crate) ending: TicketEndingTag,
+    pub ending: TicketEndingTag,
     /// The blocker whose failure prevented the ticket from running, if any.
-    pub(crate) failed_blocker: Option<String>,
+    pub failed_blocker: Option<String>,
     /// The code-agent loop telemetry accumulated for the ticket.
-    pub(crate) telemetry: crate::loops::LoopTelemetry,
+    pub telemetry: crate::loops::LoopTelemetry,
 }
 
 /// One queue round's metrics payload: the round's whole-millisecond timing and
@@ -358,16 +358,16 @@ pub(crate) struct TicketExecutionMetrics {
 /// runs no timed round -- such as recording an already completed set -- keeps
 /// the default, so a metrics reader never mistakes "not measured" for "measured
 /// as zero". The ticket list is populated by the ticket-execution-record
-/// population and stays empty until then. The payload is crate-internal and
-/// serializable with every field defaulted, so a payload written before a field
-/// existed still decodes.
+/// population and stays empty until then. The payload is publicly serializable
+/// with every field defaulted, so a payload written before a field existed still
+/// decodes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-pub(crate) struct QueueRoundMetrics {
+pub struct QueueRoundMetrics {
     /// The round's whole-millisecond timing attribution.
-    pub(crate) timing: crate::timing::QueueTimingBreakdown,
+    pub timing: crate::timing::QueueTimingBreakdown,
     /// One record per ticket the round scheduled, in emitted order.
-    pub(crate) tickets: Vec<TicketExecutionMetrics>,
+    pub tickets: Vec<TicketExecutionMetrics>,
 }
 
 /// What one queue invocation produced: how it ended, and the end-of-run report
@@ -1067,6 +1067,7 @@ fn work_with_retry(
 /// rendered handover as one separate user message. The final gate runs once
 /// whatever that attempt did; a passing gate resolves the ticket, and a failing
 /// gate leaves it failed while its own output is reported.
+#[allow(clippy::too_many_arguments)]
 fn retry_once(
     lifecycle: &mut impl Lifecycle,
     ticket: &Ticket,

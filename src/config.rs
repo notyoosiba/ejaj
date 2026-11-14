@@ -218,6 +218,49 @@ impl Config {
         }
     }
 
+    /// The canonical lowercase name of the configured mode.
+    pub(crate) fn mode_label(&self) -> &'static str {
+        self.mode.label()
+    }
+
+    /// Every provider role the configured routing actually serves, once each,
+    /// with its configured model name. Roles the mode never routes are absent,
+    /// so a mid-only run does not advertise an unconfigured giga provider.
+    pub(crate) fn active_provider_models(&self) -> Vec<(&'static str, &str)> {
+        let phases = [
+            tools::Phase::Plan,
+            tools::Phase::Spec,
+            tools::Phase::Tickets,
+            tools::Phase::Triage,
+            tools::Phase::Code,
+            tools::Phase::Review,
+            tools::Phase::Summary,
+        ];
+        let mut active: Vec<(&'static str, &str)> = Vec::new();
+        for phase in phases {
+            let role = self.provider_role(phase);
+            if !self.has_provider_role(role) || active.iter().any(|(seen, _)| *seen == role) {
+                continue;
+            }
+            active.push((role, self.provider_model(phase)));
+        }
+        active
+    }
+
+    /// Whether the configuration actually carries the provider a canonical role
+    /// names. A stale trajectory can name a role this configuration does not
+    /// configure, and pricing it must not panic the aggregation.
+    pub(crate) fn has_provider_role(&self, role: &str) -> bool {
+        match role {
+            "mid" => true,
+            "giga" => {
+                self.giga.is_some() && matches!(self.mode, llm::Mode::Giga | llm::Mode::Hybrid)
+            }
+            "smoll" => self.smoll.is_some(),
+            _ => false,
+        }
+    }
+
     /// The canonical lowercase role name of the provider that serves `phase`:
     /// `smoll` for Summary, `mid` or `giga` for every other phase.
     ///

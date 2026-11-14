@@ -221,7 +221,7 @@ impl LoopTelemetry {
     /// Every counter and every token-usage field saturates at its own ceiling,
     /// the peak keeps the larger context size, and the abort flag is the OR of
     /// both sides. Counters never borrow from or wrap into one another.
-    pub fn merge(&mut self, other: LoopTelemetry) -> () {
+    pub fn merge(&mut self, other: LoopTelemetry) {
         self.elapsed_ms = self.elapsed_ms.saturating_add(other.elapsed_ms);
         self.provider_send_attempts = self
             .provider_send_attempts
@@ -593,6 +593,7 @@ struct TurnReport<'a> {
 /// counts model turns: the attempt budget lives entirely inside this call.
 // The failure stays the loop's existing Stop so the outer path reports it once.
 #[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 fn send_turn_with_retry(
     config: &Config,
     phase: Phase,
@@ -1016,6 +1017,7 @@ fn is_control_tool_name(name: &str) -> bool {
 
 /// The loop body shared by every caller. The caller supplies the slot that
 /// receives the last printable assistant narration.
+#[allow(clippy::too_many_arguments)]
 fn run_agent_loop_capturing(
     messages: &mut Vec<Message>,
     config: &Config,
@@ -1054,6 +1056,7 @@ fn run_agent_loop_capturing(
     stop
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_agent_loop_inner(
     messages: &mut Vec<Message>,
     config: &Config,
@@ -10972,7 +10975,7 @@ mod tests {
         );
 
         let telemetry = &trajectory["telemetry"];
-        assert_eq!(telemetry["elapsed_ms"].as_u64().is_some(), true);
+        assert!(telemetry["elapsed_ms"].as_u64().is_some());
         assert_eq!(telemetry["provider_send_attempts"], 1);
         assert_eq!(telemetry["transient_retries"], 0);
         assert_eq!(telemetry["retry_backoff_ms"], 0);

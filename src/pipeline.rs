@@ -20,8 +20,8 @@
 //! spec, tickets and triage passes, every queue round, every review round and
 //! the summary pass reports one additive elapsed line as soon as that call
 //! returns, whatever it returned. The queue and review rounds carry one-based
-//! round numbers, and nothing else is timed -- not the preflight, not an
-//! artifact write, not the run as a whole.
+//! round numbers. Separately, post-handoff runs record whole-run and plan
+//! interview durations in best-effort metrics; those timings add no phase line.
 //!
 //! The library owns no artifact-directory policy and never exits: the directory
 //! is a parameter and every failure is reported to the caller, which owns the
@@ -40,6 +40,15 @@ fn retries_after_unattended_stop(kind: Option<FailureKind>) -> bool {
     )
 }
 
+/// One unattended pass run: its final outcome plus the retry evidence a pass
+/// record needs. The first-attempt reason is retained only when a fresh-session
+/// retry actually ran, so a non-eligible failure never fabricates one.
+struct RetriedOutcome<O> {
+    outcome: O,
+    retried: bool,
+    first_attempt_failure: Option<String>,
+}
+
 /// Run one pass attempt and, after an eligible unattended early stop, one
 /// fresh-session retry. Both attempts run inside the caller's single timed
 /// closure; `stopped` maps a non-handoff outcome to its failure kind, with
@@ -48,13 +57,21 @@ fn attempt_with_fresh_session_retry<O>(
     pass: &str,
     mut attempt: impl FnMut() -> O,
     stopped: impl Fn(&O) -> Option<Option<FailureKind>>,
-) -> O {
+) -> RetriedOutcome<O> {
     let first = attempt();
     let Some(kind) = stopped(&first) else {
-        return first;
+        return RetriedOutcome {
+            outcome: first,
+            retried: false,
+            first_attempt_failure: None,
+        };
     };
     if !retries_after_unattended_stop(kind) {
-        return first;
+        return RetriedOutcome {
+            outcome: first,
+            retried: false,
+            first_attempt_failure: None,
+        };
     }
     let reason = match kind {
         Some(kind) => format!("ended early ({})", kind.label()),
@@ -63,14 +80,25 @@ fn attempt_with_fresh_session_retry<O>(
     let _ = status::shared().stderr_log(&format!(
         "[WARN] {pass} {reason}; the next attempt is a fresh-session retry."
     ));
-    attempt()
+    RetriedOutcome {
+        outcome: attempt(),
+        retried: true,
+        first_attempt_failure: Some(reason),
+    }
 }
+use crate::metrics::{
+    PassMetrics, PassOutcome, PlanInterviewMetrics, QueueRoundOutcome, QueueRoundRecord,
+    ReviewRoundMetrics, ReviewRoundOutcome, RunMetrics, SummaryMetrics, TerminalOutcome,
+    TransitionGateMetrics, TriageMetrics, collect_trajectory_usage, duration_ms,
+    persist_run_metrics,
+};
 use crate::orchestrator;
 use crate::plan_document::Plan;
 use crate::review::{ReviewReport, render_reviews};
 use crate::specification::Specification;
 use crate::status::{self, OutputCoordinator, OutputKind, OutputSink};
 use crate::tickets::{Ticket, TicketSet};
+use crate::timing::{Clock, MonotonicClock, measured_with};
 use crate::triage::{TRIAGE_ARTIFACT, TriageReport, TriageState};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -152,6 +180,33 @@ pub struct Pipeline {
     /// queue and returned `Step::Retry` without committing its working-tree
     /// changes.
     dirty_from_retry: bool,
+    /// The monotonic source every measured run interval reads.
+    clock: Box<dyn Clock>,
+    /// The first plan ask's clock reading after preflight, or `None` when no
+    /// post-handoff run is in flight.
+    run_started: Option<Duration>,
+    /// The plan interview's accumulated ask intervals across pre-handoff
+    /// retries on this pipeline.
+    plan_elapsed: Duration,
+    /// The plan interview's accumulated nonblank sent turns.
+    plan_turns: u64,
+    /// The spec pass's measurements for the current post-handoff run.
+    spec_metrics: Option<PassMetrics>,
+    /// The tickets pass's measurements for the current post-handoff run.
+    tickets_metrics: Option<PassMetrics>,
+    /// The triage pass's measurements for the current post-handoff run.
+    triage_metrics: Option<TriageMetrics>,
+    /// The ordered queue-round records for the current post-handoff run.
+    queue_rounds: Vec<QueueRoundRecord>,
+    /// The ordered review-round records for the current post-handoff run.
+    review_rounds: Vec<ReviewRoundMetrics>,
+    /// The transition-gate aggregate for the current post-handoff run.
+    transition_gate_metrics: TransitionGateMetrics,
+    /// The summary pass's convergence measurements for the current run, when
+    /// the pass was reached.
+    summary_metrics: Option<SummaryMetrics>,
+    /// The phase that explains the current run's retry terminal outcome.
+    run_terminal_detail: Option<String>,
 }
 
 /// Finish one measured queue round: report the existing total and residual
@@ -192,12 +247,36 @@ impl Pipeline {
     /// copies of the config; the root is kept so that every `ask` can prove the
     /// tree this run would change is clean before any agent is asked anything.
     pub fn new(config: &Config, scope: &str, root: impl AsRef<Path>) -> Pipeline {
+        Pipeline::new_with_clock(config, scope, root, Box::new(MonotonicClock::new()))
+    }
+
+    /// The same pipeline with an injected monotonic clock. Production always
+    /// routes through the monotonic clock; a deterministic test stand-in makes
+    /// the measured run and plan intervals assertable.
+    pub(crate) fn new_with_clock(
+        config: &Config,
+        scope: &str,
+        root: impl AsRef<Path>,
+        clock: Box<dyn Clock>,
+    ) -> Pipeline {
         Pipeline {
             config: config.clone(),
             scope: scope.to_string(),
             root: root.as_ref().to_path_buf(),
             plan_agent: plan::Session::new(config, scope),
             dirty_from_retry: false,
+            clock,
+            run_started: None,
+            plan_elapsed: Duration::ZERO,
+            plan_turns: 0,
+            spec_metrics: None,
+            tickets_metrics: None,
+            triage_metrics: None,
+            queue_rounds: Vec::new(),
+            review_rounds: Vec::new(),
+            transition_gate_metrics: TransitionGateMetrics::default(),
+            summary_metrics: None,
+            run_terminal_detail: None,
         }
     }
 
@@ -230,6 +309,10 @@ impl Pipeline {
             };
         }
 
+        if self.run_started.is_none() {
+            self.run_started = Some(self.clock.now());
+        }
+
         let plan = match self.plan_handoff(input, dir) {
             Ok(plan) => plan,
             Err(step) => return step,
@@ -241,6 +324,24 @@ impl Pipeline {
         // call can leak into the next plan request. This changes only the
         // in-memory conversation: plan.md and the typed plan are untouched.
         self.plan_agent.accept_handoff(&plan);
+
+        let step = self.run_after_handoff(&plan, dir);
+        self.finalize_run(dir, step)
+    }
+
+    /// Drive every phase after a validated plan handoff to its terminal Step.
+    /// Every exit from here is post-handoff, so the caller finalizes the run
+    /// exactly once around this method.
+    fn run_after_handoff(&mut self, plan: &Plan, dir: &Path) -> Step {
+        // Each post-handoff run records only the passes it reaches itself.
+        self.spec_metrics = None;
+        self.tickets_metrics = None;
+        self.triage_metrics = None;
+        self.queue_rounds.clear();
+        self.review_rounds.clear();
+        self.transition_gate_metrics = TransitionGateMetrics::default();
+        self.summary_metrics = None;
+        self.run_terminal_detail = None;
 
         // The plan is rendered from the object the plan agent handed over --
         // never the model's raw text -- so `plan.md` parses back into the same
@@ -255,11 +356,11 @@ impl Pipeline {
             return step;
         }
 
-        let specification = match self.spec_pass(&plan, dir) {
+        let specification = match self.spec_pass(plan, dir) {
             Ok(specification) => specification,
             Err(step) => return step,
         };
-        let set = match self.tickets_pass(&plan, &specification, dir) {
+        let set = match self.tickets_pass(plan, &specification, dir) {
             Ok(set) => set,
             Err(step) => return step,
         };
@@ -271,7 +372,7 @@ impl Pipeline {
             return step;
         }
 
-        let report = match self.triage_pass(&plan, &specification, &set, dir) {
+        let report = match self.triage_pass(plan, &specification, &set, dir) {
             Ok(report) => report,
             Err(step) => return step,
         };
@@ -280,7 +381,9 @@ impl Pipeline {
             Ok(run) => run,
             Err(step) => return step,
         };
-
+        self.queue_rounds = run.queue_rounds.clone();
+        self.review_rounds = run.review_rounds.clone();
+        self.transition_gate_metrics = run.transition_gate.clone();
         // The summary phase, exactly once, immediately after the queue/review
         // loop and never before it: one fresh read-only pass over the report
         // content this invocation generated -- `run.report` and
@@ -317,7 +420,78 @@ impl Pipeline {
         // The summary reaches the console only after the commit that records it
         // succeeded, so a fatal Git failure is never presented as a successful
         // completion.
-        self.finish(run, &plan, &text)
+        self.finish(run, plan, &text)
+    }
+
+    /// Finalize one post-handoff run on a best-effort basis: collect usable
+    /// trajectory usage, compose the run document and attempt exact-.ejaj
+    /// persistence. Any collection or persistence failure is diagnostic only,
+    /// so the original terminal Step is always returned unchanged.
+    fn finalize_run(&mut self, dir: &Path, step: Step) -> Step {
+        let started = self.run_started.unwrap_or_else(|| self.clock.now());
+        let mut metrics = RunMetrics {
+            schema_version: crate::metrics::METRICS_SCHEMA_VERSION,
+            mode: self.config.mode_label().to_string(),
+            terminal_outcome: Self::terminal_outcome_label(&step),
+            terminal_detail: self.terminal_detail(&step),
+            elapsed_ms: duration_ms(self.clock.now().saturating_sub(started)),
+            plan_interview: PlanInterviewMetrics {
+                turns: self.plan_turns,
+                elapsed_ms: duration_ms(self.plan_elapsed),
+            },
+            spec_pass: self.spec_metrics.take(),
+            tickets_pass: self.tickets_metrics.take(),
+            triage: self.triage_metrics.take(),
+            queue_rounds: std::mem::take(&mut self.queue_rounds),
+            transition_gate: std::mem::take(&mut self.transition_gate_metrics),
+            review_rounds: std::mem::take(&mut self.review_rounds),
+            summary: self.summary_metrics.take(),
+            ..RunMetrics::default()
+        };
+        metrics.record_provider_models(&self.config);
+        let base = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            self.root.join(dir)
+        };
+        match collect_trajectory_usage(&base.join("trajectories"), &self.config) {
+            Ok(roles) => metrics.record_provider_roles(roles),
+            Err(error) => {
+                let _ = crate::status::shared().stderr_log(&format!(
+                    "warning: could not collect run trajectory usage: {error}"
+                ));
+            }
+        }
+        if let Err(error) = persist_run_metrics(&self.root, dir, &metrics) {
+            let _ = crate::status::shared()
+                .stderr_log(&format!("warning: could not persist run metrics: {error}"));
+        }
+        self.run_started = None;
+        self.plan_elapsed = Duration::ZERO;
+        self.plan_turns = 0;
+        step
+    }
+
+    /// The stable terminal outcome named by the run's primary Step.
+    fn terminal_outcome_label(step: &Step) -> TerminalOutcome {
+        match step {
+            Step::Complete => TerminalOutcome::Complete,
+            Step::Retry => TerminalOutcome::Retry,
+            Step::WriteFailed { .. } => TerminalOutcome::WriteFailed,
+            Step::SummaryFailed { .. } => TerminalOutcome::SummaryFailed,
+            Step::GitFailed { .. } => TerminalOutcome::GitFailed,
+        }
+    }
+
+    /// The phase or artifact that explains a non-complete terminal outcome.
+    fn terminal_detail(&self, step: &Step) -> Option<String> {
+        match step {
+            Step::Complete => None,
+            Step::Retry => self.run_terminal_detail.clone(),
+            Step::WriteFailed { artifact, .. } => Some((*artifact).to_string()),
+            Step::SummaryFailed { .. } => Some("summary".to_string()),
+            Step::GitFailed { stage, .. } => Some((*stage).to_string()),
+        }
     }
 
     /// Check the project root before a new REPL line starts. A fresh session
@@ -335,9 +509,18 @@ impl Pipeline {
     /// Ask the plan interview one turn and keep only a validated handoff.
     fn plan_handoff(&mut self, input: &str, dir: &Path) -> Result<Plan, Step> {
         let invocation = InvocationContext::new(&self.root, dir);
-        match status::timed("plan-agent ask", || {
-            self.plan_agent.ask_in(input, invocation)
-        }) {
+        let (outcome, elapsed) = {
+            let clock = self.clock.as_ref();
+            let plan_agent = &mut self.plan_agent;
+            status::timed("plan-agent ask", || {
+                measured_with(clock, || plan_agent.ask_in(input, invocation))
+            })
+        };
+        self.plan_elapsed = self.plan_elapsed.saturating_add(elapsed);
+        if !input.trim().is_empty() {
+            self.plan_turns = self.plan_turns.saturating_add(1);
+        }
+        match outcome {
             plan::Outcome::Handoff(plan) => Ok(plan),
             // Nothing was handed off: no `finish_plan`, so no artifact and no
             // spec pass. Back at plan>> with no output. This is a plan
@@ -361,17 +544,39 @@ impl Pipeline {
         // the user just confirmed into a self-contained technical specification.
         // No user turn happens in between.
         let _ = status::shared().stdout_log("\n=== Spec agent ===\n");
-        match status::timed("spec pass", || {
-            attempt_with_fresh_session_retry(
-                "spec pass",
-                || spec::to_spec_in(&self.config, &self.scope, plan, invocation),
-                |outcome| match outcome {
-                    spec::Outcome::Handoff(_) => None,
-                    spec::Outcome::TurnEnd => Some(None),
-                    spec::Outcome::Failed(kind) => Some(Some(*kind)),
-                },
-            )
-        }) {
+        let (attempt, elapsed) = {
+            let clock = self.clock.as_ref();
+            status::timed("spec pass", || {
+                measured_with(clock, || {
+                    attempt_with_fresh_session_retry(
+                        "spec pass",
+                        || spec::to_spec_in(&self.config, &self.scope, plan, invocation),
+                        |outcome| match outcome {
+                            spec::Outcome::Handoff(_) => None,
+                            spec::Outcome::TurnEnd => Some(None),
+                            spec::Outcome::Failed(kind) => Some(Some(*kind)),
+                        },
+                    )
+                })
+            })
+        };
+        let RetriedOutcome {
+            outcome,
+            retried,
+            first_attempt_failure,
+        } = attempt;
+        self.spec_metrics = Some(PassMetrics {
+            elapsed_ms: duration_ms(elapsed),
+            outcome: match &outcome {
+                spec::Outcome::Handoff(_) => PassOutcome::Handoff,
+                spec::Outcome::TurnEnd => PassOutcome::TurnEnd,
+                spec::Outcome::Failed(kind) => PassOutcome::from_failure_kind(*kind),
+            },
+            retried,
+            retry_reason: first_attempt_failure,
+            succeeded: matches!(&outcome, spec::Outcome::Handoff(_)),
+        });
+        match outcome {
             spec::Outcome::Handoff(specification) => {
                 // The specification artifact is the object's rendering, on the
                 // unchanged path. The object itself is kept: the tickets agent
@@ -422,17 +627,46 @@ impl Pipeline {
         // specification into the ordered set the queue runs. There is no direct
         // specification-to-code path any more.
         let _ = status::shared().stdout_log("\n=== Tickets agent ===\n");
-        match status::timed("tickets pass", || {
-            attempt_with_fresh_session_retry(
-                "tickets pass",
-                || tickets::to_tickets_in(&self.config, &self.scope, specification, invocation),
-                |outcome| match outcome {
-                    tickets::Outcome::Handoff(_) => None,
-                    tickets::Outcome::TurnEnd => Some(None),
-                    tickets::Outcome::Failed(kind) => Some(Some(*kind)),
-                },
-            )
-        }) {
+        let (attempt, elapsed) = {
+            let clock = self.clock.as_ref();
+            status::timed("tickets pass", || {
+                measured_with(clock, || {
+                    attempt_with_fresh_session_retry(
+                        "tickets pass",
+                        || {
+                            tickets::to_tickets_in(
+                                &self.config,
+                                &self.scope,
+                                specification,
+                                invocation,
+                            )
+                        },
+                        |outcome| match outcome {
+                            tickets::Outcome::Handoff(_) => None,
+                            tickets::Outcome::TurnEnd => Some(None),
+                            tickets::Outcome::Failed(kind) => Some(Some(*kind)),
+                        },
+                    )
+                })
+            })
+        };
+        let RetriedOutcome {
+            outcome,
+            retried,
+            first_attempt_failure,
+        } = attempt;
+        self.tickets_metrics = Some(PassMetrics {
+            elapsed_ms: duration_ms(elapsed),
+            outcome: match &outcome {
+                tickets::Outcome::Handoff(_) => PassOutcome::Handoff,
+                tickets::Outcome::TurnEnd => PassOutcome::TurnEnd,
+                tickets::Outcome::Failed(kind) => PassOutcome::from_failure_kind(*kind),
+            },
+            retried,
+            retry_reason: first_attempt_failure,
+            succeeded: matches!(&outcome, tickets::Outcome::Handoff(_)),
+        });
+        match outcome {
             tickets::Outcome::Handoff(set) => Ok(set),
             tickets::Outcome::TurnEnd => {
                 let _ = status::shared().stderr_log(
@@ -477,25 +711,89 @@ impl Pipeline {
         // draft ticket, unchanged -- before the queue is constructed or run. The
         // pass is offered no `bash` and its scripts run read-only.
         let _ = status::shared().stdout_log("\n=== Triage agent ===\n");
-        let report = match status::timed("triage pass", || {
-            attempt_with_fresh_session_retry(
-                "triage pass",
-                || triage::audit_in(&self.config, &self.scope, specification, set, invocation),
-                |outcome| match outcome {
-                    triage::Outcome::Handoff(_) => None,
-                    triage::Outcome::TurnEnd => Some(None),
-                    triage::Outcome::Failed(kind) => Some(Some(*kind)),
-                },
-            )
-        }) {
-            triage::Outcome::Handoff(report) => report,
+        let (attempt, elapsed) = {
+            let clock = self.clock.as_ref();
+            status::timed("triage pass", || {
+                measured_with(clock, || {
+                    attempt_with_fresh_session_retry(
+                        "triage pass",
+                        || {
+                            triage::audit_in(
+                                &self.config,
+                                &self.scope,
+                                specification,
+                                set,
+                                invocation,
+                            )
+                        },
+                        |outcome| match outcome {
+                            triage::Outcome::Handoff(_) => None,
+                            triage::Outcome::TurnEnd => Some(None),
+                            triage::Outcome::Failed(kind) => Some(Some(*kind)),
+                        },
+                    )
+                })
+            })
+        };
+        let RetriedOutcome {
+            outcome,
+            retried,
+            first_attempt_failure,
+        } = attempt;
+        // The pass record is filled before any artifact write, so a failed
+        // write still leaves the reached pass measured and its handoff known.
+        let pass = PassMetrics {
+            elapsed_ms: duration_ms(elapsed),
+            outcome: match &outcome {
+                triage::Outcome::Handoff(_) => PassOutcome::Handoff,
+                triage::Outcome::TurnEnd => PassOutcome::TurnEnd,
+                triage::Outcome::Failed(kind) => PassOutcome::from_failure_kind(*kind),
+            },
+            retried,
+            retry_reason: first_attempt_failure,
+            succeeded: matches!(&outcome, triage::Outcome::Handoff(_)),
+        };
+        let report = match outcome {
+            triage::Outcome::Handoff(report) => {
+                // The validated typed report is the sole authority on whether
+                // the queue runs: one classification per draft ticket, every one
+                // ready-for-agent. Anything else -- a ticket needing a human
+                // answer, or a `wontfix` -- blocks the whole set. No subset
+                // runs, and nothing waits for an interactive answer.
+                let authorized = authorizes_queue(&report);
+                self.triage_metrics = Some(triage_metrics(pass, &report, authorized));
+
+                // The artifact is the typed report's own rendering, in
+                // draft-ticket order, written beside `plan.md` and `spec.md`
+                // for every valid report -- ready or blocked. A write that
+                // fails is reported before anything is queued, so no ticket can
+                // run without its audit on record.
+                write_artifact(
+                    dir,
+                    TRIAGE_ARTIFACT,
+                    &report.to_markdown(set),
+                    "triage",
+                    "triage report written to",
+                )?;
+
+                if !authorized {
+                    let _ = status::shared().stdout_log(&report.to_markdown(set));
+                    let _ = status::shared().stderr_log(
+                        "[WARN] Triage did not mark every draft ticket ready-for-agent, so no ticket ran; the findings above say what blocks each one. The run is incomplete and retryable: no subset of the draft set executes, and no answer is waited for. Deal with the blockers and call `finish_plan` again to start a new run.",
+                    );
+                    return Err(self.downstream_retry(plan, "triage", triage_blockers(&report)));
+                }
+                report
+            }
             // No report exists, so the draft set was not audited and the queue
             // must not run: back at plan>> with no break and no execution.
             triage::Outcome::TurnEnd => {
+                self.triage_metrics = Some(TriageMetrics {
+                    pass,
+                    ..TriageMetrics::default()
+                });
                 let _ = status::shared().stderr_log(
-                    "[INFO] Triage agent ended its turn without handing over a triage report; \
-                     the draft set was not audited, so no ticket ran. The run is incomplete and \
-                     retryable: back at plan>>. Call `finish_plan` again to start a new run.",
+                    "[INFO] Triage agent ended its turn without handing over a triage report; the draft set was not audited, so no ticket ran. The run is incomplete and retryable: back at plan>>. Call `finish_plan` again to start a new run.",
                 );
                 return Err(self.downstream_retry(
                     plan,
@@ -504,10 +802,12 @@ impl Pipeline {
                 ));
             }
             triage::Outcome::Failed(kind) => {
+                self.triage_metrics = Some(TriageMetrics {
+                    pass,
+                    ..TriageMetrics::default()
+                });
                 let _ = status::shared().stderr_log(&format!(
-                    "[WARN] Triage agent ended early ({}); the draft set was not audited, so no \
-                     ticket ran. The run is incomplete and retryable: back at plan>>. Call \
-                     `finish_plan` again to start a new run.",
+                    "[WARN] Triage agent ended early ({}); the draft set was not audited, so no ticket ran. The run is incomplete and retryable: back at plan>>. Call `finish_plan` again to start a new run.",
                     kind.label()
                 ));
                 return Err(self.downstream_retry(
@@ -521,39 +821,23 @@ impl Pipeline {
             }
         };
 
-        // The artifact is the typed report's own rendering, in draft-ticket
-        // order, written beside `plan.md` and `spec.md` for every valid report
-        // -- ready or blocked. A write that fails is reported before anything is
-        // queued, so no ticket can run without its audit on record.
-        write_artifact(
-            dir,
-            TRIAGE_ARTIFACT,
-            &report.to_markdown(set),
-            "triage",
-            "triage report written to",
-        )?;
-
-        // The validated typed report is the sole authority on whether the queue
-        // runs: one classification per draft ticket, every one ready-for-agent.
-        // Anything else -- a ticket needing a human answer, or a `wontfix` --
-        // blocks the whole set. No subset runs, and nothing waits for an
-        // interactive answer.
-        if !authorizes_queue(&report) {
-            let _ = status::shared().stdout_log(&report.to_markdown(set));
-            let _ = status::shared().stderr_log(
-                "[WARN] Triage did not mark every draft ticket ready-for-agent, so no ticket \
-                 ran; the findings above say what blocks each one. The run is incomplete and \
-                 retryable: no subset of the draft set executes, and no answer is waited for. \
-                 Deal with the blockers and call `finish_plan` again to start a new run.",
-            );
-            return Err(self.downstream_retry(plan, "triage", triage_blockers(&report)));
-        }
-
         Ok(report)
     }
 
     /// Drive the bounded queue-and-review loop to its termination, keeping the
     /// content and review state the summary pass is handed.
+    /// Retain every completed queue round, transition-gate invocation, and
+    /// review pass for the finalizer even when the loop exits with a write
+    /// failure after the measurement was already taken.
+    fn retain_progress(&mut self, progress: &ReviewProgress) {
+        self.queue_rounds = progress.queue_rounds.clone();
+        self.review_rounds = progress.review_rounds.clone();
+        self.transition_gate_metrics = TransitionGateMetrics {
+            runs: progress.transition_gate_runs,
+            elapsed_ms: progress.transition_gate_elapsed_ms,
+        };
+    }
+
     fn queue_and_review(
         &mut self,
         specification: &Specification,
@@ -567,78 +851,87 @@ impl Pipeline {
         // directory holds one markdown file per ticket id and nothing else.
         let report_path = dir.join("queue-report.md");
         let mut progress = ReviewProgress::new(set, triage);
+        let result = (|| -> Result<RunReview, Step> {
+            loop {
+                progress.queue_round += 1;
+                let result = if progress.current_set.tickets.is_empty() {
+                    self.record_precompleted_round(&progress, &status_path, &report_path)
+                } else {
+                    self.run_queue_round(&progress, dir, &status_path, &report_path)
+                };
 
-        loop {
-            progress.queue_round += 1;
-            let result = if progress.current_set.tickets.is_empty() {
-                self.record_precompleted_round(&progress, &status_path, &report_path)
-            } else {
-                self.run_queue_round(&progress, dir, &status_path, &report_path)
-            };
+                progress.queue_rounds.push(QueueRoundRecord::new(
+                    u64::try_from(progress.queue_round).unwrap_or(u64::MAX),
+                    queue_round_outcome(&result.outcome),
+                    result.metrics.clone(),
+                ));
 
-            match &result.outcome {
-                orchestrator::Outcome::Resolved => {}
-                orchestrator::Outcome::Incomplete => {
-                    let _ = status::shared().stderr_log(
+                match &result.outcome {
+                    orchestrator::Outcome::Resolved => {}
+                    orchestrator::Outcome::Incomplete => {
+                        let _ = status::shared().stderr_log(
                         "[WARN] the run did not resolve every ticket; the plan tool must be called \
                          again to start a new run.",
                     );
-                    return Ok(RunReview::terminated(
-                        RunTermination::Queue(orchestrator::Outcome::Incomplete),
-                        result.report,
-                        &progress,
-                    ));
-                }
-                orchestrator::Outcome::Stopped { ticket, reason } => {
-                    let _ = status::shared().stderr_log(&format!(
+                        return Ok(RunReview::terminated(
+                            RunTermination::Queue(orchestrator::Outcome::Incomplete),
+                            result.report,
+                            &progress,
+                        ));
+                    }
+                    orchestrator::Outcome::Stopped { ticket, reason } => {
+                        let _ = status::shared().stderr_log(&format!(
                         "[WARN] Queue stopped on ticket `{}`: {}; the queue stopped and the plan \
                          tool must be called again to start a new run.",
                         ticket, reason
                     ));
-                    return Ok(RunReview::terminated(
-                        RunTermination::Queue(orchestrator::Outcome::Stopped {
-                            ticket: ticket.clone(),
-                            reason: reason.clone(),
-                        }),
-                        result.report,
-                        &progress,
-                    ));
+                        return Ok(RunReview::terminated(
+                            RunTermination::Queue(orchestrator::Outcome::Stopped {
+                                ticket: ticket.clone(),
+                                reason: reason.clone(),
+                            }),
+                            result.report,
+                            &progress,
+                        ));
+                    }
+                }
+
+                progress
+                    .prior_completed
+                    .extend(progress.current_set.tickets.iter().cloned());
+
+                match self.transition_gate(&mut progress, tickets_dir)? {
+                    TransitionGate::Passed => {}
+                    TransitionGate::Queued => continue,
+                    TransitionGate::Terminated(termination) => {
+                        return Ok(RunReview::terminated(termination, result.report, &progress));
+                    }
+                }
+
+                progress.review_round += 1;
+                match self.review_round(
+                    &mut progress,
+                    specification,
+                    &result.report,
+                    dir,
+                    tickets_dir,
+                )? {
+                    ReviewRound::Queued => {}
+                    ReviewRound::Passed => {
+                        return Ok(RunReview::terminated(
+                            RunTermination::Queue(orchestrator::Outcome::Resolved),
+                            result.report,
+                            &progress,
+                        ));
+                    }
+                    ReviewRound::Terminated(termination) => {
+                        return Ok(RunReview::terminated(termination, result.report, &progress));
+                    }
                 }
             }
-
-            progress
-                .prior_completed
-                .extend(progress.current_set.tickets.iter().cloned());
-
-            match self.transition_gate(&mut progress, tickets_dir)? {
-                TransitionGate::Passed => {}
-                TransitionGate::Queued => continue,
-                TransitionGate::Terminated(termination) => {
-                    return Ok(RunReview::terminated(termination, result.report, &progress));
-                }
-            }
-
-            progress.review_round += 1;
-            match self.review_round(
-                &mut progress,
-                specification,
-                &result.report,
-                dir,
-                tickets_dir,
-            )? {
-                ReviewRound::Queued => {}
-                ReviewRound::Passed => {
-                    return Ok(RunReview::terminated(
-                        RunTermination::Queue(orchestrator::Outcome::Resolved),
-                        result.report,
-                        &progress,
-                    ));
-                }
-                ReviewRound::Terminated(termination) => {
-                    return Ok(RunReview::terminated(termination, result.report, &progress));
-                }
-            }
-        }
+        })();
+        self.retain_progress(&progress);
+        result
     }
 
     /// Record an initial set whose every draft ticket was triaged done: no
@@ -804,32 +1097,48 @@ impl Pipeline {
         // queue adds exactly one more.
         let round = progress.review_round;
         let label = format!("review round {round}");
-        let review_report = match status::timed(&label, || {
-            attempt_with_fresh_session_retry(
-                &label,
-                || {
-                    review::audit_in(
-                        &self.config,
-                        review::ReviewInputs {
-                            scope: &self.scope,
-                            specification,
-                            tickets: &progress.all_tickets,
-                            report: queue_report,
-                            prior_reviews: &progress.reviews,
-                            existing_ticket_ids: &existing_ids,
-                        },
-                        invocation,
-                    )
-                },
-                |outcome| match outcome {
-                    review::Outcome::Handoff(_) => None,
-                    review::Outcome::TurnEnd => Some(None),
-                    review::Outcome::Failed(kind) => Some(Some(*kind)),
-                },
-            )
-        }) {
+        let (attempt, elapsed) = status::timed(&label, || {
+            let clock = self.clock.as_ref();
+            measured_with(clock, || {
+                attempt_with_fresh_session_retry(
+                    &label,
+                    || {
+                        review::audit_in(
+                            &self.config,
+                            review::ReviewInputs {
+                                scope: &self.scope,
+                                specification,
+                                tickets: &progress.all_tickets,
+                                report: queue_report,
+                                prior_reviews: &progress.reviews,
+                                existing_ticket_ids: &existing_ids,
+                            },
+                            invocation,
+                        )
+                    },
+                    |outcome| match outcome {
+                        review::Outcome::Handoff(_) => None,
+                        review::Outcome::TurnEnd => Some(None),
+                        review::Outcome::Failed(kind) => Some(Some(*kind)),
+                    },
+                )
+            })
+        });
+        let elapsed_ms = duration_ms(elapsed);
+        let round_num = u64::try_from(round).unwrap_or(u64::MAX);
+        let review_report = match attempt.outcome {
             review::Outcome::Handoff(report) => report,
             review::Outcome::TurnEnd => {
+                progress.review_rounds.push(ReviewRoundMetrics {
+                    round: round_num,
+                    elapsed_ms,
+                    outcome: ReviewRoundOutcome::TurnEnd,
+                    retried: attempt.retried,
+                    retry_reason: attempt.first_attempt_failure,
+                    succeeded: false,
+                    findings: None,
+                    fixes: None,
+                });
                 let _ = status::shared().stderr_log(
                     "[WARN] Review agent ended its turn without handing over a review report; \
                      back at plan>>. Call `finish_plan` again to start a new run.",
@@ -840,6 +1149,16 @@ impl Pipeline {
                 }));
             }
             review::Outcome::Failed(kind) => {
+                progress.review_rounds.push(ReviewRoundMetrics {
+                    round: round_num,
+                    elapsed_ms,
+                    outcome: ReviewRoundOutcome::Failed,
+                    retried: attempt.retried,
+                    retry_reason: attempt.first_attempt_failure,
+                    succeeded: false,
+                    findings: None,
+                    fixes: None,
+                });
                 let _ = status::shared().stderr_log(&format!(
                     "[WARN] Review agent ended early ({}); back at plan>>. Call `finish_plan` \
                      again to start a new run.",
@@ -852,6 +1171,22 @@ impl Pipeline {
         };
 
         progress.reviews.push(review_report.clone());
+        let findings_count = u64::try_from(review_report.findings.len()).unwrap_or(u64::MAX);
+        let fix_count = u64::try_from(review_report.fixes.len()).unwrap_or(u64::MAX);
+        progress.review_rounds.push(ReviewRoundMetrics {
+            round: round_num,
+            elapsed_ms,
+            outcome: if fix_count == 0 {
+                ReviewRoundOutcome::Passed
+            } else {
+                ReviewRoundOutcome::FixesQueued
+            },
+            retried: attempt.retried,
+            retry_reason: attempt.first_attempt_failure,
+            succeeded: true,
+            findings: Some(findings_count),
+            fixes: Some(fix_count),
+        });
         progress.review_markdown = render_reviews(&progress.reviews);
         write_artifact(
             dir,
@@ -868,6 +1203,9 @@ impl Pipeline {
 
         let prior_reviews = &progress.reviews[..progress.reviews.len() - 1];
         if let Some(reason) = review_circuit_breaker(prior_reviews, &review_report) {
+            if let Some(record) = progress.review_rounds.last_mut() {
+                record.outcome = ReviewRoundOutcome::CircuitBroken;
+            }
             let _ = status::shared().stderr_log(&format!(
                 "[WARN] review circuit breaker tripped on round {round} ({reason}); \
                  the plan tool must be called again to start a new run."
@@ -882,6 +1220,9 @@ impl Pipeline {
         // is deliberately not queued. The run stays incomplete and retryable,
         // exactly as any other non-passing review does.
         if round >= MAX_REVIEW_ROUNDS {
+            if let Some(record) = progress.review_rounds.last_mut() {
+                record.outcome = ReviewRoundOutcome::RoundCapReached;
+            }
             let _ = status::shared().stderr_log(&format!(
                 "[WARN] review still reported {} finding(s) after {MAX_REVIEW_ROUNDS} review \
                  rounds; the plan tool must be called again to start a new run.",
@@ -904,10 +1245,10 @@ impl Pipeline {
     }
 
     /// Run the one summary pass over this invocation's own report and reviews.
-    fn summary_pass(&self, run: &RunReview, dir: &Path) -> Result<String, Step> {
+    fn summary_pass(&mut self, run: &RunReview, dir: &Path) -> Result<String, Step> {
         let invocation = InvocationContext::new(&self.root, dir);
-        match status::timed("summary pass", || {
-            summary::summarize_in(
+        let attempt = status::timed("summary pass", || {
+            summary::summarize_with_metrics_in(
                 &self.config,
                 &self.scope,
                 &termination_outcome(&run.termination),
@@ -916,7 +1257,9 @@ impl Pipeline {
                 &run.generated_ids,
                 invocation,
             )
-        }) {
+        });
+        self.summary_metrics = Some(attempt.metrics);
+        match attempt.outcome {
             summary::Outcome::Summary(text) => Ok(text),
             summary::Outcome::Invalid(reason) => Err(Step::SummaryFailed { reason }),
             summary::Outcome::Failed(kind) => Err(Step::SummaryFailed {
@@ -989,6 +1332,7 @@ impl Pipeline {
     ) -> Step {
         self.plan_agent
             .record_downstream_retry(plan, phase, detail.as_ref());
+        self.run_terminal_detail = Some(phase.to_string());
         Step::Retry
     }
 }
@@ -1019,6 +1363,35 @@ fn triage_blockers(report: &TriageReport) -> String {
         "the report did not mark every draft ticket ready-for-agent".to_string()
     } else {
         blockers.join("; ")
+    }
+}
+
+/// Partition one valid triage report into the counts a pass record carries:
+/// ready-for-agent, done, and every other (blocked) state. Draft is the report's
+/// one-classification-per-draft length, and the authorization is the same
+/// predicate the queue decision reads, recorded exactly as answered.
+fn triage_metrics(
+    pass: PassMetrics,
+    report: &TriageReport,
+    authorized_queue: bool,
+) -> TriageMetrics {
+    let mut ready = 0u64;
+    let mut done = 0u64;
+    let mut blocked = 0u64;
+    for classification in &report.tickets {
+        match classification.state {
+            TriageState::ReadyForAgent => ready = ready.saturating_add(1),
+            TriageState::Done => done = done.saturating_add(1),
+            _ => blocked = blocked.saturating_add(1),
+        }
+    }
+    TriageMetrics {
+        pass,
+        draft_count: Some(u64::try_from(report.tickets.len()).unwrap_or(u64::MAX)),
+        ready_count: Some(ready),
+        done_count: Some(done),
+        blocked_count: Some(blocked),
+        queue_authorized: Some(authorized_queue),
     }
 }
 
@@ -1253,6 +1626,14 @@ enum TransitionGate {
     Terminated(RunTermination),
 }
 
+fn queue_round_outcome(outcome: &orchestrator::Outcome) -> QueueRoundOutcome {
+    match outcome {
+        orchestrator::Outcome::Resolved => QueueRoundOutcome::Resolved,
+        orchestrator::Outcome::Incomplete => QueueRoundOutcome::Incomplete,
+        orchestrator::Outcome::Stopped { .. } => QueueRoundOutcome::Stopped,
+    }
+}
+
 /// The mutable state one queue/review loop accumulates: the accepted reviews,
 /// the cumulative review artifact, the current queue set and both one-based
 /// round numbers.
@@ -1276,6 +1657,10 @@ struct ReviewProgress {
     /// across consecutive-failure resets so repair attempts stay accounted for.
     #[allow(dead_code)]
     transition_gate_runs: u64,
+    /// Ordered queue-round records.
+    queue_rounds: Vec<QueueRoundRecord>,
+    /// Ordered review-round records.
+    review_rounds: Vec<ReviewRoundMetrics>,
     /// The measured whole-millisecond duration of every transition-gate command
     /// this loop has invoked, accumulated saturatingly. Like the run count, it
     /// survives the reset a passing gate applies to consecutive failures.
@@ -1329,6 +1714,8 @@ impl ReviewProgress {
             transition_failures: 0,
             transition_gate_runs: 0,
             transition_gate_elapsed_ms: 0,
+            queue_rounds: Vec::new(),
+            review_rounds: Vec::new(),
         }
     }
 }
@@ -1349,6 +1736,9 @@ struct RunReview {
     report: String,
     review_markdown: String,
     generated_ids: Vec<String>,
+    queue_rounds: Vec<QueueRoundRecord>,
+    review_rounds: Vec<ReviewRoundMetrics>,
+    transition_gate: TransitionGateMetrics,
 }
 
 impl RunReview {
@@ -1365,6 +1755,12 @@ impl RunReview {
             report,
             review_markdown: progress.review_markdown.clone(),
             generated_ids: generated_ticket_ids(&progress.all_tickets, &progress.reviews),
+            queue_rounds: progress.queue_rounds.clone(),
+            review_rounds: progress.review_rounds.clone(),
+            transition_gate: TransitionGateMetrics {
+                runs: progress.transition_gate_runs,
+                elapsed_ms: progress.transition_gate_elapsed_ms,
+            },
         }
     }
 }
@@ -2133,6 +2529,236 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A scripted monotonic clock: every reading is the next pre-scripted
+    /// point, so the run's start, each plan ask interval and the final reading
+    /// are known literals. An extra reading fails loudly instead of silently
+    /// shifting the expected values.
+    struct ScriptedClock {
+        readings: std::sync::Mutex<std::collections::VecDeque<Duration>>,
+    }
+
+    impl crate::timing::Clock for ScriptedClock {
+        fn now(&self) -> Duration {
+            self.readings
+                .lock()
+                .expect("the scripted clock is not poisoned")
+                .pop_front()
+                .expect("the pipeline reads the clock exactly as many times as scripted")
+        }
+    }
+
+    /// A transport that ends the first two plan asks without a handoff and
+    /// hands over the fixture on the third; every later request is a plain
+    /// assistant turn, so the spec pass stops and the run returns to the plan.
+    struct RepeatingPlanTransport {
+        requests: std::sync::atomic::AtomicUsize,
+        plan_markdown: String,
+    }
+
+    impl crate::api::Transport for RepeatingPlanTransport {
+        fn send(
+            &self,
+            _outgoing: &crate::api::Outgoing,
+        ) -> Result<crate::api::RawResponse, crate::api::CallError> {
+            let request = self
+                .requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let body = if request == 3 {
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_plan_handoff",
+                                "type": "function",
+                                "function": {
+                                    "name": "finish_plan",
+                                    "arguments": serde_json::json!({
+                                        "plan": self.plan_markdown
+                                    })
+                                    .to_string(),
+                                },
+                            }],
+                        }
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "I need more detail before I can plan.",
+                            "tool_calls": [],
+                        }
+                    }]
+                })
+            };
+            Ok(crate::api::RawResponse {
+                status: 200,
+                body: body.to_string(),
+            })
+        }
+    }
+
+    /// Contract and invariant: repeated plan asks on the same pipeline
+    /// accumulate the nonblank interview turns and both ask intervals, while
+    /// the run clock starts at the first ask after preflight and spans the
+    /// handoff ask and the interactive time between asks.
+    #[test]
+    fn when_plan_interview_repeats_given_same_pipeline_then_accumulates_nonblank_turns_and_ask_time()
+     {
+        let root = scratch_dir("plan-accumulation");
+        init_clean_repository(&root);
+        let plan = Plan {
+            goal: "Keep the change small".to_string(),
+            decisions: vec![crate::plan_document::PlanDecision {
+                title: "Reuse the existing path".to_string(),
+                detail: "No new module is introduced.".to_string(),
+            }],
+            defaults: vec!["Keep the current behavior.".to_string()],
+            constraints: vec!["Do not change the repository.".to_string()],
+            open_questions: Vec::new(),
+        };
+        let transport = std::sync::Arc::new(RepeatingPlanTransport {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+            plan_markdown: plan.to_markdown(),
+        });
+        let config = Config::new(
+            "https://provider.test/v1/chat/completions",
+            "scripted-model",
+            None,
+        )
+        .with_transport(transport);
+        let clock = ScriptedClock {
+            readings: std::sync::Mutex::new(std::collections::VecDeque::from([
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+                Duration::from_millis(1_000),
+                Duration::from_millis(2_000),
+                Duration::from_millis(2_500),
+                Duration::from_millis(3_000),
+                Duration::from_millis(4_000),
+                Duration::from_millis(4_000),
+                Duration::from_millis(5_000),
+                Duration::from_millis(7_500),
+            ])),
+        };
+        let dir = root.join(".ejaj").join("run-1");
+        let mut pipeline = Pipeline::new_with_clock(&config, "test scope", &root, Box::new(clock));
+
+        assert!(
+            matches!(pipeline.ask("   \n\t", &dir), Step::Retry),
+            "a blank interview line ends the plan turn without a handoff"
+        );
+        assert!(
+            !dir.exists(),
+            "a pre-handoff turn end creates no run directory"
+        );
+        assert!(
+            matches!(pipeline.ask("Add a small guard.", &dir), Step::Retry),
+            "the second interview line also ends without a handoff"
+        );
+        assert!(
+            matches!(
+                pipeline.ask("Hand over the agreed plan.", &dir),
+                Step::Retry
+            ),
+            "the handoff's spec stop returns to the plan"
+        );
+
+        let metrics: crate::metrics::RunMetrics =
+            serde_json::from_slice(&fs::read(dir.join("metrics.json")).expect("metrics exist"))
+                .expect("the metrics document is valid JSON");
+        assert_eq!(
+            metrics.plan_interview.turns, 2,
+            "only the two nonblank plan turns count as interview turns"
+        );
+        assert_eq!(
+            metrics.plan_interview.elapsed_ms, 2_500,
+            "the three plan ask intervals accumulate"
+        );
+        assert_eq!(
+            metrics.elapsed_ms, 7_500,
+            "the run clock starts at the first plan ask and spans the handoff and interactive time"
+        );
+        let spec = metrics.spec_pass.expect("the reached spec pass is recorded");
+        assert_eq!(
+            spec.elapsed_ms, 1_000,
+            "the spec pass reports its own measured interval"
+        );
+        assert!(spec.retried);
+        assert_eq!(
+            spec.retry_reason.as_deref(),
+            Some("ended its turn"),
+            "the first spec turn end is the retry reason"
+        );
+        assert!(!spec.succeeded, "the exhausted spec pass did not hand off");
+        assert_eq!(
+            spec.outcome,
+            crate::metrics::PassOutcome::TurnEnd,
+            "both spec attempts ended their turn without handing off"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Regression: a relative session directory resolves against the pipeline's
+    /// project root for both trajectory collection and metrics persistence.
+    #[test]
+    fn when_finalizing_post_handoff_run_given_relative_session_path_then_collects_trajectories_under_root()
+    {
+        let root = scratch_dir("relative-finalization");
+        let relative = PathBuf::from(".ejaj/rel-run");
+        let trajectories = root.join(&relative).join("trajectories");
+        fs::create_dir_all(&trajectories).unwrap();
+        fs::write(
+            trajectories.join("a-mid.traj.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "phase": "code",
+                "role": "mid",
+                "model": "scripted-model",
+                "steps_taken": 3,
+                "exit_status": "complete",
+                "messages": [],
+                "telemetry": {
+                    "provider_send_attempts": 4,
+                    "transient_retries": 1,
+                    "token_usage": {
+                        "input_tokens": 10,
+                        "cached_input_tokens": 2,
+                        "output_tokens": 5,
+                        "reasoning_tokens": 1
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = Config::new(
+            "https://provider.test/v1/chat/completions",
+            "scripted-model",
+            None,
+        );
+        let mut pipeline = Pipeline::new(&config, "test scope", &root);
+        let step = pipeline.finalize_run(&relative, Step::Complete);
+        assert!(matches!(step, Step::Complete));
+
+        let metrics: crate::metrics::RunMetrics = serde_json::from_slice(
+            &fs::read(root.join(&relative).join("metrics.json")).expect("metrics exist"),
+        )
+        .expect("the persisted metrics document is valid JSON");
+        assert_eq!(metrics.http_requests, 4);
+        assert_eq!(metrics.http_retries, 1);
+        assert_eq!(metrics.provider_roles.len(), 1);
+        assert_eq!(metrics.provider_roles[0].role, "mid");
+        assert_eq!(metrics.provider_roles[0].steps, 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn sample_scorecard() -> crate::review::ReviewScorecard {
         crate::review::ReviewScorecard {
             keeper_coverage: "ok".to_string(),
@@ -2262,6 +2888,8 @@ mod tests {
             transition_failures: 0,
             transition_gate_runs: 0,
             transition_gate_elapsed_ms: 0,
+            queue_rounds: Vec::new(),
+            review_rounds: Vec::new(),
         }
     }
 

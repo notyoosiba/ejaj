@@ -15,6 +15,9 @@ mod common;
 #[path = "support/retry_tests.rs"]
 mod retry_tests;
 
+#[path = "support/metrics_lifecycle_tests.rs"]
+mod metrics_lifecycle_tests;
+
 use ejaj::Config;
 use ejaj::api::{CallError, Outgoing, RawResponse, Transport};
 use ejaj::loops::plan::{Outcome as PlanOutcome, Session};

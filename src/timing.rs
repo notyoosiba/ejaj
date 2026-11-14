@@ -79,6 +79,24 @@ where
     (value, started.elapsed())
 }
 
+/// Time `operation` against an injected monotonic clock and return both its
+/// value and the elapsed duration.
+///
+/// The clock is read immediately before the closure is entered and immediately
+/// after it returns, so only the operation itself is inside the measured
+/// interval. The difference saturates at zero if a clock ever reads backwards:
+/// a monotonic source cannot, but the arithmetic must not panic if a test
+/// stand-in violates that contract.
+pub(crate) fn measured_with<T, F>(clock: &dyn Clock, operation: F) -> (T, Duration)
+where
+    F: FnOnce() -> T,
+{
+    let started = clock.now();
+    let value = operation();
+    let finished = clock.now();
+    (value, finished.saturating_sub(started))
+}
+
 /// Time `operation`, report its elapsed duration once, and return the
 /// operation's value unchanged.
 ///
@@ -111,23 +129,23 @@ where
 /// computed from the unrounded contributions, so flooring one category can
 /// never move the unaccounted time into another.
 ///
-/// The type is crate-internal and serializable, with every field defaulting to
-/// zero when a payload omits it, so a round that reported no timing still
-/// decodes and a report written before a category existed stays readable. It
-/// reports nothing by itself: the measured queue round owns where the values go.
+/// The type is publicly serializable, with every field defaulting to zero when
+/// a payload omits it, so a round that reported no timing still decodes and a
+/// report written before a category existed stays readable. It reports nothing
+/// by itself: the measured queue round owns where the values go.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-pub(crate) struct QueueTimingBreakdown {
+pub struct QueueTimingBreakdown {
     /// The measured whole-round interval.
-    pub(crate) total_elapsed_ms: u64,
+    pub total_elapsed_ms: u64,
     /// The part attributed to completed provider attempts.
-    pub(crate) model_attempt_ms: u64,
+    pub model_attempt_ms: u64,
     /// The part attributed to executed command tools.
-    pub(crate) executed_tool_ms: u64,
+    pub executed_tool_ms: u64,
     /// The part attributed to verification gates.
-    pub(crate) verification_gate_ms: u64,
+    pub verification_gate_ms: u64,
     /// The part of the round attributed to no measured contributor.
-    pub(crate) residual_overhead_ms: u64,
+    pub residual_overhead_ms: u64,
 }
 
 /// Ephemeral accounting of the time one queue round already spent inside a

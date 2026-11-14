@@ -59,6 +59,17 @@ pub enum Outcome {
     Failed(FailureKind),
 }
 
+/// One summary pass's outcome together with the measurements its candidate
+/// loop took. The outcome is the same value the public entry point returns.
+#[derive(Debug)]
+pub(crate) struct SummaryAttempt {
+    pub(crate) outcome: Outcome,
+    /// The measurements this attempt recorded. The public entry point does not
+    /// expose them; the tests here and the run-metrics persistence consume them.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) metrics: crate::metrics::SummaryMetrics,
+}
+
 /// Write one change summary for the run the queue just finished.
 ///
 /// One fresh transcript per call: the scope, the queue outcome and the queue
@@ -112,15 +123,49 @@ pub(crate) fn summarize_in(
     ticket_ids: &[String],
     invocation: InvocationContext<'_>,
 ) -> Outcome {
-    let mut messages = vec![
-        Message::system(format!("{}{}", prompts::SUMMARY_SYSTEM_PROMPT, scope)),
-        Message::user(format!(
-            "{}{}",
-            prompts::SUMMARY_KICKOFF_PROMPT,
-            kickoff(outcome, report, review)
-        )),
-    ];
-    summary_pass(&mut messages, config, ticket_ids, invocation)
+    summarize_with_metrics_in(
+        config, scope, outcome, report, review, ticket_ids, invocation,
+    )
+    .outcome
+}
+
+/// The same summary pass as [`summarize`], also returning what its candidate
+/// loop measured: elapsed whole milliseconds, the present candidates that were
+/// generated, whether one was accepted, and the ordered rejection categories.
+///
+/// The public entry point and the pipeline's existing caller both delegate
+/// here, so the canonicalization and correction behavior is exactly the one
+/// public callers already had. An absent answer or a failed generation adds no
+/// candidate and no rejection; every present candidate is counted, and every
+/// rejected candidate is classified before the pass corrects it or ends.
+pub(crate) fn summarize_with_metrics_in(
+    config: &Config,
+    scope: &str,
+    outcome: &str,
+    report: &str,
+    review: &str,
+    ticket_ids: &[String],
+    invocation: InvocationContext<'_>,
+) -> SummaryAttempt {
+    let mut metrics = crate::metrics::SummaryMetrics::default();
+    let (outcome, elapsed) = crate::timing::measured(|| {
+        let mut messages = vec![
+            Message::system(format!("{}{}", prompts::SUMMARY_SYSTEM_PROMPT, scope)),
+            Message::user(format!(
+                "{}{}",
+                prompts::SUMMARY_KICKOFF_PROMPT,
+                kickoff(outcome, report, review)
+            )),
+        ];
+        summary_pass_with_metrics(&mut messages, config, ticket_ids, invocation, &mut metrics)
+    });
+    metrics.elapsed_ms = crate::metrics::duration_ms(elapsed);
+    metrics.outcome = match &outcome {
+        Outcome::Summary(_) => crate::metrics::SummaryOutcome::Accepted,
+        Outcome::Invalid(_) => crate::metrics::SummaryOutcome::Invalid,
+        Outcome::Failed(kind) => crate::metrics::SummaryOutcome::from_failure_kind(*kind),
+    };
+    SummaryAttempt { outcome, metrics }
 }
 
 /// The most summary answers one pass may generate: the initial candidate plus
@@ -139,11 +184,27 @@ const MAX_CANDIDATES: usize = 4;
 /// answer returns immediately, and the fourth rejection is the pass's failure.
 /// An absent answer or a generation failure stays fatal and never buys a
 /// correction.
+#[cfg(test)]
 fn summary_pass(
     messages: &mut Vec<Message>,
     config: &Config,
     ticket_ids: &[String],
     invocation: InvocationContext<'_>,
+) -> Outcome {
+    let mut metrics = crate::metrics::SummaryMetrics::default();
+    summary_pass_with_metrics(messages, config, ticket_ids, invocation, &mut metrics)
+}
+
+/// The candidate loop, also recording its measurements into metrics. Only a
+/// present answer counts as a candidate; a rejected candidate is classified
+/// before the pass corrects it or returns the fourth rejection, and acceptance
+/// is recorded only for a candidate the unchanged canonicalizer accepts.
+fn summary_pass_with_metrics(
+    messages: &mut Vec<Message>,
+    config: &Config,
+    ticket_ids: &[String],
+    invocation: InvocationContext<'_>,
+    metrics: &mut crate::metrics::SummaryMetrics,
 ) -> Outcome {
     let mut candidate = 0;
     loop {
@@ -157,10 +218,17 @@ fn summary_pass(
         let Some(answer) = answer else {
             return Outcome::Invalid(absent_answer_reason());
         };
+        metrics.candidates_generated = metrics.candidates_generated.saturating_add(1);
 
         match canonicalize_with_ticket_ids(&answer, ticket_ids) {
-            Ok(summary) => return Outcome::Summary(summary),
+            Ok(summary) => {
+                metrics.accepted = true;
+                return Outcome::Summary(summary);
+            }
             Err(reason) => {
+                metrics
+                    .rejected_candidates
+                    .push(crate::metrics::classify_summary_rejection(&reason));
                 if candidate == MAX_CANDIDATES {
                     return Outcome::Invalid(reason);
                 }
@@ -1036,6 +1104,243 @@ mod tests {
         Config::new(MID_URL, "mid-model", Some("mid-key".to_string()))
             .with_smoll(SMOLL_URL, SMOLL_MODEL, SMOLL_KEY)
             .with_transport(script)
+    }
+
+    // -----------------------------------------------------------------------
+    // The metrics-aware summary path: candidate counts, ordered rejection
+    // categories, acceptance and the final outcome, over the same scripted
+    // transport and the same real canonicalizer.
+    // -----------------------------------------------------------------------
+
+    use crate::metrics::SummaryRejectionCategory;
+
+    /// One scripted summary attempt through the internal metrics-aware path.
+    fn attempt(script: Arc<Script>) -> SummaryAttempt {
+        let config = mid_config(script);
+        summarize_with_metrics_in(
+            &config,
+            "# scope",
+            "resolved: every ticket completed",
+            "# Report\n",
+            "# Review report\n",
+            &[],
+            InvocationContext::default(),
+        )
+    }
+
+    /// Core entry-point behavior: three distinct rejected candidates keep their
+    /// categories in generation order, and the fourth, canonical candidate is
+    /// accepted and counted.
+    #[test]
+    fn when_summary_candidates_are_rejected_given_distinct_reasons_then_records_categories_in_order()
+     {
+        let script = Script::new(vec![
+            answer("feat: add the thing\n"),
+            answer("```\nfeat: add the thing\n\nBody line.\n```\n"),
+            answer("feat: Add the thing\n\nBody line.\n"),
+            answer(VALID),
+        ]);
+        let attempt = attempt(script.clone());
+
+        match attempt.outcome {
+            Outcome::Summary(text) => assert_eq!(text, VALID),
+            other => panic!("expected the canonical summary, got {other:?}"),
+        }
+        assert_eq!(attempt.metrics.candidates_generated, 4);
+        assert_eq!(
+            attempt.metrics.rejected_candidates,
+            vec![
+                SummaryRejectionCategory::EmptyBody,
+                SummaryRejectionCategory::MarkdownFence,
+                SummaryRejectionCategory::InvalidHeaderOrPreamble,
+            ],
+            "each rejection is classified in generation order"
+        );
+        assert!(attempt.metrics.accepted);
+        assert_eq!(
+            attempt.metrics.outcome,
+            crate::metrics::SummaryOutcome::Accepted
+        );
+        assert_eq!(
+            script.requests().len(),
+            4,
+            "three rejections buy exactly three corrections"
+        );
+    }
+
+    /// Core entry-point behavior: one rejected candidate retains its category,
+    /// the corrected candidate is accepted, and the candidate count covers both.
+    #[test]
+    fn when_summary_candidate_is_accepted_given_one_rejection_then_records_acceptance_and_count() {
+        let script = Script::new(vec![
+            answer("feat: Add the thing\n\nBody line.\n"),
+            answer(VALID),
+        ]);
+        let attempt = attempt(script.clone());
+
+        match attempt.outcome {
+            Outcome::Summary(text) => assert_eq!(text, VALID),
+            other => panic!("expected the corrected summary, got {other:?}"),
+        }
+        assert_eq!(attempt.metrics.candidates_generated, 2);
+        assert_eq!(
+            attempt.metrics.rejected_candidates,
+            vec![SummaryRejectionCategory::InvalidHeaderOrPreamble]
+        );
+        assert!(attempt.metrics.accepted);
+        assert_eq!(
+            script.requests().len(),
+            2,
+            "one rejection buys one correction"
+        );
+    }
+
+    /// Edge case: four invalid candidates exhaust the correction ceiling with
+    /// all four categories in order, and no fifth request is sent.
+    #[test]
+    fn when_summary_candidates_are_rejected_given_four_invalid_answers_then_stops_without_a_fifth_request()
+     {
+        let script = Script::new(vec![
+            answer("feat: add the thing\n"),
+            answer("```\nfeat: add the thing\n\nBody line.\n```\n"),
+            answer("feat: add the thing\n\nBody line.\n\nFixes #\n"),
+            answer("feat: Add the thing\n\nBody line.\n"),
+        ]);
+        let attempt = attempt(script.clone());
+
+        match attempt.outcome {
+            Outcome::Invalid(reason) => assert!(
+                reason.contains("lowercase"),
+                "the fourth candidate's own reason is retained: {reason}"
+            ),
+            other => panic!("four rejected candidates must remain fatal, got {other:?}"),
+        }
+        assert_eq!(attempt.metrics.candidates_generated, 4);
+        assert_eq!(
+            attempt.metrics.rejected_candidates,
+            vec![
+                SummaryRejectionCategory::EmptyBody,
+                SummaryRejectionCategory::MarkdownFence,
+                SummaryRejectionCategory::InvalidFooter,
+                SummaryRejectionCategory::InvalidHeaderOrPreamble,
+            ],
+            "every rejected candidate is classified before termination"
+        );
+        assert!(!attempt.metrics.accepted);
+        assert_eq!(
+            attempt.metrics.outcome,
+            crate::metrics::SummaryOutcome::Invalid
+        );
+        assert_eq!(
+            script.requests().len(),
+            4,
+            "the fourth rejection must not buy a fifth request"
+        );
+    }
+
+    /// Empty/zero boundary: an absent answer records no candidate and no
+    /// rejection, leaving the existing fatal outcome untouched.
+    #[test]
+    fn when_summary_answer_is_absent_given_generation_ends_without_text_then_records_no_candidate_and_preserves_outcome()
+     {
+        let attempts = crate::retry::MAX_ATTEMPTS as usize;
+        let script = Script::new(vec![reply(None, &[]); attempts]);
+        let attempt = attempt(script.clone());
+
+        match attempt.outcome {
+            Outcome::Failed(kind) => assert_eq!(kind.label(), "malformed response"),
+            other => panic!("an absent answer must keep its existing failure, got {other:?}"),
+        }
+        assert_eq!(attempt.metrics.candidates_generated, 0);
+        assert!(attempt.metrics.rejected_candidates.is_empty());
+        assert!(!attempt.metrics.accepted);
+        assert_eq!(
+            attempt.metrics.outcome,
+            crate::metrics::SummaryOutcome::FailedMalformed
+        );
+        assert_eq!(
+            script.requests().len(),
+            attempts,
+            "the transport boundary retries, but no correction request is made"
+        );
+    }
+
+    /// Regression: the public entry point keeps the canonical outcomes the
+    /// scripted valid and invalid answers produced before the metrics path.
+    #[test]
+    fn when_public_summary_entry_point_is_called_given_valid_and_invalid_answers_then_preserves_existing_canonical_outcomes()
+     {
+        let valid_script = Script::new(vec![answer(VALID)]);
+        let valid_config = mid_config(valid_script.clone());
+        match summarize(
+            &valid_config,
+            "# scope",
+            "resolved: every ticket completed",
+            "# Report\n",
+            "# Review report\n",
+            &[],
+        ) {
+            Outcome::Summary(text) => assert_eq!(text, VALID),
+            other => panic!("a valid answer must stay canonical, got {other:?}"),
+        }
+        assert_eq!(valid_script.requests().len(), 1);
+
+        let invalid_script = Script::new(vec![answer("feat: add the thing\n"); MAX_CANDIDATES]);
+        let invalid_config = mid_config(invalid_script.clone());
+        match summarize(
+            &invalid_config,
+            "# scope",
+            "resolved: every ticket completed",
+            "# Report\n",
+            "# Review report\n",
+            &[],
+        ) {
+            Outcome::Invalid(reason) => assert!(reason.contains("no body"), "{reason}"),
+            other => panic!("an invalid answer must stay fatal, got {other:?}"),
+        }
+        assert_eq!(invalid_script.requests().len(), MAX_CANDIDATES);
+    }
+
+    /// A transport failure during generation is fatal and records no candidate,
+    /// no rejection and no acceptance.
+    #[test]
+    fn when_summary_generation_fails_given_api_error_then_records_no_candidate_and_preserves_failure()
+     {
+        struct ApiFailure;
+
+        impl Transport for ApiFailure {
+            fn send(&self, _outgoing: &Outgoing) -> Result<RawResponse, CallError> {
+                Err(CallError::Api {
+                    status: 400,
+                    message: "bad request".to_string(),
+                })
+            }
+        }
+
+        let config = Config::new(MID_URL, "mid-model", Some("mid-key".to_string()))
+            .with_smoll(SMOLL_URL, SMOLL_MODEL, SMOLL_KEY)
+            .with_transport(Arc::new(ApiFailure));
+        let attempt = summarize_with_metrics_in(
+            &config,
+            "# scope",
+            "resolved: every ticket completed",
+            "# Report\n",
+            "# Review report\n",
+            &[],
+            InvocationContext::default(),
+        );
+
+        match attempt.outcome {
+            Outcome::Failed(kind) => assert_eq!(kind.label(), "API error"),
+            other => panic!("a generation failure must keep its existing outcome, got {other:?}"),
+        }
+        assert_eq!(attempt.metrics.candidates_generated, 0);
+        assert!(attempt.metrics.rejected_candidates.is_empty());
+        assert!(!attempt.metrics.accepted);
+        assert_eq!(
+            attempt.metrics.outcome,
+            crate::metrics::SummaryOutcome::FailedApi
+        );
     }
 
     /// A tool call and then a plain answer: the pass runs the tool, asks again,

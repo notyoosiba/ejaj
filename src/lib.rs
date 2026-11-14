@@ -13,6 +13,7 @@ pub mod api;
 pub mod config;
 pub mod llm;
 pub mod loops;
+pub mod metrics;
 pub mod orchestrator;
 pub mod pipeline;
 pub mod plan_document;
