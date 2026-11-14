@@ -12,6 +12,7 @@ README.md and AGENTS.md must always be written in ASD-STE100 Simplified Technica
 - Read this guide before you change a prompt, a tool, or an agent loop.
 - Run `cargo test` after each change.
 - Keep the crate warning-free.
+- Do not read application state from the `.ejaj` directory.
 
 ## Configuration
 
@@ -136,6 +137,16 @@ file value wins.
 
 `.env.example` is the worked application configuration. Do not store real keys
 in it.
+
+## .ejaj directory
+
+The application writes run artifacts, trajectories, and metrics to `.ejaj/`.
+These files are output records only. They do not store application state.
+
+The application keeps run state in memory and reads file changes from Git. An
+agent run must not need `.ejaj/` to exist or read state from `.ejaj/`. Only
+offline reports (`--metrics`) and self-diagnostic commands can read `.ejaj/`
+records.
 
 ## Tests
 
