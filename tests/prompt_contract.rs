@@ -620,21 +620,96 @@ fn when_assigning_criteria_given_shared_story_spans_tickets_then_each_ticket_car
 #[test]
 fn when_preserving_prompt_contracts_given_shared_story_guidance_then_fields_and_sequence_remain_stable()
  {
+    assert_ticket_fields_in_order();
+    assert_eq!(
+        TICKETS_SYSTEM_PROMPT
+            .matches("expand, migrate, contract")
+            .count(),
+        1,
+        "Step 3 must remain the sole source of expand-migrate-contract sequencing"
+    );
+}
+
+/// Return the handoff schema's field names in the order the prompt lists them.
+fn ticket_field_names() -> Vec<&'static str> {
     let schema_start = TICKETS_SYSTEM_PROMPT
         .find("with exactly these fields:")
         .expect("TICKETS_SYSTEM_PROMPT must keep its handoff schema");
     let schema_end = TICKETS_SYSTEM_PROMPT
         .find("The `verification_gate` must demonstrate")
         .expect("TICKETS_SYSTEM_PROMPT must keep the verification-gate guidance after it");
-    let fields: Vec<&str> = TICKETS_SYSTEM_PROMPT[schema_start..schema_end]
+    TICKETS_SYSTEM_PROMPT[schema_start..schema_end]
         .lines()
         .filter_map(|line| line.strip_prefix("- `"))
         .filter_map(|rest| rest.split_once("`: ").map(|(name, _)| name))
-        .collect();
+        .collect()
+}
+
+/// Assert the handoff schema still renders exactly its eleven fields, in order.
+fn assert_ticket_fields_in_order() {
     assert_eq!(
-        fields, TICKETS_FIELDS_IN_ORDER,
+        ticket_field_names(),
+        TICKETS_FIELDS_IN_ORDER,
         "the handoff schema must keep exactly its eleven existing fields in order"
     );
+}
+
+/// The direct-producer rule the consumed-contract guidance must state: a
+/// transitive ancestor is never a substitute for a direct `blocked_by` edge to
+/// the ticket that produces the consumed type, field, function, or behavior.
+const TICKETS_DIRECT_PRODUCER_RULE: &str = "Every in-set ticket that produces a type, field, function, or behavior the ticket consumes must appear directly in that ticket's `blocked_by` list: a transitive ancestor is never a substitute for a direct edge to the producer.";
+
+/// Core entry-point behavior: a ticket that consumes a type, field, function,
+/// or behavior another in-set ticket produces names that producing ticket
+/// directly in its own `blocked_by` list instead of relying on a transitive
+/// ancestor.
+#[test]
+fn when_preserving_ticket_guidance_given_consumed_sibling_contract_then_requires_direct_blocker() {
+    assert_tickets_prompt_contains(&[TICKETS_DIRECT_PRODUCER_RULE]);
+    let rule_sentence = TICKETS_SYSTEM_PROMPT
+        .split_inclusive('.')
+        .find(|sentence| {
+            sentence.contains("must appear directly in that ticket's `blocked_by` list")
+        })
+        .expect("TICKETS_SYSTEM_PROMPT must state the direct-producer rule");
+    for consumed in [
+        "Every in-set ticket",
+        "produces a type",
+        "field",
+        "function",
+        "behavior",
+        "the ticket consumes",
+    ] {
+        assert!(
+            rule_sentence.contains(consumed),
+            "the direct-producer rule must cover `{consumed}`: {rule_sentence}"
+        );
+    }
+}
+
+/// Contract and invariant check: adding the direct-producer rule leaves the
+/// eleven handoff fields in their existing order and keeps every pinned ticket
+/// instruction, including the consumed and produced contract wording.
+#[test]
+fn when_preserving_ticket_guidance_given_direct_producer_rule_then_keeps_schema_and_pinned_guidance()
+ {
+    assert_ticket_fields_in_order();
+    assert_tickets_prompt_contains(&[
+        "Turn the specification below into an ordered set of tickets without prompting the user.",
+        "1. **Inspect the codebase (read-only) with `execute_script`:**",
+        "2. **Slice the specification into vertical slices:**",
+        "3. **Sequence a wide mechanical change as expand, migrate, contract:**",
+        "4. **Look for prefactoring first:** make the change easy, then make the easy change.",
+        "5. **Hand over:** call `finish_tickets` with the whole set.",
+        "Batch small same-shape edits into one ticket only when they share one verification gate",
+        TICKETS_TRACKER_FOLDING_NEEDLE,
+        "When a ticket consumes a contract from a ticket named in its `blocked_by`, `prerequisites_assumed` must state the exact Rust module paths, type names, and complete function signatures, including every parameter type and every return type.",
+        "When a ticket produces a contract for a ticket named in its `blocks`, `scope_of_changes` must state the exact public type names and complete function signatures, including every parameter type and every return type.",
+        "Always distinguish the consumed prerequisite contract from the produced scope contract.",
+        "Do not repeat expand-migrate-contract sequencing here: Step 3 remains its sole source.",
+        "Do not invent an interface when the ticket has no applicable `blocked_by` dependency or no downstream `blocks` consumer; write `None.` instead.",
+        "Use a narrow test selection (`cargo test <module>::tests`)",
+    ]);
     assert_eq!(
         TICKETS_SYSTEM_PROMPT
             .matches("expand, migrate, contract")
@@ -870,4 +945,65 @@ fn when_triaging_given_shared_story_boundary_cases_then_narrows_only_self_contai
             "the narrowing directive must stay conditional, never `{unconditional}`"
         );
     }
+}
+
+/// Core entry-point behavior: triage audits each assumed prerequisite against
+/// the consumer's direct blockers and their recursively reachable blocker
+/// ancestors, compares an ancestor producer's declared scope with the assumed
+/// types, fields or signatures, and records the supplying producer chain in the
+/// classification notes.
+#[test]
+fn when_auditing_triage_guidance_given_transitive_producer_then_requires_ancestry_evidence() {
+    let step_two = triage_step_two();
+    for needle in [
+        "the direct blockers and their recursively reachable blocker ancestors",
+        "follow every `blocked_by` chain to its end",
+        "compare an ancestor producer's declared `scope_of_changes` with the assumed types, fields, or function signatures",
+        "record in the notes the audited producer chain and what contract its scope supplies",
+    ] {
+        assert!(
+            step_two.contains(needle),
+            "Step 2 of TRIAGE_SYSTEM_PROMPT must contain `{needle}`"
+        );
+    }
+}
+
+/// Contract and invariant check: an ancestor supplier audited as evidence makes
+/// a redundant direct edge unnecessary without changing the draft dependency
+/// list, an unsupplied prerequisite stays a finding, and the existing
+/// shared-story narrowing wording survives exactly once.
+#[test]
+fn when_preserving_triage_guidance_given_ancestor_evidence_then_keeps_dependencies_and_shared_story_narrowing()
+ {
+    let step_two = triage_step_two();
+    for needle in [
+        "The absence of a redundant direct `blocked_by` edge to that ancestor supplier is not a finding by itself",
+        "never mark the ticket `ready-for-human` or `needs-info` only because that direct edge is absent",
+        "When neither the repository nor any direct or transitive `blocked_by` producer supplies an assumed prerequisite, that missing prerequisite is a finding under the existing classification rules",
+        "the ready Agent Brief keeps the draft ticket's `blocked_by` list unchanged",
+        "no dependency is added, removed, reordered, or duplicated",
+    ] {
+        assert!(
+            step_two.contains(needle),
+            "Step 2 of TRIAGE_SYSTEM_PROMPT must contain `{needle}`"
+        );
+    }
+
+    for brief_rule in [
+        "the draft ticket's own dependency ids from its YAML front matter under ## Original Tickets, unchanged",
+        "Never add a dependency, never drop one, never repeat one",
+        "Carry the dependencies the draft ticket declared in its YAML front matter, unchanged, in the brief's blocked_by",
+    ] {
+        assert!(
+            TRIAGE_SYSTEM_PROMPT.contains(brief_rule),
+            "TRIAGE_SYSTEM_PROMPT must keep its dependency-preservation rule `{brief_rule}`"
+        );
+    }
+
+    let narrowing = "narrow that ticket's `acceptance_criteria` in its Agent Brief to the criteria its own scope implements";
+    assert_eq!(
+        step_two.matches(narrowing).count(),
+        1,
+        "Step 2 must keep the shared-story narrowing wording `{narrowing}` exactly once"
+    );
 }

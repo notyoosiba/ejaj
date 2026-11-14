@@ -241,6 +241,10 @@ impl TicketSet {
             ));
         }
 
+        if let Some(error) = validate_prerequisite_references(&self.tickets) {
+            return Err(error);
+        }
+
         for ticket in &self.tickets {
             let id = ticket.id.trim();
 
@@ -359,6 +363,55 @@ impl TicketSet {
 
         Ok(())
     }
+}
+
+/// Refuse a prerequisite that names a sibling ticket id the consumer does not declare
+/// directly in `blocked_by`.
+///
+/// The checks run after the structural rules and before per-ticket content validation, so the
+/// first failure stays deterministic. Tickets are visited in emitted order and, within one
+/// ticket, siblings are visited in emitted order; the consumer's own trimmed id is ignored and
+/// direct blockers are compared after trimming.
+fn validate_prerequisite_references(tickets: &[Ticket]) -> Option<String> {
+    for ticket in tickets {
+        let id = ticket.id.trim();
+        let declared: HashSet<&str> = ticket
+            .blocked_by
+            .iter()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        for sibling in tickets {
+            let sibling_id = sibling.id.trim();
+            if sibling_id == id || declared.contains(sibling_id) {
+                continue;
+            }
+            if contains_ticket_id_token(&ticket.prerequisites_assumed, sibling_id) {
+                return Some(format!(
+                    "[ERROR] ticket `{id}` names sibling ticket `{sibling_id}` in \
+                     `prerequisites_assumed`, which is not in its `blocked_by` list; add \
+                     `{sibling_id}` to `blocked_by` so every consumed producer ticket is \
+                     declared directly"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Whether `text` contains `candidate` as an exact, case-sensitive token.
+///
+/// A character immediately before or after an occurrence, when present, prevents a match when it
+/// is an id character, so ids that overlap as substrings never match one another.
+fn contains_ticket_id_token(text: &str, candidate: &str) -> bool {
+    if candidate.is_empty() {
+        return false;
+    }
+    text.match_indices(candidate).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + candidate.len()..].chars().next();
+        !before.is_some_and(is_id_char) && !after.is_some_and(is_id_char)
+    })
 }
 
 /// Whether `entry` is the specification module's `None.` marker, ignoring surrounding
@@ -1631,5 +1684,244 @@ cargo test tickets
         set.tickets[0].acceptance_criteria = vec!["  The shared criterion.  ".to_string()];
         set.tickets[1].acceptance_criteria = vec!["The\tshared   criterion.".to_string()];
         assert_eq!(set.validate(), Ok(()));
+    }
+
+    /// A set whose ids overlap as substrings: `1-core` is contained in `1-core-ext`, so a
+    /// sibling-token match must respect id-character boundaries.
+    fn overlapping_set() -> TicketSet {
+        let mut set = valid_set();
+        set.tickets[0].id = "1-core".to_string();
+        set.tickets[0].blocks = vec!["1-core-ext".to_string()];
+        set.tickets[0].prerequisites_assumed = "Nothing.".to_string();
+        set.tickets[1].id = "1-core-ext".to_string();
+        set.tickets[1].blocked_by = vec!["1-core".to_string()];
+        set.tickets[1].prerequisites_assumed = "The core type exists.".to_string();
+        set.tickets.push(Ticket {
+            id: "2-consumer".to_string(),
+            blocked_by: vec!["1-core-ext".to_string()],
+            blocks: Vec::new(),
+            title: "Consumer".to_string(),
+            objective: "Consume the extended core type.".to_string(),
+            acceptance_criteria: vec!["The consumer uses the extended core.".to_string()],
+            prerequisites_assumed: "Consumes 1-core-ext.".to_string(),
+            out_of_scope: Vec::new(),
+            scope_of_changes: vec!["Wire the consumer to the core.".to_string()],
+            test_expectations: vec!["when_consuming_given_core_then_works".to_string()],
+            verification_gate: "cargo test".to_string(),
+        });
+        set
+    }
+
+    #[test]
+    fn when_validating_prerequisites_given_undeclared_sibling_mentioned_then_rejects_with_actionable_error()
+     {
+        let mut set = valid_set();
+        set.tickets[0].prerequisites_assumed = "Consumes the contract from `2-second`.".to_string();
+        let error = set.validate().expect_err("must not validate");
+        assert!(error.contains("ticket `1-first`"), "{error}");
+        assert!(error.contains("sibling ticket `2-second`"), "{error}");
+        assert!(error.contains("blocked_by"), "{error}");
+        assert!(
+            error.contains("add `2-second` to `blocked_by`"),
+            "the error must instruct adding the sibling to `blocked_by`: {error}"
+        );
+    }
+
+    #[test]
+    fn when_validating_prerequisites_given_declared_direct_blocker_then_accepts() {
+        let mut set = valid_set();
+        set.tickets[1].blocked_by = vec!["  1-first  ".to_string()];
+        set.tickets[1].prerequisites_assumed = "  Consumes the  1-first  contract.  ".to_string();
+        assert_eq!(set.validate(), Ok(()));
+
+        // A mention without any sibling id is the minimum valid boundary.
+        let mut set = valid_set();
+        set.tickets[0].prerequisites_assumed =
+            "Nothing is assumed about other tickets.".to_string();
+        assert_eq!(set.validate(), Ok(()));
+    }
+
+    #[test]
+    fn when_validating_prerequisites_given_token_boundary_cases_then_matches_exact_ids() {
+        struct Case<'a> {
+            name: &'a str,
+            ticket: usize,
+            prerequisites: &'a str,
+            blocked_by: Vec<&'a str>,
+            rejected_sibling: Option<&'a str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "self mention only",
+                ticket: 0,
+                prerequisites: "Follows the 1-core design.",
+                blocked_by: vec![],
+                rejected_sibling: None,
+            },
+            Case {
+                name: "no sibling mention with no blockers",
+                ticket: 0,
+                prerequisites: "Nothing is assumed about other tickets.",
+                blocked_by: vec![],
+                rejected_sibling: None,
+            },
+            Case {
+                name: "case-different mention of a sibling",
+                ticket: 2,
+                prerequisites: "Consumes the 1-CORE fields.",
+                blocked_by: vec!["1-core-ext"],
+                rejected_sibling: None,
+            },
+            Case {
+                name: "longer id containing the shorter sibling",
+                ticket: 2,
+                prerequisites: "Consumes the 1-core-ext fields.",
+                blocked_by: vec!["1-core-ext"],
+                rejected_sibling: None,
+            },
+            Case {
+                name: "id-character letter prefix prevents a match",
+                ticket: 2,
+                prerequisites: "Consumes the v1-core fields.",
+                blocked_by: vec!["1-core-ext"],
+                rejected_sibling: None,
+            },
+            Case {
+                name: "id-character digit prefix prevents a match",
+                ticket: 2,
+                prerequisites: "Consumes the 21-core fields.",
+                blocked_by: vec!["1-core-ext"],
+                rejected_sibling: None,
+            },
+            Case {
+                name: "id-character dot suffix prevents a match",
+                ticket: 2,
+                prerequisites: "Consumes the 1-core.ext fields.",
+                blocked_by: vec!["1-core-ext"],
+                rejected_sibling: None,
+            },
+            Case {
+                name: "id-character underscore suffix prevents a match",
+                ticket: 2,
+                prerequisites: "Consumes the 1-core_extra fields.",
+                blocked_by: vec!["1-core-ext"],
+                rejected_sibling: None,
+            },
+            Case {
+                name: "shorter sibling as an exact token",
+                ticket: 2,
+                prerequisites: "Consumes the 1-core fields.",
+                blocked_by: vec!["1-core-ext"],
+                rejected_sibling: Some("1-core"),
+            },
+            Case {
+                name: "sibling bounded by punctuation",
+                ticket: 2,
+                prerequisites: "Consumes (1-core), then stops.",
+                blocked_by: vec!["1-core-ext"],
+                rejected_sibling: Some("1-core"),
+            },
+        ];
+
+        for case in cases {
+            let mut set = overlapping_set();
+            set.tickets[case.ticket].prerequisites_assumed = case.prerequisites.to_string();
+            set.tickets[case.ticket].blocked_by = case
+                .blocked_by
+                .iter()
+                .map(|entry| entry.to_string())
+                .collect();
+            match case.rejected_sibling {
+                None => assert_eq!(
+                    set.validate(),
+                    Ok(()),
+                    "case `{}` must be accepted",
+                    case.name
+                ),
+                Some(sibling) => {
+                    let error = set
+                        .validate()
+                        .expect_err("the undeclared sibling must be rejected");
+                    assert!(
+                        error.contains(&format!("sibling ticket `{sibling}`")),
+                        "case `{}` must name `{sibling}`: {error}",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn when_validating_prerequisites_given_multiple_missing_siblings_then_reports_first_in_emitted_order()
+     {
+        // Two missing siblings on one consumer: the first sibling in emitted order is named.
+        let mut set = overlapping_set();
+        set.tickets[2].blocked_by.clear();
+        set.tickets[2].prerequisites_assumed = "Consumes both 1-core and 1-core-ext.".to_string();
+        let error = set.validate().expect_err("must not validate");
+        assert!(
+            error.contains("ticket `2-consumer` names sibling ticket `1-core`"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("sibling ticket `1-core-ext`"),
+            "the later sibling is not named: {error}"
+        );
+
+        // Two failing consumers: the first consumer in emitted order is named.
+        let mut set = valid_set();
+        set.tickets[0].blocked_by.clear();
+        set.tickets[1].blocked_by.clear();
+        set.tickets[0].prerequisites_assumed = "Consumes `2-second`.".to_string();
+        set.tickets[1].prerequisites_assumed = "Consumes `1-first`.".to_string();
+        let error = set.validate().expect_err("must not validate");
+        assert!(
+            error.contains("ticket `1-first` names sibling ticket `2-second`"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("ticket `2-second` names sibling"),
+            "the later consumer is not named: {error}"
+        );
+    }
+
+    #[test]
+    fn when_validating_prerequisites_given_structural_or_content_errors_then_preserves_validation_precedence()
+     {
+        // A missing dependency is reported before any undeclared sibling.
+        let mut set = valid_set();
+        set.tickets[0].prerequisites_assumed = "Consumes `2-second`.".to_string();
+        set.tickets[1].blocked_by = vec!["9-absent".to_string()];
+        let error = set.validate().expect_err("must not validate");
+        assert!(error.contains("9-absent"), "{error}");
+        assert!(!error.contains("prerequisites_assumed"), "{error}");
+        assert!(!error.contains("sibling"), "{error}");
+
+        // A dependency cycle is reported before any undeclared sibling.
+        let mut set = overlapping_set();
+        set.tickets[0].blocked_by = vec!["1-core-ext".to_string()];
+        set.tickets[2].prerequisites_assumed = "Consumes `1-core`.".to_string();
+        let error = set.validate().expect_err("must not validate");
+        assert!(error.contains("cycle"), "{error}");
+        assert!(!error.contains("prerequisites_assumed"), "{error}");
+
+        // An undeclared sibling is reported before any per-ticket content failure, even one on
+        // an earlier ticket.
+        let mut set = valid_set();
+        set.tickets[0].title = "abc".to_string();
+        set.tickets[1].blocked_by.clear();
+        set.tickets[1].prerequisites_assumed = "Consumes `1-first`.".to_string();
+        let error = set.validate().expect_err("must not validate");
+        assert!(error.contains("sibling ticket `1-first`"), "{error}");
+        assert!(!error.contains("title"), "{error}");
+
+        // Blank prerequisite validation still rejects a prerequisite that names no sibling.
+        let mut set = valid_set();
+        set.tickets[0].prerequisites_assumed = "   \n".to_string();
+        let error = set.validate().expect_err("must not validate");
+        assert!(error.contains("1-first"), "{error}");
+        assert!(error.contains("blank `prerequisites_assumed`"), "{error}");
     }
 }

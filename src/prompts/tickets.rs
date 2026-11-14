@@ -44,6 +44,7 @@ files and modules in `prerequisites_assumed` and `scope_of_changes` so the code 
 straight to them.
 
 When a ticket consumes a contract from a ticket named in its `blocked_by`, `prerequisites_assumed` must state the exact Rust module paths, type names, and complete function signatures, including every parameter type and every return type.
+Every in-set ticket that produces a type, field, function, or behavior the ticket consumes must appear directly in that ticket's `blocked_by` list: a transitive ancestor is never a substitute for a direct edge to the producer.
 When a ticket produces a contract for a ticket named in its `blocks`, `scope_of_changes` must state the exact public type names and complete function signatures, including every parameter type and every return type.
 Always distinguish the consumed prerequisite contract from the produced scope contract. Do not repeat expand-migrate-contract sequencing here: Step 3 remains its sole source.
 Do not invent an interface when the ticket has no applicable `blocked_by` dependency or no downstream `blocks` consumer; write `None.` instead.
