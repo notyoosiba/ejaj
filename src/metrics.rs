@@ -16,7 +16,7 @@
 
 use crate::api::TokenUsage;
 use crate::config::Config;
-use crate::orchestrator::QueueRoundMetrics;
+use crate::orchestrator::{AttemptOutcomeTag, QueueRoundMetrics, TicketStatusTag};
 use crate::tools::Phase;
 
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// The version of the serialized metrics contract this crate writes.
-pub const METRICS_SCHEMA_VERSION: u32 = 1;
+pub const METRICS_SCHEMA_VERSION: u32 = 2;
 
 /// The file name a persisted run-metrics document always has.
 pub const METRICS_FILE_NAME: &str = "metrics.json";
@@ -290,6 +290,8 @@ pub struct ReviewRoundMetrics {
 pub struct TransitionGateMetrics {
     /// The gate runs.
     pub runs: u64,
+    /// The gate invocations that returned an error.
+    pub failures: u64,
     /// The gate's accumulated measured interval, in whole milliseconds.
     pub elapsed_ms: u64,
 }
@@ -648,11 +650,7 @@ fn warn_unusable(path: &Path, reason: &str) {
 ///
 /// Returns whether a file was written. A lookalike such as .ejaj-extra is an
 /// ordinary destination and is left alone.
-pub fn persist_run_metrics(
-    root: &Path,
-    dir: &Path,
-    metrics: &RunMetrics,
-) -> io::Result<bool> {
+pub fn persist_run_metrics(root: &Path, dir: &Path, metrics: &RunMetrics) -> io::Result<bool> {
     let destination = if dir.is_absolute() {
         dir.to_path_buf()
     } else {
@@ -666,6 +664,872 @@ pub fn persist_run_metrics(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     fs::write(destination.join(METRICS_FILE_NAME), payload)?;
     Ok(true)
+}
+
+/// Render a deterministic offline Markdown scorecard over the direct child
+/// session directories of one corpus.
+///
+/// Only direct child directories are considered, in lexical order. A session
+/// without a metrics document is ignored; a present document that cannot be
+/// read, is not a regular file, does not decode, or does not carry the current
+/// schema version is counted once as skipped so every usable sibling still
+/// contributes. A not-found corpus root renders the same valid zero-run report
+/// as an empty one, while any other corpus-root read error is returned.
+pub fn render_corpus_report(dir: &Path) -> io::Result<String> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(CorpusAccumulator::default().render());
+        }
+        Err(error) => return Err(error),
+    };
+
+    let mut sessions = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sessions.push((entry.file_name(), entry.path()));
+        }
+    }
+    sessions.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut accumulator = CorpusAccumulator::default();
+    for (_, session) in sessions {
+        match read_session_metrics(&session) {
+            SessionMetrics::Usable(metrics) => accumulator.add(&metrics),
+            SessionMetrics::Absent => {}
+            SessionMetrics::Unusable => {
+                accumulator.skipped_files = accumulator.skipped_files.saturating_add(1);
+            }
+        }
+    }
+    Ok(accumulator.render())
+}
+
+/// One direct child session directory's metrics-document disposition.
+enum SessionMetrics {
+    /// The session has no metrics document, so it is neither analyzed nor
+    /// skipped.
+    Absent,
+    /// The session's present metrics document cannot be analyzed.
+    Unusable,
+    /// The session's present metrics document is a usable version-2 run.
+    Usable(Box<RunMetrics>),
+}
+
+/// Read one session's metrics document and classify it without ever aborting
+/// the surrounding corpus scan.
+fn read_session_metrics(session: &Path) -> SessionMetrics {
+    let path = session.join(METRICS_FILE_NAME);
+    let presence = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return SessionMetrics::Absent,
+        Err(_) => return SessionMetrics::Unusable,
+    };
+    let metadata = if presence.file_type().is_symlink() {
+        match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => return SessionMetrics::Unusable,
+        }
+    } else {
+        presence
+    };
+    if !metadata.is_file() {
+        return SessionMetrics::Unusable;
+    }
+    let Ok(bytes) = fs::read(&path) else {
+        return SessionMetrics::Unusable;
+    };
+    let metrics: RunMetrics = match serde_json::from_slice(&bytes) {
+        Ok(metrics) => metrics,
+        Err(_) => return SessionMetrics::Unusable,
+    };
+    if metrics.schema_version != METRICS_SCHEMA_VERSION {
+        return SessionMetrics::Unusable;
+    }
+    SessionMetrics::Usable(Box::new(metrics))
+}
+
+/// One mode's analyzed-run totals.
+#[derive(Default)]
+struct ModeAccumulator {
+    runs: u64,
+    completed: u64,
+}
+
+/// One provider role's corpus-wide counters, tokens and priced total.
+#[derive(Default)]
+struct RoleAccumulator {
+    invocations: u64,
+    steps: u64,
+    http_requests: u64,
+    http_retries: u64,
+    usage: TokenUsage,
+    estimated_cost_usd: f64,
+    priced: bool,
+}
+
+/// One phase's fresh-session retry attempts and their successful outcomes.
+#[derive(Default)]
+struct FreshRetryAccumulator {
+    reached: u64,
+    retried: u64,
+    succeeded: u64,
+    succeeded_after_retry: u64,
+}
+
+impl FreshRetryAccumulator {
+    /// Fold one reached pass's retry and final success outcome.
+    fn add_pass(&mut self, retried: bool, succeeded: bool) {
+        self.reached = self.reached.saturating_add(1);
+        if retried {
+            self.retried = self.retried.saturating_add(1);
+            if succeeded {
+                self.succeeded_after_retry = self.succeeded_after_retry.saturating_add(1);
+            }
+        }
+        if succeeded {
+            self.succeeded = self.succeeded.saturating_add(1);
+        }
+    }
+}
+
+/// Corpus-wide queue loop and tool-friction totals.
+#[derive(Default)]
+struct LoopFrictionAccumulator {
+    elapsed_ms: u64,
+    bash_calls: u64,
+    bash_failures: u64,
+    bash_timeouts: u64,
+    bash_output_spills: u64,
+    script_calls: u64,
+    script_failures: u64,
+    script_timeouts: u64,
+    rejected_control_calls: u64,
+    rejected_tool_calls: u64,
+    tier1_compactions: u64,
+    tier2_summaries: u64,
+    tier2_summary_failures: u64,
+    overflow_recoveries: u64,
+    truncation_recoveries: u64,
+    repeated_turn_warnings: u64,
+    repeated_turn_aborts: u64,
+}
+
+impl LoopFrictionAccumulator {
+    /// Fold one ticket's loop telemetry into the corpus totals, saturating
+    /// every counter.
+    fn add(&mut self, telemetry: &crate::loops::LoopTelemetry) {
+        self.elapsed_ms = self.elapsed_ms.saturating_add(telemetry.elapsed_ms);
+        self.bash_calls = self.bash_calls.saturating_add(telemetry.bash_calls);
+        self.bash_failures = self.bash_failures.saturating_add(telemetry.bash_failures);
+        self.bash_timeouts = self.bash_timeouts.saturating_add(telemetry.bash_timeouts);
+        self.bash_output_spills = self
+            .bash_output_spills
+            .saturating_add(telemetry.bash_output_spills);
+        self.script_calls = self
+            .script_calls
+            .saturating_add(telemetry.execute_script_calls);
+        self.script_failures = self
+            .script_failures
+            .saturating_add(telemetry.execute_script_failures);
+        self.script_timeouts = self
+            .script_timeouts
+            .saturating_add(telemetry.execute_script_timeouts);
+        self.rejected_control_calls = self
+            .rejected_control_calls
+            .saturating_add(telemetry.rejected_control_tool_calls);
+        self.rejected_tool_calls = self
+            .rejected_tool_calls
+            .saturating_add(telemetry.rejected_other_tool_calls);
+        self.tier1_compactions = self
+            .tier1_compactions
+            .saturating_add(telemetry.tier1_compactions);
+        self.tier2_summaries = self
+            .tier2_summaries
+            .saturating_add(telemetry.tier2_summaries_accepted);
+        self.tier2_summary_failures = self
+            .tier2_summary_failures
+            .saturating_add(telemetry.tier2_summary_failures);
+        self.overflow_recoveries = self
+            .overflow_recoveries
+            .saturating_add(telemetry.overflow_compaction_recoveries);
+        self.truncation_recoveries = self
+            .truncation_recoveries
+            .saturating_add(telemetry.truncation_recoveries);
+        self.repeated_turn_warnings = self
+            .repeated_turn_warnings
+            .saturating_add(telemetry.repeated_tool_warnings);
+        self.repeated_turn_aborts = self
+            .repeated_turn_aborts
+            .saturating_add(telemetry.repeated_tool_aborts);
+    }
+}
+
+/// The private corpus aggregation state. Only the rendered Markdown leaves
+/// this module, so every accumulator stays an implementation detail.
+#[derive(Default)]
+struct CorpusAccumulator {
+    analyzed_runs: u64,
+    skipped_files: usize,
+    modes: BTreeMap<String, ModeAccumulator>,
+    elapsed_total_ms: u64,
+    completed_runs: u64,
+    completed_elapsed_ms: u64,
+    priced_runs: u64,
+    estimated_cost_usd: f64,
+    priced_completed_tickets: u64,
+    terminal_outcomes: BTreeMap<String, u64>,
+    provider_roles: BTreeMap<String, RoleAccumulator>,
+    ticket_records: u64,
+    attempts: u64,
+    first_pass_completions: u64,
+    retried_tickets: u64,
+    rescued_tickets: u64,
+    first_attempt_failures: u64,
+    first_attempt_failure_categories: BTreeMap<String, u64>,
+    escalations: u64,
+    rescued_escalations: u64,
+    triage_runs: u64,
+    triage_succeeded: u64,
+    triage_retried: u64,
+    triage_outcomes: BTreeMap<String, u64>,
+    drafts: u64,
+    ready: u64,
+    done: u64,
+    blocked: u64,
+    queue_authorized: u64,
+    queue_unauthorized: u64,
+    spec_retries: FreshRetryAccumulator,
+    tickets_retries: FreshRetryAccumulator,
+    triage_retries: FreshRetryAccumulator,
+    review_retries: BTreeMap<u64, FreshRetryAccumulator>,
+    gate_runs: u64,
+    gate_failures: u64,
+    gate_elapsed_ms: u64,
+    review_rounds: u64,
+    review_stalls: u64,
+    review_outcomes: BTreeMap<String, u64>,
+    summary_runs: u64,
+    summary_accepted: u64,
+    summary_pass_at_1: u64,
+    summary_with_candidates: u64,
+    summary_outcomes: BTreeMap<String, u64>,
+    rejection_categories: BTreeMap<String, u64>,
+    friction: LoopFrictionAccumulator,
+}
+
+impl CorpusAccumulator {
+    /// Fold one analyzed version-2 run into every corpus dimension with
+    /// saturating integer addition.
+    fn add(&mut self, metrics: &RunMetrics) {
+        self.analyzed_runs = self.analyzed_runs.saturating_add(1);
+        self.elapsed_total_ms = self.elapsed_total_ms.saturating_add(metrics.elapsed_ms);
+        let completed = metrics.terminal_outcome == TerminalOutcome::Complete;
+        if completed {
+            self.completed_runs = self.completed_runs.saturating_add(1);
+            self.completed_elapsed_ms =
+                self.completed_elapsed_ms.saturating_add(metrics.elapsed_ms);
+        }
+        let mode = self.modes.entry(metrics.mode.clone()).or_default();
+        mode.runs = mode.runs.saturating_add(1);
+        if completed {
+            mode.completed = mode.completed.saturating_add(1);
+        }
+        bump(&mut self.terminal_outcomes, terminal_label(metrics));
+        if let Some(cost) = metrics.estimated_cost_usd {
+            self.priced_runs = self.priced_runs.saturating_add(1);
+            self.estimated_cost_usd += cost;
+            let completed_tickets = u64::try_from(
+                metrics
+                    .queue_rounds
+                    .iter()
+                    .flat_map(|round| round.metrics.tickets.iter())
+                    .filter(|ticket| ticket.final_status == TicketStatusTag::Completed)
+                    .count(),
+            )
+            .unwrap_or(u64::MAX);
+            self.priced_completed_tickets = self
+                .priced_completed_tickets
+                .saturating_add(completed_tickets);
+        }
+        for role in &metrics.provider_roles {
+            self.add_role(role);
+        }
+        self.add_queue(metrics);
+        self.add_triage(metrics);
+        self.add_fresh_retries(metrics);
+        self.add_transition_gate(metrics);
+        self.add_review(metrics);
+        self.add_summary(metrics);
+    }
+
+    /// Fold one provider role's counters, tokens and priced estimate.
+    fn add_role(&mut self, role: &ProviderRoleMetrics) {
+        let entry = self.provider_roles.entry(role.role.clone()).or_default();
+        entry.invocations = entry.invocations.saturating_add(role.invocations);
+        entry.steps = entry.steps.saturating_add(role.steps);
+        entry.http_requests = entry.http_requests.saturating_add(role.http_requests);
+        entry.http_retries = entry.http_retries.saturating_add(role.http_retries);
+        entry.usage = entry.usage.saturating_add(role.usage);
+        if let Some(cost) = role.estimated_cost_usd {
+            entry.estimated_cost_usd += cost;
+            entry.priced = true;
+        }
+    }
+
+    /// Fold every ticket record of every queue round into the funnel and loop
+    /// friction totals.
+    fn add_queue(&mut self, metrics: &RunMetrics) {
+        for round in &metrics.queue_rounds {
+            for ticket in &round.metrics.tickets {
+                self.ticket_records = self.ticket_records.saturating_add(1);
+                self.attempts = self.attempts.saturating_add(ticket.attempt_count);
+                let completed = ticket.final_status == TicketStatusTag::Completed;
+                if completed && ticket.attempt_count == 1 {
+                    self.first_pass_completions = self.first_pass_completions.saturating_add(1);
+                }
+                if ticket.attempt_count > 1 {
+                    self.retried_tickets = self.retried_tickets.saturating_add(1);
+                    if completed && ticket.attempt_count == 2 {
+                        self.rescued_tickets = self.rescued_tickets.saturating_add(1);
+                    }
+                }
+                let failed_first_attempt = ticket.attempt_count > 0
+                    && (ticket.attempt_count > 1
+                        || ticket.first_attempt_outcome != Some(AttemptOutcomeTag::Complete));
+                if failed_first_attempt {
+                    self.first_attempt_failures = self.first_attempt_failures.saturating_add(1);
+                    let category = ticket
+                        .first_attempt_outcome
+                        .map(attempt_outcome_label)
+                        .unwrap_or("unknown");
+                    bump(
+                        &mut self.first_attempt_failure_categories,
+                        category.to_string(),
+                    );
+                }
+                if ticket.retry_escalated {
+                    self.escalations = self.escalations.saturating_add(1);
+                    if completed {
+                        self.rescued_escalations = self.rescued_escalations.saturating_add(1);
+                    }
+                }
+                self.friction.add(&ticket.telemetry);
+            }
+        }
+    }
+
+    /// Fold the triage pass's outcomes and report-derived counts.
+    fn add_triage(&mut self, metrics: &RunMetrics) {
+        let Some(triage) = &metrics.triage else {
+            return;
+        };
+        self.triage_runs = self.triage_runs.saturating_add(1);
+        if triage.pass.succeeded {
+            self.triage_succeeded = self.triage_succeeded.saturating_add(1);
+        }
+        if triage.pass.retried {
+            self.triage_retried = self.triage_retried.saturating_add(1);
+        }
+        bump(
+            &mut self.triage_outcomes,
+            pass_outcome_label(triage.pass.outcome).to_string(),
+        );
+        self.drafts = self.drafts.saturating_add(triage.draft_count.unwrap_or(0));
+        self.ready = self.ready.saturating_add(triage.ready_count.unwrap_or(0));
+        self.done = self.done.saturating_add(triage.done_count.unwrap_or(0));
+        self.blocked = self
+            .blocked
+            .saturating_add(triage.blocked_count.unwrap_or(0));
+        match triage.queue_authorized {
+            Some(true) => self.queue_authorized = self.queue_authorized.saturating_add(1),
+            Some(false) => {
+                self.queue_unauthorized = self.queue_unauthorized.saturating_add(1);
+            }
+            None => {}
+        }
+    }
+
+    /// Fold each reached phase's fresh-session retry outcome.
+    fn add_fresh_retries(&mut self, metrics: &RunMetrics) {
+        if let Some(pass) = &metrics.spec_pass {
+            self.spec_retries.add_pass(pass.retried, pass.succeeded);
+        }
+        if let Some(pass) = &metrics.tickets_pass {
+            self.tickets_retries.add_pass(pass.retried, pass.succeeded);
+        }
+        if let Some(triage) = &metrics.triage {
+            self.triage_retries
+                .add_pass(triage.pass.retried, triage.pass.succeeded);
+        }
+        for round in &metrics.review_rounds {
+            self.review_retries
+                .entry(round.round)
+                .or_default()
+                .add_pass(round.retried, round.succeeded);
+        }
+    }
+
+    /// Fold the transition-gate aggregate.
+    fn add_transition_gate(&mut self, metrics: &RunMetrics) {
+        self.gate_runs = self.gate_runs.saturating_add(metrics.transition_gate.runs);
+        self.gate_failures = self
+            .gate_failures
+            .saturating_add(metrics.transition_gate.failures);
+        self.gate_elapsed_ms = self
+            .gate_elapsed_ms
+            .saturating_add(metrics.transition_gate.elapsed_ms);
+    }
+
+    /// Fold every review round's convergence outcome.
+    fn add_review(&mut self, metrics: &RunMetrics) {
+        let rounds = u64::try_from(metrics.review_rounds.len()).unwrap_or(u64::MAX);
+        self.review_rounds = self.review_rounds.saturating_add(rounds);
+        for round in &metrics.review_rounds {
+            if matches!(
+                round.outcome,
+                ReviewRoundOutcome::CircuitBroken | ReviewRoundOutcome::RoundCapReached
+            ) {
+                self.review_stalls = self.review_stalls.saturating_add(1);
+            }
+            bump(
+                &mut self.review_outcomes,
+                review_outcome_label(round.outcome).to_string(),
+            );
+        }
+    }
+
+    /// Fold the summary pass's outcome and rejected-candidate categories.
+    fn add_summary(&mut self, metrics: &RunMetrics) {
+        let Some(summary) = &metrics.summary else {
+            return;
+        };
+        self.summary_runs = self.summary_runs.saturating_add(1);
+        if summary.accepted {
+            self.summary_accepted = self.summary_accepted.saturating_add(1);
+        }
+        if summary.candidates_generated > 0 {
+            self.summary_with_candidates = self.summary_with_candidates.saturating_add(1);
+        }
+        if summary.accepted && summary.candidates_generated == 1 {
+            self.summary_pass_at_1 = self.summary_pass_at_1.saturating_add(1);
+        }
+        bump(
+            &mut self.summary_outcomes,
+            summary_outcome_label(summary.outcome).to_string(),
+        );
+        for category in &summary.rejected_candidates {
+            bump(
+                &mut self.rejection_categories,
+                rejection_label(*category).to_string(),
+            );
+        }
+    }
+
+    /// Render the complete scorecard with fixed section order and exactly one
+    /// final newline.
+    fn render(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "{} runs analyzed, {} metrics files skipped",
+            self.analyzed_runs, self.skipped_files
+        ));
+        lines.push(String::new());
+        lines.push("# ejaj Execution Metrics".to_string());
+        self.render_modes(&mut lines);
+        self.render_elapsed_and_cost(&mut lines);
+        self.render_terminal_outcomes(&mut lines);
+        self.render_provider_roles(&mut lines);
+        self.render_queue_funnel(&mut lines);
+        self.render_triage(&mut lines);
+        self.render_transition_gate(&mut lines);
+        self.render_review_and_summary(&mut lines);
+        self.render_friction(&mut lines);
+        let mut report = lines.join("\n");
+        report.push('\n');
+        report
+    }
+
+    /// Render per-mode run totals and completion rates in lexical mode order.
+    fn render_modes(&self, lines: &mut Vec<String>) {
+        push_heading(lines, "## Mode Summary");
+        lines.push("| Mode | Runs | Completed | Completion Rate |".to_string());
+        lines.push("| --- | --- | --- | --- |".to_string());
+        for (mode, stats) in &self.modes {
+            lines.push(format!(
+                "| {mode} | {} | {} | {} |",
+                stats.runs,
+                stats.completed,
+                completion_rate(stats.completed, stats.runs)
+            ));
+        }
+    }
+
+    /// Render elapsed totals, means and priced-run cost figures.
+    fn render_elapsed_and_cost(&self, lines: &mut Vec<String>) {
+        push_heading(lines, "## Elapsed & Cost");
+        lines.push(format!("- Total elapsed: {} ms", self.elapsed_total_ms));
+        lines.push(format!(
+            "- Mean elapsed per analyzed run: {}",
+            mean_ms(self.elapsed_total_ms, self.analyzed_runs)
+        ));
+        lines.push(format!(
+            "- Mean elapsed per completed run: {}",
+            mean_ms(self.completed_elapsed_ms, self.completed_runs)
+        ));
+        lines.push(format!("- Priced runs: {}", self.priced_runs));
+        lines.push(format!(
+            "- Estimated cost: {}",
+            cost_total(self.estimated_cost_usd, self.priced_runs > 0)
+        ));
+        lines.push(format!(
+            "- Mean cost per completed ticket: {}",
+            mean_cost(self.estimated_cost_usd, self.priced_completed_tickets)
+        ));
+    }
+
+    /// Render terminal-outcome labels in lexical order.
+    fn render_terminal_outcomes(&self, lines: &mut Vec<String>) {
+        push_heading(lines, "## Terminal Outcomes");
+        lines.push("| Outcome | Runs |".to_string());
+        lines.push("| --- | --- |".to_string());
+        for (outcome, runs) in &self.terminal_outcomes {
+            lines.push(format!("| {outcome} | {runs} |"));
+        }
+    }
+
+    /// Render provider-role counters, tokens, cache hit rates and cost totals
+    /// in lexical role order.
+    fn render_provider_roles(&self, lines: &mut Vec<String>) {
+        push_heading(lines, "## Provider Roles");
+        lines.push(
+            "| Role | Invocations | Steps | HTTP Requests | HTTP Retries | Input Tokens | Cached Input Tokens | Output Tokens | Reasoning Tokens | Cache Hit Rate | Estimated Cost |"
+                .to_string(),
+        );
+        lines.push(
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |".to_string(),
+        );
+        for (role, stats) in &self.provider_roles {
+            lines.push(format!(
+                "| {role} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                stats.invocations,
+                stats.steps,
+                stats.http_requests,
+                stats.http_retries,
+                stats.usage.input_tokens,
+                stats.usage.cached_input_tokens,
+                stats.usage.output_tokens,
+                stats.usage.reasoning_tokens,
+                cache_hit_rate(&stats.usage),
+                cost_total(stats.estimated_cost_usd, stats.priced)
+            ));
+        }
+    }
+
+    /// Render the queue ticket, attempt, rescue, failure and escalation funnel.
+    fn render_queue_funnel(&self, lines: &mut Vec<String>) {
+        push_heading(lines, "## Queue Funnel");
+        for line in [
+            format!("- Ticket records: {}", self.ticket_records),
+            format!("- Attempts: {}", self.attempts),
+            format!("- First-pass completions: {}", self.first_pass_completions),
+            format!("- Retried tickets: {}", self.retried_tickets),
+            format!("- Rescued tickets: {}", self.rescued_tickets),
+            format!("- First-attempt failures: {}", self.first_attempt_failures),
+            format!("- Escalations: {}", self.escalations),
+            format!("- Rescued escalations: {}", self.rescued_escalations),
+        ] {
+            lines.push(line);
+        }
+        lines.push(String::new());
+        lines.push("| First Attempt Outcome | Failures |".to_string());
+        lines.push("| --- | --- |".to_string());
+        for (outcome, failures) in &self.first_attempt_failure_categories {
+            lines.push(format!("| {outcome} | {failures} |"));
+        }
+    }
+
+    /// Render the triage outcomes and fresh-session retry outcomes.
+    fn render_triage(&self, lines: &mut Vec<String>) {
+        push_heading(lines, "## Triage & Fresh-Session Retries");
+        for line in [
+            format!("- Triage runs: {}", self.triage_runs),
+            format!("- Triage succeeded: {}", self.triage_succeeded),
+            format!("- Triage retried: {}", self.triage_retried),
+            format!("- Drafts: {}", self.drafts),
+            format!("- Ready: {}", self.ready),
+            format!("- Done: {}", self.done),
+            format!("- Blocked: {}", self.blocked),
+            format!("- Queue authorized: {}", self.queue_authorized),
+            format!("- Queue unauthorized: {}", self.queue_unauthorized),
+        ] {
+            lines.push(line);
+        }
+        lines.push(String::new());
+        lines.push("| Triage Outcome | Runs |".to_string());
+        lines.push("| --- | --- |".to_string());
+        for (outcome, runs) in &self.triage_outcomes {
+            lines.push(format!("| {outcome} | {runs} |"));
+        }
+        lines.push(String::new());
+        lines.push("| Phase | Reached | Retried | Succeeded | Succeeded After Retry |".to_string());
+        lines.push("| --- | --- | --- | --- | --- |".to_string());
+        for (phase, stats) in [
+            ("spec", &self.spec_retries),
+            ("tickets", &self.tickets_retries),
+            ("triage", &self.triage_retries),
+        ] {
+            lines.push(fresh_retry_row(phase, stats));
+        }
+        for (round, stats) in &self.review_retries {
+            lines.push(fresh_retry_row(&format!("review {round}"), stats));
+        }
+    }
+
+    /// Render the transition-gate run, failure and elapsed totals.
+    fn render_transition_gate(&self, lines: &mut Vec<String>) {
+        push_heading(lines, "## Transition Gate");
+        for line in [
+            format!("- Gate runs: {}", self.gate_runs),
+            format!("- Gate failures: {}", self.gate_failures),
+            format!("- Gate elapsed: {} ms", self.gate_elapsed_ms),
+        ] {
+            lines.push(line);
+        }
+    }
+
+    /// Render review convergence and stall outcomes plus summary outcomes and
+    /// rejection categories.
+    fn render_review_and_summary(&self, lines: &mut Vec<String>) {
+        push_heading(lines, "## Review & Summary");
+        lines.push(format!("- Review rounds: {}", self.review_rounds));
+        lines.push(format!("- Review stalls: {}", self.review_stalls));
+        lines.push(String::new());
+        lines.push("| Review Outcome | Rounds |".to_string());
+        lines.push("| --- | --- |".to_string());
+        for (outcome, rounds) in &self.review_outcomes {
+            lines.push(format!("| {outcome} | {rounds} |"));
+        }
+        lines.push(format!("- Summary runs: {}", self.summary_runs));
+        lines.push(format!("- Summaries accepted: {}", self.summary_accepted));
+        lines.push(format!(
+            "- Summary pass@1: {}/{} ({})",
+            self.summary_pass_at_1,
+            self.summary_with_candidates,
+            completion_rate(self.summary_pass_at_1, self.summary_with_candidates)
+        ));
+        lines.push(String::new());
+        lines.push("| Summary Outcome | Runs |".to_string());
+        lines.push("| --- | --- |".to_string());
+        for (outcome, runs) in &self.summary_outcomes {
+            lines.push(format!("| {outcome} | {runs} |"));
+        }
+        lines.push(String::new());
+        lines.push("| Summary Rejection | Candidates |".to_string());
+        lines.push("| --- | --- |".to_string());
+        for (category, candidates) in &self.rejection_categories {
+            lines.push(format!("| {category} | {candidates} |"));
+        }
+    }
+
+    /// Render the queue loop and tool-friction totals.
+    fn render_friction(&self, lines: &mut Vec<String>) {
+        let friction = &self.friction;
+        push_heading(lines, "## Queue Loop & Tool Friction");
+        for line in [
+            format!("- Bash calls: {}", friction.bash_calls),
+            format!("- Bash failures: {}", friction.bash_failures),
+            format!("- Bash timeouts: {}", friction.bash_timeouts),
+            format!("- Bash output spills: {}", friction.bash_output_spills),
+            format!("- Script calls: {}", friction.script_calls),
+            format!("- Script failures: {}", friction.script_failures),
+            format!("- Script timeouts: {}", friction.script_timeouts),
+            format!(
+                "- Rejected control calls: {}",
+                friction.rejected_control_calls
+            ),
+            format!("- Rejected tool calls: {}", friction.rejected_tool_calls),
+            format!("- Tier 1 compactions: {}", friction.tier1_compactions),
+            format!("- Tier 2 summaries: {}", friction.tier2_summaries),
+            format!(
+                "- Tier 2 summary failures: {}",
+                friction.tier2_summary_failures
+            ),
+            format!("- Overflow recoveries: {}", friction.overflow_recoveries),
+            format!(
+                "- Truncation recoveries: {}",
+                friction.truncation_recoveries
+            ),
+            format!(
+                "- Repeated-turn warnings: {}",
+                friction.repeated_turn_warnings
+            ),
+            format!("- Repeated-turn aborts: {}", friction.repeated_turn_aborts),
+            format!("- Loop elapsed: {} ms", friction.elapsed_ms),
+        ] {
+            lines.push(line);
+        }
+    }
+}
+
+/// Append one blank-separated level-two heading.
+fn push_heading(lines: &mut Vec<String>, heading: &str) {
+    lines.push(String::new());
+    lines.push(heading.to_string());
+    lines.push(String::new());
+}
+
+/// One fresh-session table row in the declared column order.
+fn fresh_retry_row(phase: &str, stats: &FreshRetryAccumulator) -> String {
+    format!(
+        "| {phase} | {} | {} | {} | {} |",
+        stats.reached, stats.retried, stats.succeeded, stats.succeeded_after_retry
+    )
+}
+
+/// Saturating increment of one map-backed counter.
+fn bump(map: &mut BTreeMap<String, u64>, key: String) {
+    let slot = map.entry(key).or_insert(0);
+    *slot = slot.saturating_add(1);
+}
+
+/// The stable terminal-outcome label, including the explanatory detail when
+/// the run carries one.
+fn terminal_label(metrics: &RunMetrics) -> String {
+    let (base, fallback) = match metrics.terminal_outcome {
+        TerminalOutcome::Complete => return "complete".to_string(),
+        TerminalOutcome::Retry => ("retry", "unspecified"),
+        TerminalOutcome::WriteFailed => ("write_failed", "unspecified"),
+        TerminalOutcome::SummaryFailed => ("summary_failed", "summary"),
+        TerminalOutcome::GitFailed => ("git_failed", "unspecified"),
+    };
+    let detail = metrics
+        .terminal_detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| detail.replace(['\n', '\r'], " ").replace('|', "/"));
+    format!("{base}: {}", detail.as_deref().unwrap_or(fallback))
+}
+
+/// One attempt outcome's stable wire label.
+fn attempt_outcome_label(outcome: AttemptOutcomeTag) -> &'static str {
+    match outcome {
+        AttemptOutcomeTag::Complete => "complete",
+        AttemptOutcomeTag::TurnEnd => "turn_end",
+        AttemptOutcomeTag::FailedApi => "failed_api",
+        AttemptOutcomeTag::FailedTransport => "failed_transport",
+        AttemptOutcomeTag::FailedMalformed => "failed_malformed",
+        AttemptOutcomeTag::FailedStepLimit => "failed_step_limit",
+        AttemptOutcomeTag::FailedContextGuard => "failed_context_guard",
+    }
+}
+
+/// One triage pass outcome's stable wire label.
+fn pass_outcome_label(outcome: PassOutcome) -> &'static str {
+    match outcome {
+        PassOutcome::Handoff => "handoff",
+        PassOutcome::TurnEnd => "turn_end",
+        PassOutcome::FailedApi => "failed_api",
+        PassOutcome::FailedTransport => "failed_transport",
+        PassOutcome::FailedMalformed => "failed_malformed",
+        PassOutcome::FailedStepLimit => "failed_step_limit",
+        PassOutcome::FailedContextGuard => "failed_context_guard",
+    }
+}
+
+/// One review round's stable outcome label.
+fn review_outcome_label(outcome: ReviewRoundOutcome) -> &'static str {
+    match outcome {
+        ReviewRoundOutcome::Passed => "passed",
+        ReviewRoundOutcome::FixesQueued => "fixes_queued",
+        ReviewRoundOutcome::TurnEnd => "turn_end",
+        ReviewRoundOutcome::Failed => "failed",
+        ReviewRoundOutcome::CircuitBroken => "circuit_broken",
+        ReviewRoundOutcome::RoundCapReached => "round_cap_reached",
+    }
+}
+
+/// One summary pass's stable outcome label.
+fn summary_outcome_label(outcome: SummaryOutcome) -> &'static str {
+    match outcome {
+        SummaryOutcome::Accepted => "accepted",
+        SummaryOutcome::Invalid => "invalid",
+        SummaryOutcome::FailedApi => "failed_api",
+        SummaryOutcome::FailedTransport => "failed_transport",
+        SummaryOutcome::FailedMalformed => "failed_malformed",
+        SummaryOutcome::FailedStepLimit => "failed_step_limit",
+        SummaryOutcome::FailedContextGuard => "failed_context_guard",
+    }
+}
+
+/// One summary-rejection category's stable wire label.
+fn rejection_label(category: SummaryRejectionCategory) -> &'static str {
+    match category {
+        SummaryRejectionCategory::Empty => "empty",
+        SummaryRejectionCategory::MarkdownFence => "markdown_fence",
+        SummaryRejectionCategory::GeneratedTicketId => "generated_ticket_id",
+        SummaryRejectionCategory::RefsFooter => "refs_footer",
+        SummaryRejectionCategory::EmptyBody => "empty_body",
+        SummaryRejectionCategory::InvalidFooter => "invalid_footer",
+        SummaryRejectionCategory::MissingBlankLine => "missing_blank_line",
+        SummaryRejectionCategory::LineOverLimit => "line_over_limit",
+        SummaryRejectionCategory::InvalidHeaderOrPreamble => "invalid_header_or_preamble",
+    }
+}
+
+/// A completion rate with one decimal place, or an em dash when the
+/// denominator is zero.
+fn completion_rate(completed: u64, runs: u64) -> String {
+    if runs == 0 {
+        "—".to_string()
+    } else {
+        format!("{:.1}%", completed as f64 * 100.0 / runs as f64)
+    }
+}
+
+/// A mean whole-millisecond duration with one decimal place, or an em dash
+/// when undefined. The quotient is carried in integer tenths so an upper-limit
+/// total keeps every digit instead of rounding through f64.
+fn mean_ms(total: u64, count: u64) -> String {
+    if count == 0 {
+        return "—".to_string();
+    }
+    let tenths = (u128::from(total) * 10 + u128::from(count) / 2) / u128::from(count);
+    format!("{}.{} ms", tenths / 10, tenths % 10)
+}
+
+/// A cache hit rate with one decimal place, or an em dash when the role
+/// reported no input tokens.
+fn cache_hit_rate(usage: &TokenUsage) -> String {
+    if usage.input_tokens == 0 {
+        "—".to_string()
+    } else {
+        format!(
+            "{:.1}%",
+            usage.cached_input_tokens as f64 * 100.0 / usage.input_tokens as f64
+        )
+    }
+}
+
+/// A six-decimal USD total, or an em dash when no run was priced.
+fn cost_total(total: f64, priced: bool) -> String {
+    if priced {
+        format!("${total:.6}")
+    } else {
+        "—".to_string()
+    }
+}
+
+/// A six-decimal mean cost over completed tickets, or an em dash when there
+/// is no completed ticket to divide by.
+fn mean_cost(total: f64, completed_tickets: u64) -> String {
+    if completed_tickets == 0 {
+        "—".to_string()
+    } else {
+        format!("${:.6}", total / completed_tickets as f64)
+    }
 }
 
 /// Classify one summary canonicalizer rejection reason into its stable
@@ -707,6 +1571,8 @@ pub fn classify_summary_rejection(reason: &str) -> SummaryRejectionCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loops::LoopTelemetry;
+    use crate::orchestrator::{AttemptOutcomeTag, TicketExecutionMetrics, TicketStatusTag};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -722,6 +1588,306 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("the scratch directory should be creatable");
         dir
+    }
+
+    /// The fixed scorecard section order every rendered report preserves.
+    const REPORT_SECTIONS: [&str; 10] = [
+        "# ejaj Execution Metrics",
+        "## Mode Summary",
+        "## Elapsed & Cost",
+        "## Terminal Outcomes",
+        "## Provider Roles",
+        "## Queue Funnel",
+        "## Triage & Fresh-Session Retries",
+        "## Transition Gate",
+        "## Review & Summary",
+        "## Queue Loop & Tool Friction",
+    ];
+
+    /// Assert every fixed section appears once and in the fixed order.
+    fn assert_section_order(report: &str) {
+        let mut previous = None;
+        for heading in REPORT_SECTIONS {
+            let index = report
+                .find(heading)
+                .unwrap_or_else(|| panic!("the report must contain the {heading} section"));
+            if let Some(previous) = previous {
+                assert!(
+                    index > previous,
+                    "{heading} must follow the previous section in the fixed order"
+                );
+            }
+            previous = Some(index);
+        }
+    }
+
+    /// The report text from one heading up to the next level-two heading.
+    fn report_section<'a>(report: &'a str, heading: &str) -> &'a str {
+        let start = report
+            .find(heading)
+            .unwrap_or_else(|| panic!("the report must contain {heading}"));
+        let content = start + heading.len();
+        let end = report[content..]
+            .find("\n## ")
+            .map(|offset| content + offset + 1)
+            .unwrap_or(report.len());
+        &report[start..end]
+    }
+
+    /// Whether the report contains exactly this whole line.
+    fn has_line(report: &str, expected: &str) -> bool {
+        report.lines().any(|line| line == expected)
+    }
+
+    /// Persist one session's run metrics as real JSON under the corpus root.
+    fn write_session_metrics(corpus: &Path, session: &str, metrics: &RunMetrics) {
+        let dir = corpus.join(session);
+        fs::create_dir_all(&dir).expect("the session directory should be creatable");
+        fs::write(
+            dir.join(METRICS_FILE_NAME),
+            serde_json::to_vec_pretty(metrics).expect("the run metrics should serialize"),
+        )
+        .expect("the run metrics should persist");
+    }
+
+    /// A minimal analyzed run with only the fields a given test needs changed.
+    fn base_session(mode: &str, outcome: TerminalOutcome, elapsed_ms: u64) -> RunMetrics {
+        RunMetrics {
+            schema_version: METRICS_SCHEMA_VERSION,
+            mode: mode.to_string(),
+            terminal_outcome: outcome,
+            elapsed_ms,
+            ..RunMetrics::default()
+        }
+    }
+
+    /// One provider-role usage record with explicit counters and tokens.
+    fn provider_role(
+        role: &str,
+        invocations: u64,
+        steps: u64,
+        http_requests: u64,
+        http_retries: u64,
+        tokens: [u64; 4],
+        cost: Option<f64>,
+    ) -> ProviderRoleMetrics {
+        ProviderRoleMetrics {
+            role: role.to_string(),
+            model: format!("{role}-model"),
+            invocations,
+            steps,
+            http_requests,
+            http_retries,
+            usage: TokenUsage {
+                input_tokens: tokens[0],
+                cached_input_tokens: tokens[1],
+                output_tokens: tokens[2],
+                reasoning_tokens: tokens[3],
+            },
+            estimated_cost_usd: cost,
+        }
+    }
+
+    /// One ticket execution record with its attempt and ending tags.
+    fn ticket_record(
+        id: &str,
+        attempts: u64,
+        status: TicketStatusTag,
+        first_outcome: Option<AttemptOutcomeTag>,
+        escalated: bool,
+    ) -> TicketExecutionMetrics {
+        TicketExecutionMetrics {
+            ticket_id: id.to_string(),
+            attempt_count: attempts,
+            first_attempt_outcome: first_outcome,
+            retry_escalated: escalated,
+            final_status: status,
+            ..TicketExecutionMetrics::default()
+        }
+    }
+
+    /// One queue round carrying the given ticket records.
+    fn queue_round_record(round: u64, tickets: Vec<TicketExecutionMetrics>) -> QueueRoundRecord {
+        QueueRoundRecord {
+            round,
+            outcome: QueueRoundOutcome::Resolved,
+            metrics: QueueRoundMetrics {
+                tickets,
+                ..QueueRoundMetrics::default()
+            },
+        }
+    }
+
+    /// One review round with its convergence outcome and retry flags.
+    fn review_round_record(
+        round: u64,
+        outcome: ReviewRoundOutcome,
+        retried: bool,
+        succeeded: bool,
+    ) -> ReviewRoundMetrics {
+        ReviewRoundMetrics {
+            round,
+            outcome,
+            retried,
+            succeeded,
+            ..ReviewRoundMetrics::default()
+        }
+    }
+
+    /// The first multi-session run: a completed mid run with triage, a rescued
+    /// escalation, review convergence, summary rejection and tool friction.
+    fn first_corpus_session() -> RunMetrics {
+        let mut first_ticket = ticket_record(
+            "t1",
+            1,
+            TicketStatusTag::Completed,
+            Some(AttemptOutcomeTag::Complete),
+            false,
+        );
+        first_ticket.telemetry = LoopTelemetry {
+            elapsed_ms: 100,
+            bash_calls: 2,
+            bash_failures: 1,
+            bash_output_spills: 1,
+            execute_script_calls: 3,
+            execute_script_failures: 1,
+            execute_script_timeouts: 1,
+            rejected_control_tool_calls: 1,
+            tier1_compactions: 1,
+            tier2_summaries_accepted: 1,
+            overflow_compaction_recoveries: 1,
+            repeated_tool_warnings: 2,
+            ..LoopTelemetry::default()
+        };
+        let mut second_ticket = ticket_record(
+            "t2",
+            2,
+            TicketStatusTag::Completed,
+            Some(AttemptOutcomeTag::TurnEnd),
+            true,
+        );
+        second_ticket.telemetry = LoopTelemetry {
+            elapsed_ms: 200,
+            bash_calls: 1,
+            execute_script_calls: 2,
+            rejected_other_tool_calls: 1,
+            tier1_compactions: 2,
+            tier2_summary_failures: 1,
+            truncation_recoveries: 1,
+            repeated_tool_warnings: 1,
+            repeated_tool_aborts: 1,
+            ..LoopTelemetry::default()
+        };
+        let third_ticket = ticket_record(
+            "t3",
+            2,
+            TicketStatusTag::Failed,
+            Some(AttemptOutcomeTag::FailedApi),
+            false,
+        );
+
+        let mut metrics = base_session("mid", TerminalOutcome::Complete, 1_000);
+        metrics.estimated_cost_usd = Some(2.0);
+        metrics.provider_roles = vec![
+            provider_role("mid", 2, 4, 5, 1, [100, 50, 20, 5], Some(1.5)),
+            provider_role("smoll", 1, 1, 1, 0, [50, 0, 10, 0], Some(0.5)),
+        ];
+        metrics.triage = Some(TriageMetrics {
+            pass: PassMetrics {
+                elapsed_ms: 50,
+                outcome: PassOutcome::Handoff,
+                retried: false,
+                retry_reason: None,
+                succeeded: true,
+            },
+            draft_count: Some(3),
+            ready_count: Some(2),
+            done_count: Some(1),
+            blocked_count: Some(0),
+            queue_authorized: Some(true),
+        });
+        metrics.queue_rounds = vec![queue_round_record(
+            1,
+            vec![first_ticket, second_ticket, third_ticket],
+        )];
+        metrics.transition_gate = TransitionGateMetrics {
+            runs: 2,
+            failures: 1,
+            elapsed_ms: 300,
+        };
+        metrics.review_rounds = vec![
+            review_round_record(1, ReviewRoundOutcome::FixesQueued, true, true),
+            review_round_record(2, ReviewRoundOutcome::CircuitBroken, false, false),
+        ];
+        metrics.summary = Some(SummaryMetrics {
+            elapsed_ms: 90,
+            outcome: SummaryOutcome::Accepted,
+            candidates_generated: 2,
+            accepted: true,
+            rejected_candidates: vec![SummaryRejectionCategory::MarkdownFence],
+        });
+        metrics.spec_pass = Some(PassMetrics {
+            elapsed_ms: 10,
+            outcome: PassOutcome::Handoff,
+            retried: true,
+            retry_reason: Some("ended its turn".to_string()),
+            succeeded: true,
+        });
+        metrics.tickets_pass = Some(PassMetrics {
+            elapsed_ms: 20,
+            outcome: PassOutcome::Handoff,
+            retried: false,
+            retry_reason: None,
+            succeeded: true,
+        });
+        metrics
+    }
+
+    /// The second multi-session run: an unpriced mid run that ended in retry,
+    /// so its cost never enters the priced-run denominators.
+    fn second_corpus_session() -> RunMetrics {
+        let mut metrics = base_session("mid", TerminalOutcome::Retry, 500);
+        metrics.terminal_detail = Some("review".to_string());
+        metrics.provider_roles = vec![provider_role("mid", 1, 2, 2, 1, [100, 50, 0, 0], None)];
+        metrics.queue_rounds = vec![queue_round_record(
+            1,
+            vec![ticket_record(
+                "t4",
+                1,
+                TicketStatusTag::Failed,
+                Some(AttemptOutcomeTag::FailedMalformed),
+                false,
+            )],
+        )];
+        metrics.transition_gate = TransitionGateMetrics {
+            runs: 1,
+            failures: 0,
+            elapsed_ms: 100,
+        };
+        metrics.review_rounds = vec![review_round_record(
+            1,
+            ReviewRoundOutcome::Passed,
+            false,
+            true,
+        )];
+        metrics
+    }
+
+    /// The third multi-session run: a completed, priced hybrid run whose only
+    /// role is giga, used to prove lexical mode and role ordering.
+    fn hybrid_corpus_session() -> RunMetrics {
+        let mut metrics = base_session("hybrid", TerminalOutcome::Complete, 250);
+        metrics.estimated_cost_usd = Some(1.0);
+        metrics.provider_roles = vec![provider_role(
+            "giga",
+            1,
+            3,
+            2,
+            0,
+            [1_000, 250, 100, 0],
+            Some(1.0),
+        )];
+        metrics
     }
 
     /// One trajectory JSON value in the production shape, with telemetry
@@ -780,8 +1946,8 @@ mod tests {
     /// serializes every Section 4 field under its stable versioned name and
     /// shape, and no superseded name survives beside it.
     #[test]
-    fn when_run_metrics_are_serialized_given_post_handoff_outcomes_then_matches_versioned_contract()
-    {
+    fn when_run_metrics_are_serialized_given_schema_two_transition_failures_then_persists_all_gate_counters()
+     {
         let metrics = RunMetrics {
             schema_version: METRICS_SCHEMA_VERSION,
             mode: "hybrid".to_string(),
@@ -831,7 +1997,8 @@ mod tests {
                 metrics: QueueRoundMetrics::default(),
             }],
             transition_gate: TransitionGateMetrics {
-                runs: 2,
+                runs: 3,
+                failures: 2,
                 elapsed_ms: 400,
             },
             review_rounds: vec![ReviewRoundMetrics {
@@ -872,7 +2039,7 @@ mod tests {
         };
 
         let value = serde_json::to_value(&metrics).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["mode"], "hybrid");
         assert_eq!(value["provider_models"]["mid"], "mid-model");
         assert_eq!(value["provider_models"]["giga"], "giga-model");
@@ -905,10 +2072,10 @@ mod tests {
         );
         assert_eq!(value["queue_rounds"][0]["round"], 1);
         assert_eq!(value["queue_rounds"][0]["outcome"], "resolved");
-        assert_eq!(value["transition_gate"]["runs"], 2);
+        assert_eq!(value["transition_gate"]["runs"], 3);
+        assert_eq!(value["transition_gate"]["failures"], 2);
         assert_eq!(value["transition_gate"]["elapsed_ms"], 400);
         assert!(value["transition_gate"].get("command").is_none());
-        assert!(value["transition_gate"].get("failures").is_none());
         assert!(value["transition_gate"].get("total_elapsed_ms").is_none());
         assert_eq!(value["review_rounds"][0]["round"], 1);
         assert_eq!(value["review_rounds"][0]["elapsed_ms"], 1_500);
@@ -921,10 +2088,7 @@ mod tests {
         assert_eq!(value["summary"]["outcome"], "accepted");
         assert_eq!(value["summary"]["candidates_generated"], 2);
         assert_eq!(value["summary"]["accepted"], true);
-        assert_eq!(
-            value["summary"]["rejected_candidates"][0],
-            "markdown_fence"
-        );
+        assert_eq!(value["summary"]["rejected_candidates"][0], "markdown_fence");
         assert_eq!(value["provider_roles"][0]["role"], "mid");
         assert_eq!(value["provider_roles"][0]["model"], "mid-model");
         assert_eq!(value["provider_roles"][0]["invocations"], 4);
@@ -956,7 +2120,12 @@ mod tests {
                 "the superseded {superseded} name is not part of the contract"
             );
         }
-        for superseded_review in ["verdict", "convergence", "findings_count", "fix_tickets_emitted"] {
+        for superseded_review in [
+            "verdict",
+            "convergence",
+            "findings_count",
+            "fix_tickets_emitted",
+        ] {
             assert!(
                 value["review_rounds"][0].get(superseded_review).is_none(),
                 "the superseded review field {superseded_review} is not part of the contract"
@@ -1028,10 +2197,7 @@ mod tests {
         };
         let value = serde_json::to_value(&failed_retry).unwrap();
         assert_eq!(value["outcome"], "failed_malformed");
-        assert_eq!(
-            value["retry_reason"],
-            "ended early (malformed response)"
-        );
+        assert_eq!(value["retry_reason"], "ended early (malformed response)");
 
         let not_retried = PassMetrics {
             elapsed_ms: 9,
@@ -1117,7 +2283,11 @@ mod tests {
             "sk-smoll",
         );
         let cases: Vec<RoleExpectations<'_>> = vec![
-            ("mid", mid, &[("mid", "mid-model"), ("smoll", "smoll-model")]),
+            (
+                "mid",
+                mid,
+                &[("mid", "mid-model"), ("smoll", "smoll-model")],
+            ),
             (
                 "hybrid",
                 multi_role_config(),
@@ -1134,7 +2304,11 @@ mod tests {
                 .iter()
                 .map(|role| (role.role.as_str(), role.model.as_str()))
                 .collect();
-            assert_eq!(actual.as_slice(), expected, "{label}: only active roles and models");
+            assert_eq!(
+                actual.as_slice(),
+                expected,
+                "{label}: only active roles and models"
+            );
 
             let mut metrics = RunMetrics::default();
             metrics.record_provider_models(&config);
@@ -1535,7 +2709,7 @@ mod tests {
         );
         let payload: serde_json::Value =
             serde_json::from_slice(&fs::read(&relative_file).unwrap()).unwrap();
-        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["schema_version"], 2);
         assert_eq!(payload["mode"], "hybrid");
         assert_eq!(payload["provider_models"]["mid"], "mid-model");
         assert_eq!(payload["provider_models"]["giga"], "giga-model");
@@ -1654,5 +2828,929 @@ mod tests {
                 "an unknown reason takes the deterministic fallback"
             );
         }
+    }
+
+    /// Core entry-point behavior: a missing corpus and an empty corpus both
+    /// render a valid zero-run scorecard with no skipped metrics files.
+    #[test]
+    fn when_metrics_are_reported_given_missing_or_empty_corpus_then_shows_zero_runs() {
+        let root = scratch_dir("corpus-empty");
+        let missing = root.join("missing");
+        let empty = root.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        fs::write(empty.join("notes.txt"), "a non-directory child is ignored").unwrap();
+
+        let cases = [("missing", missing.as_path()), ("empty", empty.as_path())];
+        for (name, dir) in cases {
+            let report = render_corpus_report(dir)
+                .unwrap_or_else(|error| panic!("{name}: every valid corpus renders: {error}"));
+            assert_eq!(
+                report.lines().next(),
+                Some("0 runs analyzed, 0 metrics files skipped"),
+                "{name}: the first physical line reports zero runs and zero skipped files: {report}"
+            );
+            assert_section_order(&report);
+            assert!(
+                report.ends_with('\n'),
+                "{name}: the report ends with a newline"
+            );
+            assert!(
+                !report.ends_with("\n\n"),
+                "{name}: the report ends with exactly one newline"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Edge-case table: a malformed, unsupported-schema or non-regular metrics
+    /// file is counted once and skipped, a missing metrics file is not counted,
+    /// and an adjacent valid session still contributes to the report.
+    #[test]
+    fn when_metrics_are_reported_given_malformed_or_unsupported_sessions_then_skips_them_and_continues()
+     {
+        #[derive(Clone, Copy)]
+        enum Subject {
+            Missing,
+            Malformed,
+            UnsupportedSchema,
+            NonRegular,
+            Valid,
+        }
+
+        let root = scratch_dir("corpus-mixed");
+        let cases = [
+            ("missing", Subject::Missing, 1u64, 0usize),
+            ("malformed", Subject::Malformed, 1, 1),
+            ("unsupported", Subject::UnsupportedSchema, 1, 1),
+            ("non-regular", Subject::NonRegular, 1, 1),
+            ("valid", Subject::Valid, 2, 0),
+        ];
+
+        for (name, subject, expected_runs, expected_skipped) in cases {
+            let corpus = root.join(name);
+            write_session_metrics(
+                &corpus,
+                "a-valid",
+                &base_session("mid", TerminalOutcome::Complete, 100),
+            );
+            let subject_dir = corpus.join("b-subject");
+            match subject {
+                Subject::Missing => {
+                    fs::create_dir_all(&subject_dir).unwrap();
+                }
+                Subject::Malformed => {
+                    fs::create_dir_all(&subject_dir).unwrap();
+                    fs::write(subject_dir.join(METRICS_FILE_NAME), "{ not json").unwrap();
+                }
+                Subject::UnsupportedSchema => {
+                    let mut metrics = base_session("mid", TerminalOutcome::Complete, 999);
+                    metrics.schema_version = METRICS_SCHEMA_VERSION - 1;
+                    write_session_metrics(&corpus, "b-subject", &metrics);
+                }
+                Subject::NonRegular => {
+                    fs::create_dir_all(subject_dir.join(METRICS_FILE_NAME)).unwrap();
+                }
+                Subject::Valid => {
+                    write_session_metrics(
+                        &corpus,
+                        "b-subject",
+                        &base_session("mid", TerminalOutcome::Complete, 100),
+                    );
+                }
+            }
+
+            let report = render_corpus_report(&corpus)
+                .unwrap_or_else(|error| panic!("{name}: unusable sessions never abort: {error}"));
+            let expected_first_line =
+                format!("{expected_runs} runs analyzed, {expected_skipped} metrics files skipped");
+            assert_eq!(
+                report.lines().next(),
+                Some(expected_first_line.as_str()),
+                "{name}: expected the first physical line to be {expected_first_line:?}: {report}"
+            );
+            let expected_elapsed = format!("- Total elapsed: {} ms", expected_runs * 100);
+            assert!(
+                has_line(&report, &expected_elapsed),
+                "{name}: only usable sessions contribute elapsed time: {report}"
+            );
+            assert!(
+                report_section(&report, "## Mode Summary").contains("| mid |"),
+                "{name}: the valid session still contributes a mode row"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Core entry-point behavior: several real persisted sessions aggregate
+    /// with independently calculated totals, fixed section order, lexical map
+    /// ordering and exactly one final newline.
+    #[test]
+    fn when_metrics_are_reported_given_multiple_sessions_then_aggregates_deterministically() {
+        let root = scratch_dir("corpus-multi");
+        let corpus = root.join("corpus");
+        write_session_metrics(&corpus, "a-first", &first_corpus_session());
+        write_session_metrics(&corpus, "b-second", &second_corpus_session());
+        write_session_metrics(&corpus, "c-hybrid", &hybrid_corpus_session());
+
+        let report = render_corpus_report(&corpus).expect("the corpus should render");
+
+        assert_eq!(
+            report.lines().next(),
+            Some("3 runs analyzed, 0 metrics files skipped"),
+            "the first physical line reports the analyzed and skipped counts: {report}"
+        );
+        assert_section_order(&report);
+
+        let modes = report_section(&report, "## Mode Summary");
+        assert!(modes.contains("| hybrid | 1 | 1 | 100.0% |"), "{modes}");
+        assert!(modes.contains("| mid | 2 | 1 | 50.0% |"), "{modes}");
+        assert!(
+            modes.find("| hybrid |").unwrap() < modes.find("| mid |").unwrap(),
+            "mode rows are lexically ordered: {modes}"
+        );
+
+        let cost = report_section(&report, "## Elapsed & Cost");
+        for line in [
+            "- Total elapsed: 1750 ms",
+            "- Mean elapsed per analyzed run: 583.3 ms",
+            "- Mean elapsed per completed run: 625.0 ms",
+            "- Priced runs: 2",
+            "- Estimated cost: $3.000000",
+            "- Mean cost per completed ticket: $1.500000",
+        ] {
+            assert!(has_line(cost, line), "expected {line:?} in: {cost}");
+        }
+
+        let outcomes = report_section(&report, "## Terminal Outcomes");
+        assert!(outcomes.contains("| complete | 2 |"), "{outcomes}");
+        assert!(outcomes.contains("| retry: review | 1 |"), "{outcomes}");
+        assert!(
+            outcomes.find("| complete |").unwrap() < outcomes.find("| retry: review |").unwrap(),
+            "terminal outcomes are lexically ordered: {outcomes}"
+        );
+
+        let roles = report_section(&report, "## Provider Roles");
+        for row in [
+            "| giga | 1 | 3 | 2 | 0 | 1000 | 250 | 100 | 0 | 25.0% | $1.000000 |",
+            "| mid | 3 | 6 | 7 | 2 | 200 | 100 | 20 | 5 | 50.0% | $1.500000 |",
+            "| smoll | 1 | 1 | 1 | 0 | 50 | 0 | 10 | 0 | 0.0% | $0.500000 |",
+        ] {
+            assert!(roles.contains(row), "expected role row {row:?} in: {roles}");
+        }
+        assert!(
+            roles.find("| giga |").unwrap() < roles.find("| mid |").unwrap()
+                && roles.find("| mid |").unwrap() < roles.find("| smoll |").unwrap(),
+            "provider-role rows are lexically ordered: {roles}"
+        );
+
+        let funnel = report_section(&report, "## Queue Funnel");
+        for line in [
+            "- Ticket records: 4",
+            "- Attempts: 6",
+            "- First-pass completions: 1",
+            "- Retried tickets: 2",
+            "- Rescued tickets: 1",
+            "- First-attempt failures: 3",
+            "- Escalations: 1",
+            "- Rescued escalations: 1",
+        ] {
+            assert!(has_line(funnel, line), "expected {line:?} in: {funnel}");
+        }
+
+        let triage = report_section(&report, "## Triage & Fresh-Session Retries");
+        for line in [
+            "- Triage runs: 1",
+            "- Triage succeeded: 1",
+            "- Triage retried: 0",
+            "- Drafts: 3",
+            "- Ready: 2",
+            "- Done: 1",
+            "- Blocked: 0",
+            "- Queue authorized: 1",
+            "- Queue unauthorized: 0",
+        ] {
+            assert!(has_line(triage, line), "expected {line:?} in: {triage}");
+        }
+        for row in [
+            "| spec | 1 | 1 | 1 | 1 |",
+            "| tickets | 1 | 0 | 1 | 0 |",
+            "| triage | 1 | 0 | 1 | 0 |",
+            "| review 1 | 2 | 1 | 2 | 1 |",
+            "| review 2 | 1 | 0 | 0 | 0 |",
+        ] {
+            assert!(has_line(triage, row), "expected row {row:?} in: {triage}");
+        }
+        assert!(
+            triage.find("| spec |").unwrap() < triage.find("| tickets |").unwrap()
+                && triage.find("| tickets |").unwrap() < triage.find("| triage |").unwrap()
+                && triage.find("| triage |").unwrap() < triage.find("| review 1 |").unwrap(),
+            "fresh-session retry rows use the declared order: {triage}"
+        );
+
+        let gate = report_section(&report, "## Transition Gate");
+        for line in [
+            "- Gate runs: 3",
+            "- Gate failures: 1",
+            "- Gate elapsed: 400 ms",
+        ] {
+            assert!(has_line(gate, line), "expected {line:?} in: {gate}");
+        }
+
+        let review_summary = report_section(&report, "## Review & Summary");
+        for line in [
+            "- Review rounds: 3",
+            "- Review stalls: 1",
+            "- Summary runs: 1",
+            "- Summaries accepted: 1",
+            "| circuit_broken | 1 |",
+            "| fixes_queued | 1 |",
+            "| passed | 1 |",
+            "| accepted | 1 |",
+            "| markdown_fence | 1 |",
+        ] {
+            assert!(
+                has_line(review_summary, line),
+                "expected {line:?} in: {review_summary}"
+            );
+        }
+        assert!(
+            review_summary.find("| circuit_broken |").unwrap()
+                < review_summary.find("| fixes_queued |").unwrap()
+                && review_summary.find("| fixes_queued |").unwrap()
+                    < review_summary.find("| passed |").unwrap(),
+            "review outcome rows are lexically ordered: {review_summary}"
+        );
+
+        let friction = report_section(&report, "## Queue Loop & Tool Friction");
+        for line in [
+            "- Bash calls: 3",
+            "- Bash failures: 1",
+            "- Bash timeouts: 0",
+            "- Bash output spills: 1",
+            "- Script calls: 5",
+            "- Script failures: 1",
+            "- Script timeouts: 1",
+            "- Rejected control calls: 1",
+            "- Rejected tool calls: 1",
+            "- Tier 1 compactions: 3",
+            "- Tier 2 summaries: 1",
+            "- Tier 2 summary failures: 1",
+            "- Overflow recoveries: 1",
+            "- Truncation recoveries: 1",
+            "- Repeated-turn warnings: 3",
+            "- Repeated-turn aborts: 1",
+            "- Loop elapsed: 300 ms",
+        ] {
+            assert!(has_line(friction, line), "expected {line:?} in: {friction}");
+        }
+
+        assert!(report.ends_with('\n'), "the report ends with a newline");
+        assert!(
+            !report.ends_with("\n\n"),
+            "the report ends with exactly one newline"
+        );
+        for volatile in ["/tmp", "ejaj-metrics-test", "timestamp", "sk-"] {
+            assert!(
+                !report.contains(volatile),
+                "the report must not leak volatile data such as {volatile}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Core entry-point behavior and edge-case table: every queue record counts
+    /// once even when its ticket id repeats across rounds, and the funnel uses
+    /// the exact attempt, rescue, failure and escalation rules.
+    #[test]
+    fn when_metrics_are_reported_given_ticket_attempts_and_outcomes_then_applies_exact_funnel_rules()
+     {
+        let root = scratch_dir("corpus-funnel-rules");
+        let corpus = root.join("corpus");
+        let mut metrics = base_session("mid", TerminalOutcome::Complete, 100);
+        metrics.queue_rounds = vec![
+            queue_round_record(
+                1,
+                vec![
+                    ticket_record(
+                        "r-a",
+                        1,
+                        TicketStatusTag::Completed,
+                        Some(AttemptOutcomeTag::Complete),
+                        false,
+                    ),
+                    ticket_record(
+                        "r-b",
+                        2,
+                        TicketStatusTag::Completed,
+                        Some(AttemptOutcomeTag::TurnEnd),
+                        false,
+                    ),
+                    ticket_record(
+                        "r-c",
+                        3,
+                        TicketStatusTag::Completed,
+                        Some(AttemptOutcomeTag::TurnEnd),
+                        false,
+                    ),
+                    ticket_record(
+                        "r-d",
+                        1,
+                        TicketStatusTag::Failed,
+                        Some(AttemptOutcomeTag::FailedApi),
+                        false,
+                    ),
+                ],
+            ),
+            queue_round_record(
+                2,
+                vec![
+                    ticket_record("r-a", 1, TicketStatusTag::Failed, None, false),
+                    ticket_record("r-f", 0, TicketStatusTag::Completed, None, false),
+                    ticket_record("r-g", 1, TicketStatusTag::Failed, None, false),
+                    ticket_record("r-h", 2, TicketStatusTag::Failed, None, false),
+                    ticket_record(
+                        "r-i",
+                        2,
+                        TicketStatusTag::Completed,
+                        Some(AttemptOutcomeTag::Complete),
+                        true,
+                    ),
+                    ticket_record(
+                        "r-j",
+                        3,
+                        TicketStatusTag::Failed,
+                        Some(AttemptOutcomeTag::FailedMalformed),
+                        true,
+                    ),
+                    ticket_record(
+                        "r-k",
+                        3,
+                        TicketStatusTag::Completed,
+                        Some(AttemptOutcomeTag::FailedStepLimit),
+                        true,
+                    ),
+                ],
+            ),
+        ];
+        write_session_metrics(&corpus, "a-run", &metrics);
+
+        let report = render_corpus_report(&corpus).expect("the corpus should render");
+        let funnel = report_section(&report, "## Queue Funnel");
+        for line in [
+            "- Ticket records: 11",
+            "- Attempts: 19",
+            "- First-pass completions: 1",
+            "- Retried tickets: 6",
+            "- Rescued tickets: 2",
+            "- First-attempt failures: 9",
+            "- Escalations: 3",
+            "- Rescued escalations: 2",
+            "| complete | 1 |",
+            "| failed_api | 1 |",
+            "| failed_malformed | 1 |",
+            "| failed_step_limit | 1 |",
+            "| turn_end | 2 |",
+            "| unknown | 3 |",
+        ] {
+            assert!(has_line(funnel, line), "expected {line:?} in: {funnel}");
+        }
+        let categories = [
+            "complete",
+            "failed_api",
+            "failed_malformed",
+            "failed_step_limit",
+            "turn_end",
+            "unknown",
+        ];
+        let mut previous = None;
+        for category in categories {
+            let needle = format!("| {category} |");
+            let index = funnel
+                .find(&needle)
+                .unwrap_or_else(|| panic!("missing category {category}: {funnel}"));
+            if let Some(previous) = previous {
+                assert!(
+                    index > previous,
+                    "categories are lexically ordered: {funnel}"
+                );
+            }
+            previous = Some(index);
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Core entry-point behavior: fresh-session retry rows cover spec, tickets,
+    /// triage and every observed review round, with reached, retried, succeeded
+    /// and post-retry success counts from real persisted run metrics.
+    #[test]
+    fn when_metrics_are_reported_given_fresh_session_retries_then_reports_each_reached_pass_and_outcome()
+     {
+        let root = scratch_dir("corpus-fresh-retries");
+        let corpus = root.join("corpus");
+
+        let mut first = base_session("mid", TerminalOutcome::Complete, 10);
+        first.spec_pass = Some(PassMetrics {
+            retried: true,
+            succeeded: true,
+            ..PassMetrics::default()
+        });
+        first.tickets_pass = Some(PassMetrics {
+            retried: false,
+            succeeded: true,
+            ..PassMetrics::default()
+        });
+        first.triage = Some(TriageMetrics {
+            pass: PassMetrics {
+                retried: true,
+                succeeded: false,
+                ..PassMetrics::default()
+            },
+            ..TriageMetrics::default()
+        });
+        first.review_rounds = vec![
+            review_round_record(1, ReviewRoundOutcome::Passed, true, true),
+            review_round_record(2, ReviewRoundOutcome::FixesQueued, false, true),
+        ];
+        write_session_metrics(&corpus, "a-first", &first);
+
+        let mut second = base_session("mid", TerminalOutcome::Complete, 10);
+        second.tickets_pass = Some(PassMetrics {
+            retried: true,
+            succeeded: false,
+            ..PassMetrics::default()
+        });
+        second.review_rounds = vec![
+            review_round_record(1, ReviewRoundOutcome::TurnEnd, true, false),
+            review_round_record(3, ReviewRoundOutcome::Passed, false, true),
+        ];
+        write_session_metrics(&corpus, "b-second", &second);
+
+        let report = render_corpus_report(&corpus).expect("the corpus should render");
+        let section = report_section(&report, "## Triage & Fresh-Session Retries");
+        for row in [
+            "| spec | 1 | 1 | 1 | 1 |",
+            "| tickets | 2 | 1 | 1 | 0 |",
+            "| triage | 1 | 1 | 0 | 0 |",
+            "| review 1 | 2 | 2 | 1 | 1 |",
+            "| review 2 | 1 | 0 | 1 | 0 |",
+            "| review 3 | 1 | 0 | 1 | 0 |",
+        ] {
+            assert!(has_line(section, row), "expected row {row:?} in: {section}");
+        }
+        let order = [
+            "| spec |",
+            "| tickets |",
+            "| triage |",
+            "| review 1 |",
+            "| review 2 |",
+            "| review 3 |",
+        ];
+        let mut previous = None;
+        for needle in order {
+            let index = section
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing row {needle}: {section}"));
+            if let Some(previous) = previous {
+                assert!(index > previous, "rows use the declared order: {section}");
+            }
+            previous = Some(index);
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Core entry-point behavior: triage pass outcomes aggregate by their
+    /// stable persisted labels alongside the existing triage totals and
+    /// fresh-session retry rows.
+    #[test]
+    fn when_metrics_are_reported_given_triage_pass_outcomes_then_aggregates_stable_labels() {
+        let root = scratch_dir("corpus-triage-outcomes");
+        let corpus = root.join("corpus");
+        let cases = [
+            ("a-handoff", PassOutcome::Handoff, false, true),
+            ("b-handoff", PassOutcome::Handoff, false, true),
+            ("c-turn-end", PassOutcome::TurnEnd, true, false),
+            ("d-api", PassOutcome::FailedApi, false, false),
+            ("e-transport", PassOutcome::FailedTransport, false, false),
+            ("f-malformed", PassOutcome::FailedMalformed, false, false),
+            ("g-step-limit", PassOutcome::FailedStepLimit, false, false),
+            (
+                "h-context-guard",
+                PassOutcome::FailedContextGuard,
+                false,
+                false,
+            ),
+        ];
+        for (name, outcome, retried, succeeded) in cases {
+            let mut metrics = base_session("mid", TerminalOutcome::Complete, 10);
+            metrics.triage = Some(TriageMetrics {
+                pass: PassMetrics {
+                    outcome,
+                    retried,
+                    succeeded,
+                    ..PassMetrics::default()
+                },
+                ..TriageMetrics::default()
+            });
+            write_session_metrics(&corpus, name, &metrics);
+        }
+
+        let report = render_corpus_report(&corpus).expect("the corpus should render");
+        let section = report_section(&report, "## Triage & Fresh-Session Retries");
+        for line in [
+            "- Triage runs: 8",
+            "- Triage succeeded: 2",
+            "- Triage retried: 1",
+            "| failed_api | 1 |",
+            "| failed_context_guard | 1 |",
+            "| failed_malformed | 1 |",
+            "| failed_step_limit | 1 |",
+            "| failed_transport | 1 |",
+            "| handoff | 2 |",
+            "| turn_end | 1 |",
+            "| triage | 8 | 1 | 2 | 0 |",
+        ] {
+            assert!(has_line(section, line), "expected {line:?} in: {section}");
+        }
+        let order = [
+            "| failed_api |",
+            "| failed_context_guard |",
+            "| failed_malformed |",
+            "| failed_step_limit |",
+            "| failed_transport |",
+            "| handoff |",
+            "| turn_end |",
+        ];
+        let mut previous = None;
+        for needle in order {
+            let index = section
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing triage outcome {needle}: {section}"));
+            if let Some(previous) = previous {
+                assert!(
+                    index > previous,
+                    "triage outcome rows are lexically ordered: {section}"
+                );
+            }
+            previous = Some(index);
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Core entry-point behavior: a circuit-broken or round-capped review round
+    /// is a stalled trip, while ordinary convergence outcomes are not.
+    #[test]
+    fn when_metrics_are_reported_given_review_round_caps_then_counts_stalls() {
+        let root = scratch_dir("corpus-review-stalls");
+        let corpus = root.join("corpus");
+        let mut metrics = base_session("mid", TerminalOutcome::Retry, 10);
+        metrics.review_rounds = vec![
+            review_round_record(1, ReviewRoundOutcome::Passed, false, true),
+            review_round_record(2, ReviewRoundOutcome::FixesQueued, false, true),
+            review_round_record(3, ReviewRoundOutcome::CircuitBroken, false, false),
+            review_round_record(4, ReviewRoundOutcome::RoundCapReached, false, false),
+        ];
+        write_session_metrics(&corpus, "a-run", &metrics);
+
+        let report = render_corpus_report(&corpus).expect("the corpus should render");
+        let section = report_section(&report, "## Review & Summary");
+        for line in [
+            "- Review rounds: 4",
+            "- Review stalls: 2",
+            "| circuit_broken | 1 |",
+            "| fixes_queued | 1 |",
+            "| passed | 1 |",
+            "| round_cap_reached | 1 |",
+        ] {
+            assert!(has_line(section, line), "expected {line:?} in: {section}");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Core entry-point behavior: summary pass@1 counts only accepted summaries
+    /// with exactly one generated candidate, over summaries that generated any
+    /// candidate at all.
+    #[test]
+    fn when_metrics_are_reported_given_summary_candidate_outcomes_then_reports_pass_at_one() {
+        let root = scratch_dir("corpus-summary-pass-one");
+        let corpus = root.join("corpus");
+        let cases = [
+            ("a-one-accepted", true, 1),
+            ("b-two-accepted", true, 2),
+            ("c-one-rejected", false, 1),
+            ("d-zero-rejected", false, 0),
+        ];
+        for (name, accepted, candidates) in cases {
+            let mut metrics = base_session("mid", TerminalOutcome::Complete, 10);
+            metrics.summary = Some(SummaryMetrics {
+                outcome: if accepted {
+                    SummaryOutcome::Accepted
+                } else {
+                    SummaryOutcome::Invalid
+                },
+                candidates_generated: candidates,
+                accepted,
+                ..SummaryMetrics::default()
+            });
+            write_session_metrics(&corpus, name, &metrics);
+        }
+
+        let report = render_corpus_report(&corpus).expect("the corpus should render");
+        let section = report_section(&report, "## Review & Summary");
+        for line in [
+            "- Summary runs: 4",
+            "- Summaries accepted: 2",
+            "- Summary pass@1: 1/3 (33.3%)",
+        ] {
+            assert!(has_line(section, line), "expected {line:?} in: {section}");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Core entry-point behavior and edge-case table: terminal outcomes retain
+    /// persisted detail, and absent or blank detail falls back to the stable
+    /// label for that outcome.
+    #[test]
+    fn when_metrics_are_reported_given_terminal_details_then_uses_stable_labels_and_fallbacks() {
+        let root = scratch_dir("corpus-terminal-labels");
+        let corpus = root.join("corpus");
+        let cases = [
+            (
+                "a-complete",
+                TerminalOutcome::Complete,
+                Some("ignored detail"),
+            ),
+            ("b-retry-detail", TerminalOutcome::Retry, Some("review")),
+            ("c-retry-blank", TerminalOutcome::Retry, Some("   ")),
+            ("d-write-detail", TerminalOutcome::WriteFailed, Some("spec")),
+            ("e-write-absent", TerminalOutcome::WriteFailed, None),
+            (
+                "f-summary-detail",
+                TerminalOutcome::SummaryFailed,
+                Some("summary"),
+            ),
+            ("g-summary-absent", TerminalOutcome::SummaryFailed, None),
+            ("h-git-detail", TerminalOutcome::GitFailed, Some("commit")),
+            ("i-git-absent", TerminalOutcome::GitFailed, None),
+        ];
+        for (name, outcome, detail) in cases {
+            let mut metrics = base_session("mid", outcome, 1);
+            metrics.terminal_detail = detail.map(str::to_string);
+            write_session_metrics(&corpus, name, &metrics);
+        }
+
+        let report = render_corpus_report(&corpus).expect("the corpus should render");
+        let outcomes = report_section(&report, "## Terminal Outcomes");
+        for row in [
+            "| complete | 1 |",
+            "| git_failed: commit | 1 |",
+            "| git_failed: unspecified | 1 |",
+            "| retry: review | 1 |",
+            "| retry: unspecified | 1 |",
+            "| summary_failed: summary | 2 |",
+            "| write_failed: spec | 1 |",
+            "| write_failed: unspecified | 1 |",
+        ] {
+            assert!(
+                outcomes.contains(row),
+                "expected row {row:?} in: {outcomes}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Boundary: upper-limit elapsed totals and denominators render exact
+    /// one-decimal means instead of a lossy floating-point approximation.
+    #[test]
+    fn when_metrics_are_reported_given_upper_boundary_elapsed_totals_then_renders_accurate_means() {
+        let root = scratch_dir("corpus-upper-elapsed");
+        let cases = [
+            (
+                "single",
+                vec![(u64::MAX, TerminalOutcome::Complete)],
+                "18446744073709551615.0 ms",
+                "18446744073709551615.0 ms",
+            ),
+            (
+                "pair",
+                vec![
+                    (u64::MAX - 1, TerminalOutcome::Complete),
+                    (1, TerminalOutcome::Complete),
+                ],
+                "9223372036854775807.5 ms",
+                "9223372036854775807.5 ms",
+            ),
+            (
+                "mixed",
+                vec![
+                    (u64::MAX - 1, TerminalOutcome::Complete),
+                    (1, TerminalOutcome::Complete),
+                    (0, TerminalOutcome::Retry),
+                ],
+                "6148914691236517205.0 ms",
+                "9223372036854775807.5 ms",
+            ),
+            (
+                "quartet",
+                vec![
+                    (u64::MAX, TerminalOutcome::Complete),
+                    (0, TerminalOutcome::Complete),
+                    (0, TerminalOutcome::Complete),
+                    (0, TerminalOutcome::Complete),
+                ],
+                "4611686018427387903.8 ms",
+                "4611686018427387903.8 ms",
+            ),
+        ];
+
+        for (name, sessions, analyzed_mean, completed_mean) in cases {
+            let corpus = root.join(name);
+            for (index, (elapsed_ms, outcome)) in sessions.into_iter().enumerate() {
+                write_session_metrics(
+                    &corpus,
+                    &format!("session-{index}"),
+                    &base_session("mid", outcome, elapsed_ms),
+                );
+            }
+
+            let report = render_corpus_report(&corpus)
+                .unwrap_or_else(|error| panic!("{name}: the corpus should render: {error}"));
+            let cost = report_section(&report, "## Elapsed & Cost");
+            for line in [
+                "- Total elapsed: 18446744073709551615 ms",
+                &format!("- Mean elapsed per analyzed run: {analyzed_mean}"),
+                &format!("- Mean elapsed per completed run: {completed_mean}"),
+            ] {
+                assert!(has_line(cost, line), "{name}: expected {line:?} in: {cost}");
+            }
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Contract and invariant: saturating counters preserve u64::MAX totals,
+    /// and every undefined derived value renders as an em dash.
+    #[test]
+    fn when_metrics_are_reported_given_saturated_counters_and_empty_denominators_then_preserves_totals_and_shows_em_dashes()
+     {
+        let root = scratch_dir("corpus-saturated");
+        let corpus = root.join("corpus");
+
+        let mut heavy = base_session("mid", TerminalOutcome::Retry, u64::MAX);
+        heavy.terminal_detail = Some("queue".to_string());
+        heavy.provider_roles = vec![provider_role(
+            "mid",
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            [0, 0, 0, 0],
+            None,
+        )];
+        heavy.queue_rounds = vec![queue_round_record(
+            1,
+            vec![ticket_record(
+                "heavy",
+                u64::MAX,
+                TicketStatusTag::Failed,
+                Some(AttemptOutcomeTag::FailedApi),
+                false,
+            )],
+        )];
+        heavy.transition_gate = TransitionGateMetrics {
+            runs: u64::MAX,
+            failures: u64::MAX,
+            elapsed_ms: u64::MAX,
+        };
+        heavy.review_rounds = vec![review_round_record(
+            1,
+            ReviewRoundOutcome::CircuitBroken,
+            false,
+            false,
+        )];
+        write_session_metrics(&corpus, "a-heavy", &heavy);
+
+        let mut extra = base_session("mid", TerminalOutcome::Retry, 5);
+        extra.terminal_detail = Some("queue".to_string());
+        extra.provider_roles = vec![provider_role("mid", 3, 4, 5, 6, [0, 0, 0, 0], None)];
+        extra.queue_rounds = vec![queue_round_record(
+            1,
+            vec![ticket_record(
+                "extra",
+                10,
+                TicketStatusTag::Failed,
+                None,
+                false,
+            )],
+        )];
+        extra.transition_gate = TransitionGateMetrics {
+            runs: 7,
+            failures: 8,
+            elapsed_ms: 9,
+        };
+        extra.review_rounds = vec![review_round_record(
+            1,
+            ReviewRoundOutcome::Passed,
+            false,
+            true,
+        )];
+        write_session_metrics(&corpus, "b-extra", &extra);
+
+        let report = render_corpus_report(&corpus).expect("the saturated corpus should render");
+
+        assert!(has_line(
+            &report,
+            "2 runs analyzed, 0 metrics files skipped"
+        ));
+        assert!(has_line(&report, "| mid | 2 | 0 | 0.0% |"));
+        for line in [
+            "- Total elapsed: 18446744073709551615 ms",
+            "- Mean elapsed per analyzed run: 9223372036854775807.5 ms",
+            "- Mean elapsed per completed run: —",
+            "- Priced runs: 0",
+            "- Estimated cost: —",
+            "- Mean cost per completed ticket: —",
+            "- Attempts: 18446744073709551615",
+            "- Retried tickets: 2",
+            "- First-attempt failures: 2",
+            "- Gate runs: 18446744073709551615",
+            "- Gate failures: 18446744073709551615",
+            "- Gate elapsed: 18446744073709551615 ms",
+            "| mid | 18446744073709551615 | 18446744073709551615 | 18446744073709551615 | 18446744073709551615 | 0 | 0 | 0 | 0 | — | — |",
+        ] {
+            assert!(has_line(&report, line), "expected {line:?} in: {report}");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Boundary: a denied corpus root is an error, while a denied session file
+    /// is skipped and the readable session is retained. The assertion is only
+    /// meaningful on hosts where permissions are reliably enforced.
+    #[cfg(unix)]
+    #[test]
+    fn when_metrics_are_reported_given_denied_corpus_and_session_reads_then_returns_or_skips_as_specified()
+     {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch_dir("corpus-permissions");
+        let corpus = root.join("corpus");
+        write_session_metrics(
+            &corpus,
+            "b-readable",
+            &base_session("mid", TerminalOutcome::Complete, 100),
+        );
+        let denied_session = corpus.join("a-denied");
+        fs::create_dir_all(&denied_session).unwrap();
+        fs::write(
+            denied_session.join(METRICS_FILE_NAME),
+            serde_json::to_vec_pretty(&base_session("hybrid", TerminalOutcome::Complete, 999))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let denied_file = denied_session.join(METRICS_FILE_NAME);
+        fs::set_permissions(&denied_file, fs::Permissions::from_mode(0o000)).unwrap();
+        let enforced = fs::read(&denied_file).is_err();
+        if !enforced {
+            fs::set_permissions(&denied_file, fs::Permissions::from_mode(0o644)).unwrap();
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let report = render_corpus_report(&corpus)
+            .expect("a denied session file is skipped rather than aborting");
+        assert!(
+            has_line(&report, "1 runs analyzed, 1 metrics files skipped"),
+            "the denied session is skipped and the readable one retained: {report}"
+        );
+        assert!(
+            has_line(&report, "- Total elapsed: 100 ms"),
+            "the readable session still contributes: {report}"
+        );
+        assert!(
+            !report.contains("999 ms"),
+            "the denied session never contributes: {report}"
+        );
+
+        fs::set_permissions(&corpus, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied_root = render_corpus_report(&corpus);
+        fs::set_permissions(&corpus, fs::Permissions::from_mode(0o755)).unwrap();
+
+        fs::set_permissions(&denied_file, fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            denied_root.is_err(),
+            "a corpus-directory read error other than not-found is returned"
+        );
     }
 }

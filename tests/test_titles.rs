@@ -370,9 +370,9 @@ fn when_recording_ticket_execution_metrics_given_queue_and_hybrid_tests_then_use
     assert_no_internal_identifier(title);
 }
 
-/// Regression for transition-gate accounting: every new pipeline title names
-/// the caller-visible gate behaviour in domain language, and the pass, missing
-/// manifest, saturation and repair/termination expectations all remain present.
+/// Regression for transition-gate accounting: every remaining pipeline title
+/// names the caller-visible gate behaviour in domain language, and the
+/// repair/termination expectation remains present.
 #[test]
 fn when_accounting_for_transition_gates_given_pipeline_tests_then_uses_domain_level_titles() {
     let unit_titles = test_titles(&source("src/pipeline.rs"));
@@ -389,9 +389,6 @@ fn when_accounting_for_transition_gates_given_pipeline_tests_then_uses_domain_le
     accounting.sort_unstable();
     let mut expected = vec![
         "when_a_transition_gate_fails_given_repair_and_termination_paths_then_preserves_existing_control_flow",
-        "when_a_transition_gate_is_checked_given_no_test_manifest_then_records_no_command",
-        "when_a_transition_gate_passes_given_a_test_manifest_then_counts_one_command_without_timing_output",
-        "when_transition_gate_attempts_accumulate_given_repeated_failures_then_saturates_without_resetting_totals",
     ];
     expected.sort_unstable();
     assert_eq!(

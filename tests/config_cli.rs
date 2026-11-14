@@ -96,6 +96,20 @@ impl Run {
 /// after a full clear, in a fresh directory and with closed stdin.
 fn start(envs: &[(&str, &str)]) -> Run {
     let scratch = Scratch::new();
+    start_in(&scratch, envs, &[])
+}
+
+/// Start the real binary once in a fresh isolated directory and with the
+/// supplied command-line arguments.
+fn start_with_args(envs: &[(&str, &str)], args: &[&str]) -> Run {
+    let scratch = Scratch::new();
+    start_in(&scratch, envs, args)
+}
+
+/// Start the real binary in one prepared scratch directory: the environment is
+/// cleared down to PATH, HOME and TERM, stdin is closed, and only the supplied
+/// arguments are passed.
+fn start_in(scratch: &Scratch, envs: &[(&str, &str)], args: &[&str]) -> Run {
     let mut command = Command::new(BINARY);
     command
         .current_dir(scratch.path())
@@ -106,6 +120,7 @@ fn start(envs: &[(&str, &str)]) -> Run {
         )
         .env("HOME", scratch.path())
         .env("TERM", "dumb")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -775,4 +790,162 @@ fn when_configuring_given_other_provider_credentials_without_smoll_credentials_t
         assert!(!error.contains(MID_MODEL), "mode {mode}: {error}");
         assert!(!error.contains(GIGA_MODEL), "mode {mode}: {error}");
     }
+}
+
+/// Write one malformed session metrics document under a corpus directory, so
+/// the corpus report can show which directory was scanned without needing a
+/// provider or a valid run-metrics payload.
+fn malformed_session(corpus: &Path, session: &str) {
+    let directory = corpus.join(session);
+    fs::create_dir_all(&directory).expect("the session directory is created");
+    fs::write(directory.join("metrics.json"), "not a run-metrics document")
+        .expect("the malformed metrics document is written");
+}
+
+/// Core entry-point behavior: a metrics request needs no provider credentials
+/// and never loads `.env` or reaches provider startup. The default request
+/// scans `<project_root>/.ejaj`, while an explicit relative directory is used
+/// exactly as given from the process working directory.
+#[test]
+fn when_metrics_are_requested_given_missing_credentials_then_prints_the_report() {
+    let scratch = Scratch::new();
+    malformed_session(&scratch.path().join(".ejaj"), "session-a");
+    fs::write(
+        scratch.path().join(".env"),
+        "AGENT_MODE=mystery\nAGENT_MODE=also-a-mystery\n",
+    )
+    .expect("the dotenv fixture is written");
+
+    let default = start_in(&scratch, &[], &["--metrics"]);
+    default.assert_success();
+    assert!(
+        default.stdout.contains("# ejaj Execution Metrics"),
+        "the default metrics request must print the report\nstdout:\n{}",
+        default.stdout
+    );
+    assert!(
+        default
+            .stdout
+            .contains("0 runs analyzed, 1 metrics files skipped"),
+        "the default request must scan <project_root>/.ejaj\nstdout:\n{}",
+        default.stdout
+    );
+    assert!(
+        !default.stdout.contains("[INFO]") && !default.stdout.contains("mode mid:"),
+        "a metrics request must not describe provider configuration\nstdout:\n{}",
+        default.stdout
+    );
+    assert_eq!(
+        default.stderr, "",
+        "a metrics request must not load .env or report startup diagnostics"
+    );
+
+    let explicit_corpus = scratch.path().join("relative-corpus");
+    malformed_session(&explicit_corpus, "session-b");
+    malformed_session(&explicit_corpus, "session-c");
+
+    let explicit = start_in(&scratch, &[], &["--metrics", "relative-corpus"]);
+    explicit.assert_success();
+    assert!(
+        explicit.stdout.contains("# ejaj Execution Metrics"),
+        "the explicit metrics request must print the report\nstdout:\n{}",
+        explicit.stdout
+    );
+    assert!(
+        explicit
+            .stdout
+            .contains("0 runs analyzed, 2 metrics files skipped"),
+        "the explicit relative directory must be scanned from the working directory\nstdout:\n{}",
+        explicit.stdout
+    );
+    assert!(
+        !explicit.stdout.contains("[INFO]") && !explicit.stdout.contains("mode mid:"),
+        "an explicit metrics request must not describe provider configuration\nstdout:\n{}",
+        explicit.stdout
+    );
+    assert_eq!(
+        explicit.stderr, "",
+        "an explicit metrics request must not load .env or report startup diagnostics"
+    );
+}
+
+/// Core entry-point behavior / malformed input: every unsupported argument
+/// form prints exactly one usage diagnostic to stderr, prints no report and
+/// exits with status 1.
+#[test]
+fn when_unknown_arguments_are_supplied_given_metrics_cli_then_prints_one_usage_error() {
+    let cases: &[&[&str]] = &[
+        &["prompt.md"],
+        &["--unknown"],
+        &["one", "two"],
+        &["--metrics", "--verbose"],
+        &["--metrics", "-"],
+        &["--metrics", "corpus", "extra"],
+    ];
+
+    for &args in cases {
+        let run = start_with_args(&[], args);
+        let error = assert_one_error(&run);
+        assert_eq!(
+            error, "[ERROR] Usage: ejaj [--metrics [ejaj-dir]]",
+            "wrong usage diagnostic for {args:?}"
+        );
+        assert!(
+            !run.stdout.contains("# ejaj Execution Metrics"),
+            "{args:?} must not print a metrics report\nstdout:\n{}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains("mode mid:") && !run.stdout.contains("[INFO]"),
+            "{args:?} must not reach provider startup\nstdout:\n{}",
+            run.stdout
+        );
+    }
+}
+
+/// Contract: a corpus scan failure is one [ERROR] diagnostic on stderr and a
+/// status of 1, never a report on stdout.
+#[test]
+fn when_metrics_are_requested_given_unreadable_corpus_then_prints_one_scan_error() {
+    let scratch = Scratch::new();
+    fs::write(
+        scratch.path().join("blocked"),
+        "this is a file, not a directory",
+    )
+    .expect("the blocking file is written");
+
+    let run = start_in(&scratch, &[], &["--metrics", "blocked/corpus"]);
+    let error = assert_one_error(&run);
+    assert!(
+        error.starts_with("[ERROR] Could not read the metrics corpus at blocked/corpus: "),
+        "the scan error must name the requested corpus: {error}"
+    );
+    assert!(
+        !run.stdout.contains("# ejaj Execution Metrics"),
+        "a failed scan must not print a report\nstdout:\n{}",
+        run.stdout
+    );
+}
+
+/// Regression: with no arguments the ordinary interactive startup is retained,
+/// so missing provider credentials still reach configuration and fail there
+/// rather than being mistaken for a metrics request.
+#[test]
+fn when_no_arguments_are_supplied_given_missing_provider_credentials_then_preserves_interactive_startup_behavior()
+ {
+    let run = start(&[]);
+    let error = assert_one_error(&run);
+    assert!(
+        error.contains("LLM_SMOLL_MODEL") || error.contains("LLM_SMOLL_API_KEY"),
+        "no-argument startup must still require provider configuration: {error}"
+    );
+    assert!(
+        !error.contains("Usage:"),
+        "no arguments must not be reported as a usage error: {error}"
+    );
+    assert!(
+        !run.stdout.contains("# ejaj Execution Metrics"),
+        "no-argument startup must not print a metrics report\nstdout:\n{}",
+        run.stdout
+    );
 }

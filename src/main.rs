@@ -4,6 +4,7 @@ use ejaj::status;
 use rustyline::error::ReadlineError;
 use rustyline::{Cmd, DefaultEditor, EventHandler, KeyCode, KeyEvent, Modifiers};
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -337,7 +338,97 @@ fn run_repl(rl: &mut DefaultEditor, pipeline: &mut Pipeline) {
     }
 }
 
+/// The one usage line printed for any unsupported command-line form.
+const CLI_USAGE: &str = "Usage: ejaj [--metrics [ejaj-dir]]";
+
+/// The one accepted command-line flag: the offline metrics request.
+const METRICS_FLAG: &str = "--metrics";
+
+/// What the command line asks the process to do.
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    /// No arguments: the ordinary interactive startup.
+    Interactive,
+    /// An offline metrics request. The optional directory is the corpus to
+    /// scan; no directory selects the project's own `.ejaj` directory.
+    Metrics(Option<PathBuf>),
+}
+
+/// The reason a command line is rejected: every unsupported form carries the
+/// same one-line usage guidance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CliUsageError;
+
+impl CliUsageError {
+    /// The usage line for this rejection.
+    fn message(self) -> &'static str {
+        CLI_USAGE
+    }
+}
+
+/// Classify the process arguments without reading the environment, loading
+/// `.env`, resolving the project root or changing the working directory.
+///
+/// Exactly three forms are accepted: no arguments, `--metrics`, and
+/// `--metrics <dir>`. A directory is used as supplied -- relative paths stay
+/// relative to the process working directory -- and is never required to be
+/// UTF-8. Anything else is a usage error.
+fn parse_cli_args(args: &[OsString]) -> Result<CliAction, CliUsageError> {
+    match args {
+        [] => Ok(CliAction::Interactive),
+        [flag] if flag == OsStr::new(METRICS_FLAG) => Ok(CliAction::Metrics(None)),
+        [flag, directory] if flag == OsStr::new(METRICS_FLAG) && !is_flag(directory) => {
+            Ok(CliAction::Metrics(Some(PathBuf::from(directory))))
+        }
+        _ => Err(CliUsageError),
+    }
+}
+
+/// Whether one argument would be parsed as a flag, which makes it invalid as
+/// an explicit metrics directory. Non-UTF-8 values cannot begin with the ASCII
+/// `-`, so the decision is made on the encoded bytes rather than by requiring
+/// the path to be text.
+fn is_flag(argument: &OsStr) -> bool {
+    argument.as_encoded_bytes().first() == Some(&b'-')
+}
+
+/// Print the offline metrics scorecard for one corpus, or the one diagnostic
+/// that explains why it could not be scanned. A metrics request ends here: no
+/// dotenv load, provider configuration, project-root entry or REPL setup runs
+/// for an offline report.
+fn run_metrics(directory: Option<PathBuf>) {
+    let target = directory.unwrap_or_else(|| PathBuf::from(project_root()).join(".ejaj"));
+    match ejaj::metrics::render_corpus_report(&target) {
+        Ok(report) => {
+            let _ = status::shared().stdout_log(report.trim_end_matches('\n'));
+        }
+        Err(error) => {
+            let _ = status::shared().stderr_log(&format!(
+                "[ERROR] Could not read the metrics corpus at {}: {}",
+                target.display(),
+                error
+            ));
+            exit(1);
+        }
+    }
+}
+
 fn main() {
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
+    match parse_cli_args(&args) {
+        Ok(CliAction::Interactive) => start_interactive(),
+        Ok(CliAction::Metrics(directory)) => run_metrics(directory),
+        Err(error) => {
+            let _ = status::shared().stderr_log(&format!("[ERROR] {}", error.message()));
+            exit(1);
+        }
+    }
+}
+
+/// The ordinary startup, in its established order: load dotenv, resolve and
+/// report provider configuration, enter the project root, then run the
+/// interactive loop.
+fn start_interactive() {
     load_dotenv();
 
     let config = configured();
@@ -387,6 +478,8 @@ fn main() {
 mod tests {
     use super::*;
     use std::io;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn when_tracking_given_first_dotenv_key_then_records_pair_without_warning() {
@@ -575,5 +668,76 @@ mod tests {
             Some("wake up"),
             "surrounding whitespace is removed"
         );
+    }
+
+    #[test]
+    fn when_cli_arguments_are_parsed_given_supported_forms_then_selects_interactive_or_metrics_action()
+     {
+        assert_eq!(
+            parse_cli_args(&[]),
+            Ok(CliAction::Interactive),
+            "no arguments keep the interactive startup"
+        );
+
+        assert_eq!(
+            parse_cli_args(&[OsString::from("--metrics")]),
+            Ok(CliAction::Metrics(None)),
+            "--metrics alone selects the default corpus"
+        );
+
+        assert_eq!(
+            parse_cli_args(&[
+                OsString::from("--metrics"),
+                OsString::from("relative/corpus")
+            ]),
+            Ok(CliAction::Metrics(Some(PathBuf::from("relative/corpus")))),
+            "an explicit relative directory is kept as given"
+        );
+
+        assert_eq!(
+            parse_cli_args(&[
+                OsString::from("--metrics"),
+                OsString::from("/var/tmp/corpus")
+            ]),
+            Ok(CliAction::Metrics(Some(PathBuf::from("/var/tmp/corpus")))),
+            "an explicit absolute directory is kept as given"
+        );
+
+        #[cfg(unix)]
+        {
+            let non_utf8 =
+                OsString::from_vec(vec![b'm', b'e', b't', b'r', b'i', b'c', b's', b'-', 0xff]);
+            assert_eq!(
+                parse_cli_args(&[OsString::from("--metrics"), non_utf8.clone()]),
+                Ok(CliAction::Metrics(Some(PathBuf::from(non_utf8)))),
+                "a non-UTF-8 explicit directory survives as a path"
+            );
+        }
+    }
+
+    #[test]
+    fn when_cli_arguments_are_parsed_given_invalid_forms_then_returns_usage_error() {
+        let invalid: &[&[&str]] = &[
+            &["prompt.md"],
+            &["--unknown"],
+            &["-m"],
+            &["one", "two"],
+            &["--metrics", "--verbose"],
+            &["--metrics", "-"],
+            &["--metrics", "corpus", "extra"],
+            &["--metrics", "one", "two", "three"],
+        ];
+
+        for &arguments in invalid {
+            let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+            match parse_cli_args(&arguments) {
+                Ok(action) => panic!("{arguments:?} must be rejected, got {action:?}"),
+                Err(error) => assert_eq!(
+                    error.message(),
+                    "Usage: ejaj [--metrics [ejaj-dir]]",
+                    "{arguments:?} must carry the one usage line"
+                ),
+            }
+        }
     }
 }

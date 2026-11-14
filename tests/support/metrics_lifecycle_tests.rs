@@ -622,10 +622,7 @@ fn assert_pass_record(
         reason,
         "unexpected first-attempt failure reason"
     );
-    assert_eq!(
-        record.succeeded, succeeded,
-        "unexpected final pass outcome"
-    );
+    assert_eq!(record.succeeded, succeeded, "unexpected final pass outcome");
     assert!(
         record.elapsed_ms <= total_elapsed_ms,
         "the pass interval {} ms is outside the whole run's {} ms",
@@ -789,7 +786,9 @@ fn when_triage_report_varies_given_draft_ready_done_and_blocked_states_then_reco
         assert_eq!(triage.done_count, Some(done), "the done count");
         assert_eq!(triage.blocked_count, Some(blocked), "the blocked count");
         assert_eq!(
-            triage.ready_count.unwrap() + triage.done_count.unwrap() + triage.blocked_count.unwrap(),
+            triage.ready_count.unwrap()
+                + triage.done_count.unwrap()
+                + triage.blocked_count.unwrap(),
             triage.draft_count.unwrap(),
             "the classifications partition the draft set"
         );
@@ -966,7 +965,7 @@ None.
 
 /// Core entry-point behavior: one run that reaches every phase, resolves its
 /// queue, passes review, writes an accepted summary and records the commit
-/// persists the complete version-1 contract at the run directory's top level.
+/// persists the complete version-2 contract at the run directory's top level.
 #[test]
 fn when_complete_run_finishes_given_all_phases_and_provider_trajectories_then_writes_versioned_convergence_contract()
  {
@@ -993,7 +992,7 @@ fn when_complete_run_finishes_given_all_phases_and_provider_trajectories_then_wr
     let raw = read_metrics_value(&run_dir);
     assert_eq!(
         raw["schema_version"].as_u64(),
-        Some(1),
+        Some(2),
         "the versioned contract"
     );
     assert_eq!(
@@ -1070,6 +1069,7 @@ fn when_complete_run_finishes_given_all_phases_and_provider_trajectories_then_wr
     assert!(ticket["failed_blocker"].is_null());
 
     assert_eq!(raw["transition_gate"]["runs"].as_u64(), Some(0));
+    assert_eq!(raw["transition_gate"]["failures"].as_u64(), Some(0));
     assert_eq!(raw["transition_gate"]["elapsed_ms"].as_u64(), Some(0));
 
     let reviews = raw["review_rounds"]
@@ -1410,10 +1410,11 @@ fn when_queue_rounds_run_given_execution_and_precompleted_sets_then_records_one_
 }
 
 /// Edge-case table and contract: a missing transition-gate manifest contributes
-/// no invocation and no time, while passing, repair-producing and terminating
-/// invocations are each counted with the whole milliseconds they actually ran.
+/// no invocation, no failure and no time, while passing, repair-producing and
+/// terminating invocations are each counted with the whole milliseconds they
+/// actually ran and each error contributes exactly one failure.
 #[test]
-fn when_transition_gate_is_absent_or_invoked_given_pass_repair_and_termination_then_counts_only_actual_durations()
+fn when_transition_gate_is_absent_or_invoked_given_pass_repair_and_termination_then_persists_only_failed_invocations()
  {
     let (step, metrics, _) = metrics_run(common::ScriptedTransport::new());
     assert!(
@@ -1439,6 +1440,10 @@ fn when_transition_gate_is_absent_or_invoked_given_pass_repair_and_termination_t
         metrics.transition_gate.runs, 1,
         "one passing invocation is counted"
     );
+    assert_eq!(
+        metrics.transition_gate.failures, 0,
+        "a passing invocation contributes no failure"
+    );
     assert!(
         metrics.transition_gate.elapsed_ms > 0,
         "the passing invocation's actual whole milliseconds are accumulated"
@@ -1457,6 +1462,10 @@ fn when_transition_gate_is_absent_or_invoked_given_pass_repair_and_termination_t
     assert_eq!(
         metrics.transition_gate.runs, 2,
         "the failing and the repaired invocations are both counted"
+    );
+    assert_eq!(
+        metrics.transition_gate.failures, 1,
+        "only the erroring repair-path invocation contributes a failure"
     );
     assert!(
         metrics.transition_gate.elapsed_ms > 0,
@@ -1493,6 +1502,10 @@ fn when_transition_gate_is_absent_or_invoked_given_pass_repair_and_termination_t
     assert_eq!(
         metrics.transition_gate.runs, 3,
         "every terminating invocation is counted"
+    );
+    assert_eq!(
+        metrics.transition_gate.failures, 3,
+        "every invocation leading to termination contributes one failure"
     );
     assert!(
         metrics.transition_gate.elapsed_ms > 0,
@@ -1533,10 +1546,7 @@ fn when_review_rounds_end_given_retry_failure_and_valid_reports_then_records_out
         round.get("findings").is_none(),
         "no report means no finding count"
     );
-    assert!(
-        round.get("fixes").is_none(),
-        "no report means no fix count"
-    );
+    assert!(round.get("fixes").is_none(), "no report means no fix count");
 
     let (_, failed, _) =
         metrics_run(common::ScriptedTransport::new().with_review(common::ReviewScript::ApiError));
@@ -1547,18 +1557,12 @@ fn when_review_rounds_end_given_retry_failure_and_valid_reports_then_records_out
         round["retried"], false,
         "an API failure is not retried in a fresh session"
     );
-    assert_eq!(
-        round["succeeded"], false,
-        "a failed pass is not handed off"
-    );
+    assert_eq!(round["succeeded"], false, "a failed pass is not handed off");
     assert!(
         round.get("findings").is_none(),
         "no report means no finding count"
     );
-    assert!(
-        round.get("fixes").is_none(),
-        "no report means no fix count"
-    );
+    assert!(round.get("fixes").is_none(), "no report means no fix count");
 
     let (_, fixed, _) = metrics_run(
         common::ScriptedTransport::new().with_review(common::ReviewScript::FixOnceThenPass),
@@ -1567,18 +1571,9 @@ fn when_review_rounds_end_given_retry_failure_and_valid_reports_then_records_out
     let first = &value["review_rounds"][0];
     assert_eq!(first["round"], 1);
     assert_eq!(first["outcome"], "fixes_queued");
-    assert_eq!(
-        first["succeeded"], true,
-        "a valid fix report is handed off"
-    );
-    assert_eq!(
-        first["findings"], 1,
-        "the report's finding is counted"
-    );
-    assert_eq!(
-        first["fixes"], 1,
-        "the report's fix is counted"
-    );
+    assert_eq!(first["succeeded"], true, "a valid fix report is handed off");
+    assert_eq!(first["findings"], 1, "the report's finding is counted");
+    assert_eq!(first["fixes"], 1, "the report's fix is counted");
     let second = &value["review_rounds"][1];
     assert_eq!(second["round"], 2, "the converging pass is round two");
     assert_eq!(second["outcome"], "passed");
@@ -1625,10 +1620,7 @@ fn when_review_round_limits_are_reached_given_stalled_fixes_or_round_cap_then_pr
             round["findings"], 1,
             "every capped report keeps its finding count"
         );
-        assert_eq!(
-            round["fixes"], 1,
-            "every capped report keeps its fix count"
-        );
+        assert_eq!(round["fixes"], 1, "every capped report keeps its fix count");
         if index + 1 < 10 {
             assert_eq!(round["outcome"], "fixes_queued");
         }
@@ -1772,12 +1764,11 @@ fn when_queue_or_review_write_fails_given_completed_measurements_then_persists_p
         value["transition_gate"]["runs"], 1,
         "the completed transition-gate invocation survives the review write failure"
     );
-    assert!(
-        value["transition_gate"]["elapsed_ms"]
-            .as_u64()
-            .unwrap()
-            > 0
+    assert_eq!(
+        value["transition_gate"]["failures"], 0,
+        "the passing invocation contributes no failure"
     );
+    assert!(value["transition_gate"]["elapsed_ms"].as_u64().unwrap() > 0);
 }
 
 /// Zero-usage boundary: configured token prices still produce an explicit zero
@@ -1921,7 +1912,7 @@ fn when_callers_use_the_run_metrics_seams_given_known_inputs_then_observe_the_st
     );
 
     let metrics = RunMetrics {
-        schema_version: 1,
+        schema_version: 2,
         elapsed_ms: 2_500,
         ..RunMetrics::default()
     };
@@ -1938,7 +1929,7 @@ fn when_callers_use_the_run_metrics_seams_given_known_inputs_then_observe_the_st
         &fs::read(session.join("metrics.json")).expect("the persisted metrics are readable"),
     )
     .expect("the persisted metrics are JSON");
-    assert_eq!(raw["schema_version"], 1);
+    assert_eq!(raw["schema_version"], 2);
     assert_eq!(raw["elapsed_ms"], 2_500);
     assert!(
         !ejaj::metrics::persist_run_metrics(
